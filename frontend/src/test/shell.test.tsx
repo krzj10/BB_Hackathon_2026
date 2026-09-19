@@ -45,10 +45,10 @@ describe("app shell navigation", () => {
 });
 
 describe("Today page visual structure", () => {
-  it("renders the greeting, status strip, timeline, attention and decisions", () => {
+  it("renders the greeting, status strip, timeline, attention and decisions", async () => {
     renderAppAt("/");
 
-    expect(screen.getByText(/Good (morning|afternoon|evening)/)).toBeInTheDocument();
+    expect(await screen.findByText(/Good (morning|afternoon|evening)/)).toBeInTheDocument();
     expect(screen.getByText("Timeline")).toBeInTheDocument();
     expect(screen.getByText("ACME Contract Review")).toBeInTheDocument();
     expect(screen.getByRole("heading", { level: 3, name: "Attention" })).toBeInTheDocument();
