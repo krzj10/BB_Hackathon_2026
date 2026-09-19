@@ -221,6 +221,7 @@ __marimo__/
 .uv-cache/
 .npm-cache-tmp/
 pytest-cache-files-*/
+.pytest-tmp/
 *.tsbuildinfo
 
 # EVA: secrets, databases and demo data must never enter Git
