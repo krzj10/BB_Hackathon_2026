@@ -13,9 +13,12 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from . import __version__
+from .api.auth_google import router as auth_google_router
+from .api.calendar import router as calendar_router
 from .api.health import router as health_router
 from .config import Settings
 from .dependencies import get_settings
+from .google.auth import GoogleAuth
 
 logger = logging.getLogger("eva.main")
 
@@ -38,7 +41,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(title="EVA Core Platform", version=__version__, lifespan=lifespan)
     app.state.settings = settings
+    # A02: the auth boundary owns all Google credentials. Tests replace
+    # app.state.google_auth (and optionally google_http_factory) with fakes.
+    app.state.google_auth = GoogleAuth(settings)
     app.include_router(health_router)
+    app.include_router(auth_google_router)
+    app.include_router(calendar_router)
     return app
 
 

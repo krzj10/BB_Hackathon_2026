@@ -69,6 +69,10 @@ class Settings(BaseSettings):
     google_client_id: str = ""
     google_client_secret: str = Field(default="", repr=False)
     google_redirect_uri: str = "http://localhost:8000/api/auth/google/callback"
+    #: Offline credentials (refresh/access tokens) live OUTSIDE source control.
+    #: The default sits under secrets/, which is gitignored; the file is
+    #: written 0600 best-effort and never read into API responses or logs.
+    google_credentials_path: str = "secrets/google_credentials.json"
 
     @field_validator("eva_llm_allowed_origins", mode="before")
     @classmethod
