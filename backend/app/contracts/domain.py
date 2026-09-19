@@ -343,6 +343,32 @@ class ExecutiveBriefing(ContractModel):
     retrieval_status: RetrievalStatus
     retrieval_notes: list[str] = Field(default_factory=list)
 
+    @model_validator(mode="after")
+    def _claim_sources_resolve(self) -> "ExecutiveBriefing":
+        """Evidence integrity: every source_id referenced by any Claim in this
+        briefing must resolve to an actual SourceRef of the briefing's own
+        evidence (briefing sources plus the meeting's sources). Unsourced
+        inference/suggestion claims remain valid; unknown ids never."""
+        valid_ids = {source.id for source in self.sources} | {
+            source.id for source in self.meeting.sources
+        }
+        collections = (
+            ("previous_interactions", self.previous_interactions),
+            ("open_topics", self.open_topics),
+            ("previous_decisions", self.previous_decisions),
+            ("risks", self.risks),
+            ("suggestions", self.suggestions),
+        )
+        for field_name, claims in collections:
+            for claim in claims:
+                unknown = [sid for sid in claim.source_ids if sid not in valid_ids]
+                if unknown:
+                    raise ValueError(
+                        f"{field_name}: claim source_ids {unknown} do not resolve to "
+                        "any SourceRef in this briefing's evidence"
+                    )
+        return self
+
 
 # ---------------------------------------------------------------------------
 # Attention, Decisions

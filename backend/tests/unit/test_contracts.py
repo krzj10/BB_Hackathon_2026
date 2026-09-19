@@ -34,7 +34,7 @@ from jsonschema import Draft202012Validator
 from jsonschema import ValidationError as JsonSchemaValidationError
 from pydantic import TypeAdapter, ValidationError
 
-from app.config import Settings
+from app.config import Settings, UnsafeEndpointConfigurationError
 from app.contracts import api, domain
 from app.main import create_app
 
@@ -471,8 +471,45 @@ def test_settings_origin_allowlist_parsing_and_rejection() -> None:
         "http://100.64.0.2:8321",
         "https://infer.tailnet.example",
     ]
-    with pytest.raises(ValidationError):
+    with pytest.raises(UnsafeEndpointConfigurationError):
         Settings(_env_file=None, EVA_LLM_ALLOWED_ORIGINS="ftp://nope")
+
+
+# ---------------------------------------------------------------------------
+# ExecutiveBriefing evidence integrity (claims must resolve to SourceRefs)
+# ---------------------------------------------------------------------------
+
+
+def _briefing_payload() -> dict:
+    return load_fixture("briefing_acme_pl.json")
+
+
+def test_briefing_fact_with_unresolvable_source_id_fails() -> None:
+    data = _briefing_payload()
+    data["open_topics"][0] = {
+        "text": "Nieznany wątek",
+        "kind": "fact",
+        "source_ids": ["missing-source"],
+    }
+    with pytest.raises(ValidationError) as excinfo:
+        domain.ExecutiveBriefing.model_validate(data)
+    assert "missing-source" in str(excinfo.value)
+
+
+def test_briefing_unsourced_inference_and_suggestion_remain_valid() -> None:
+    data = _briefing_payload()
+    data["open_topics"] = [{"text": "Możliwy wątek", "kind": "inference", "source_ids": []}]
+    data["suggestions"] = [{"text": "Zaproponuj termin", "kind": "suggestion"}]
+    briefing = domain.ExecutiveBriefing.model_validate(data)
+    assert briefing.open_topics[0].source_ids == []
+
+
+def test_briefing_claim_referencing_real_source_passes() -> None:
+    data = _briefing_payload()
+    real_id = data["sources"][0]["id"]
+    data["risks"] = [{"text": "Ryzyko terminu", "kind": "inference", "source_ids": [real_id]}]
+    briefing = domain.ExecutiveBriefing.model_validate(data)
+    assert briefing.risks[0].source_ids == [real_id]
 
 
 def test_secrets_never_appear_in_repr() -> None:

@@ -39,7 +39,8 @@ def build_component_health(settings: Settings) -> dict[str, ProviderHealth]:
 
     components["database"] = ProviderHealth(
         status=HealthStatus.DEGRADED,
-        detail="persistence layer not initialized yet (A01)",
+        detail="persistence layer implemented; runtime database readiness not "
+        "probed by this health check",
     )
 
     if settings.self_hosted_configured:
@@ -76,7 +77,8 @@ def build_component_health(settings: Settings) -> dict[str, ProviderHealth]:
     if settings.google_configured:
         components["google"] = ProviderHealth(
             status=HealthStatus.DEGRADED,
-            detail="OAuth client configured; flow not implemented yet (A02)",
+            detail="Google OAuth/read integration configured; live account "
+            "connection not probed by this health check",
         )
     else:
         components["google"] = ProviderHealth(
