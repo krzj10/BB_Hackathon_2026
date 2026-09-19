@@ -504,3 +504,184 @@ def test_session_persistence_and_action_link(db) -> None:
             "SELECT session_id FROM proposed_actions WHERE id = ?", (action.id,)
         ).fetchone()
     assert row[0] == action.session_id
+
+
+# ---------------------------------------------------------------------------
+# A03 atomic approval+receipt and rejection operations
+# ---------------------------------------------------------------------------
+
+APPROVAL_NOW = datetime.fromisoformat("2026-09-21T12:02:00+02:00")  # inside fixture TTL
+
+
+def bound_receipt(action, **overrides) -> domain.ApprovalReceipt:
+    data = {
+        "id": "rcpt-test-001",
+        "action_id": action.id,
+        "revision": action.revision,
+        "arguments_digest": action.arguments_digest,
+        "channel": "ui",
+        "approved_at": APPROVAL_NOW,
+        "policy_version": action.policy_version,
+    }
+    data.update(overrides)
+    return domain.ApprovalReceipt.model_validate(data)
+
+
+def seeded_action(db) -> domain.ProposedAction:
+    action = fresh_action()
+    ActionRepository(db).create_action(action)
+    return action
+
+
+def test_approve_with_receipt_commits_status_and_receipt_together(db) -> None:
+    repo = ActionRepository(db)
+    action = seeded_action(db)
+    won = repo.approve_with_receipt(
+        bound_receipt(action),
+        expected_revision=action.revision,
+        expected_arguments_digest=action.arguments_digest,
+        expected_policy_version=action.policy_version,
+        now=APPROVAL_NOW,
+    )
+    assert won is True
+    assert repo.get_action(action.id).status is domain.ProposedActionStatus.APPROVED
+    receipt = repo.get_receipt(action.id, action.revision)
+    assert receipt is not None and receipt.arguments_digest == action.arguments_digest
+
+
+def _assert_untouched(repo: ActionRepository, db, action) -> None:
+    assert repo.get_action(action.id).status is domain.ProposedActionStatus.PENDING
+    with db.connect() as conn:
+        rows = conn.execute(
+            "SELECT COUNT(*) AS n FROM approval_receipts WHERE action_id = ?", (action.id,)
+        ).fetchone()
+    assert rows["n"] == 0
+
+
+def test_approve_with_receipt_digest_mismatch_changes_nothing(db) -> None:
+    repo = ActionRepository(db)
+    action = seeded_action(db)
+    tampered_digest = "sha256:other"
+    won = repo.approve_with_receipt(
+        bound_receipt(action, arguments_digest=tampered_digest),
+        expected_revision=action.revision,
+        expected_arguments_digest=tampered_digest,
+        expected_policy_version=action.policy_version,
+        now=APPROVAL_NOW,
+    )
+    assert won is False
+    _assert_untouched(repo, db, action)
+
+
+def test_approve_with_receipt_policy_mismatch_changes_nothing(db) -> None:
+    repo = ActionRepository(db)
+    action = seeded_action(db)
+    won = repo.approve_with_receipt(
+        bound_receipt(action),
+        expected_revision=action.revision,
+        expected_arguments_digest=action.arguments_digest,
+        expected_policy_version="policy-v2-changed",
+        now=APPROVAL_NOW,
+    )
+    assert won is False
+    _assert_untouched(repo, db, action)
+
+
+def test_approve_with_receipt_revision_mismatch_changes_nothing(db) -> None:
+    repo = ActionRepository(db)
+    action = seeded_action(db)
+    wrong_revision = action.revision + 1
+    won = repo.approve_with_receipt(
+        bound_receipt(action, revision=wrong_revision),
+        expected_revision=wrong_revision,
+        expected_arguments_digest=action.arguments_digest,
+        expected_policy_version=action.policy_version,
+        now=APPROVAL_NOW,
+    )
+    assert won is False
+    _assert_untouched(repo, db, action)
+
+
+def test_approve_with_receipt_inconsistent_binding_is_programming_error(db) -> None:
+    repo = ActionRepository(db)
+    action = seeded_action(db)
+    with pytest.raises(ValueError):
+        # A receipt whose own binding disagrees with the expected tuple can
+        # never be submitted - that is a caller bug, not an approval outcome.
+        repo.approve_with_receipt(
+            bound_receipt(action),
+            expected_revision=action.revision + 5,
+            expected_arguments_digest=action.arguments_digest,
+            expected_policy_version=action.policy_version,
+            now=APPROVAL_NOW,
+        )
+
+
+def test_approve_with_receipt_after_expiry_changes_nothing(db) -> None:
+    repo = ActionRepository(db)
+    action = seeded_action(db)
+    late = datetime.fromisoformat("2026-09-21T12:05:00+02:00")  # >= expires_at
+    won = repo.approve_with_receipt(
+        bound_receipt(action),
+        expected_revision=action.revision,
+        expected_arguments_digest=action.arguments_digest,
+        expected_policy_version=action.policy_version,
+        now=late,
+    )
+    assert won is False
+    _assert_untouched(repo, db, action)
+
+
+def test_reject_action_is_final(db) -> None:
+    repo = ActionRepository(db)
+    action = seeded_action(db)
+    won = repo.reject_action(
+        action.id,
+        expected_revision=action.revision,
+        expected_arguments_digest=action.arguments_digest,
+    )
+    assert won is True
+    assert repo.get_action(action.id).status is domain.ProposedActionStatus.REJECTED
+    # A rejected action can never become approved afterwards.
+    later = repo.approve_with_receipt(
+        bound_receipt(action),
+        expected_revision=action.revision,
+        expected_arguments_digest=action.arguments_digest,
+        expected_policy_version=action.policy_version,
+        now=APPROVAL_NOW,
+    )
+    assert later is False
+    assert repo.get_action(action.id).status is domain.ProposedActionStatus.REJECTED
+
+
+def test_concurrent_approve_with_receipt_has_exactly_one_winner(db) -> None:
+    action = seeded_action(db)
+    barrier = threading.Barrier(2)
+    results: list[bool] = []
+    lock = threading.Lock()
+
+    def attempt(index: int) -> None:
+        repo = ActionRepository(db)  # independent repository, same DB file
+        receipt = bound_receipt(action, id=f"rcpt-race-{index}")
+        barrier.wait()
+        won = repo.approve_with_receipt(
+            receipt,
+            expected_revision=action.revision,
+            expected_arguments_digest=action.arguments_digest,
+            expected_policy_version=action.policy_version,
+            now=APPROVAL_NOW,
+        )
+        with lock:
+            results.append(won)
+
+    threads = [threading.Thread(target=attempt, args=(i,)) for i in (1, 2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    assert sorted(results) == [False, True]
+    with db.connect() as conn:
+        rows = conn.execute(
+            "SELECT COUNT(*) AS n FROM approval_receipts WHERE action_id = ?", (action.id,)
+        ).fetchone()
+    assert rows["n"] == 1  # exactly one receipt for exactly one approval
