@@ -1,0 +1,13 @@
+# Dependencies
+node_modules/
+
+# Local env files (Vite: .env, .env.local, .env.development, ...)
+.env
+.env.*
+!.env.example
+
+# Local-only Vite overrides
+*.local
+
+# Test coverage
+coverage/
