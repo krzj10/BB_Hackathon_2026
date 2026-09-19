@@ -61,6 +61,7 @@ def _validated_origin(raw: str) -> str:
         raise UnsafeEndpointConfigurationError(_ORIGIN_REJECT) from None
     if parts.username is not None or parts.password is not None:
         raise UnsafeEndpointConfigurationError(_CREDENTIAL_REJECT)
+    _require_valid_port(parts)
     if parts.scheme not in ("http", "https") or not parts.hostname:
         raise UnsafeEndpointConfigurationError(_ORIGIN_REJECT)
     if parts.path not in ("", "/") or parts.query or parts.fragment:
@@ -81,11 +82,23 @@ def _validated_endpoint(raw: str) -> str:
         raise UnsafeEndpointConfigurationError(_ENDPOINT_REJECT) from None
     if parts.username is not None or parts.password is not None:
         raise UnsafeEndpointConfigurationError(_CREDENTIAL_REJECT)
+    _require_valid_port(parts)
     if parts.scheme not in ("http", "https") or not parts.hostname:
         raise UnsafeEndpointConfigurationError(_ENDPOINT_REJECT)
     if parts.query or parts.fragment:
         raise UnsafeEndpointConfigurationError(_ENDPOINT_REJECT)
     return raw.strip()
+
+
+def _require_valid_port(parts: Any) -> None:
+    """Reject malformed/out-of-range ports (urlsplit keeps them but .port
+    raises ValueError). Fixed generic error; the URL is never echoed."""
+    try:
+        parts.port  # noqa: B018 - access validates
+    except ValueError:
+        raise UnsafeEndpointConfigurationError(
+            "invalid self-hosted endpoint configuration: malformed or out-of-range port"
+        ) from None
 
 
 class Settings(BaseSettings):

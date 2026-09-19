@@ -219,8 +219,11 @@ class ActionRepository:
         if (
             receipt.revision != expected_revision
             or receipt.arguments_digest != expected_arguments_digest
+            or receipt.policy_version != expected_policy_version
         ):
-            raise ValueError("receipt must be bound to the revision and digest it approves")
+            raise ValueError(
+                "receipt must be bound to the revision, digest and policy version it approves"
+            )
         with self._db.transaction() as conn:
             cur = conn.execute(
                 """

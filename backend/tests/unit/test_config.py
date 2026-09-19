@@ -175,3 +175,44 @@ def test_health_wording_is_current_not_stale_milestones() -> None:
         "live account connection not probed"
         in body["components"]["google"]["detail"]
     )
+
+
+# ---------------------------------------------------------------------------
+# Malformed ports are rejected without echoing the configured URL
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "bad_url",
+    [
+        "https://host.example:not-a-port",
+        "https://host.example:99999",
+    ],
+)
+class TestMalformedPorts:
+    def test_origin_with_bad_port_rejected_without_leak(self, monkeypatch, bad_url) -> None:
+        _clean_env(monkeypatch)
+        monkeypatch.setenv("EVA_LLM_ALLOWED_ORIGINS", bad_url)
+        with pytest.raises(UnsafeEndpointConfigurationError) as excinfo:
+            Settings(_env_file=None)
+        assert bad_url not in str(excinfo.value)
+
+    def test_base_url_with_bad_port_rejected_without_leak(self, monkeypatch, bad_url) -> None:
+        _clean_env(monkeypatch)
+        monkeypatch.setenv("EVA_LLM_BASE_URL", f"{bad_url}/v1")
+        with pytest.raises(UnsafeEndpointConfigurationError) as excinfo:
+            Settings(_env_file=None)
+        assert bad_url not in str(excinfo.value)
+
+    def test_fallback_with_bad_port_rejected_without_leak(self, monkeypatch, bad_url) -> None:
+        _clean_env(monkeypatch)
+        monkeypatch.setenv("EVA_LLM_FALLBACK_BASE_URL", f"{bad_url}/v1")
+        with pytest.raises(UnsafeEndpointConfigurationError) as excinfo:
+            Settings(_env_file=None)
+        assert bad_url not in str(excinfo.value)
+
+
+def test_valid_port_still_accepted(monkeypatch) -> None:
+    _clean_env(monkeypatch)
+    monkeypatch.setenv("EVA_LLM_ALLOWED_ORIGINS", "http://100.64.0.2:8321")
+    assert Settings(_env_file=None).eva_llm_allowed_origins == ["http://100.64.0.2:8321"]

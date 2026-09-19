@@ -576,11 +576,12 @@ def test_approve_with_receipt_digest_mismatch_changes_nothing(db) -> None:
 def test_approve_with_receipt_policy_mismatch_changes_nothing(db) -> None:
     repo = ActionRepository(db)
     action = seeded_action(db)
+    wrong_policy = "policy-v2-changed"
     won = repo.approve_with_receipt(
-        bound_receipt(action),
+        bound_receipt(action, policy_version=wrong_policy),
         expected_revision=action.revision,
         expected_arguments_digest=action.arguments_digest,
-        expected_policy_version="policy-v2-changed",
+        expected_policy_version=wrong_policy,  # differs from the STORED action row
         now=APPROVAL_NOW,
     )
     assert won is False
@@ -685,3 +686,49 @@ def test_concurrent_approve_with_receipt_has_exactly_one_winner(db) -> None:
             "SELECT COUNT(*) AS n FROM approval_receipts WHERE action_id = ?", (action.id,)
         ).fetchone()
     assert rows["n"] == 1  # exactly one receipt for exactly one approval
+
+
+def test_approve_with_receipt_policy_version_guard_is_programming_error(db) -> None:
+    repo = ActionRepository(db)
+    action = seeded_action(db)
+    with pytest.raises(ValueError):
+        # A receipt declaring a different policy version than the approved
+        # expected version can never be submitted (repository invariant).
+        repo.approve_with_receipt(
+            bound_receipt(action, policy_version="policy-v9-mismatched"),
+            expected_revision=action.revision,
+            expected_arguments_digest=action.arguments_digest,
+            expected_policy_version=action.policy_version,
+            now=APPROVAL_NOW,
+        )
+    assert repo.get_action(action.id).status is domain.ProposedActionStatus.PENDING
+
+
+def test_approve_with_receipt_rolls_back_when_insert_fails(db) -> None:
+    """Atomicity: if the receipt INSERT fails after the conditional UPDATE
+    matched (here via a deliberate PRIMARY KEY collision), the whole
+    transaction rolls back - no partial APPROVED-without-receipt state."""
+    repo = ActionRepository(db)
+    first = seeded_action(db)
+    assert repo.approve_with_receipt(
+        bound_receipt(first, id="rcpt-clash"),
+        expected_revision=first.revision,
+        expected_arguments_digest=first.arguments_digest,
+        expected_policy_version=first.policy_version,
+        now=APPROVAL_NOW,
+    ) is True
+
+    second = fresh_action(id="act-demo-rollback-second-002")
+    repo.create_action(second)
+    clashing = bound_receipt(second, id="rcpt-clash")  # same receipt PK -> INSERT fails
+    with pytest.raises(sqlite3.IntegrityError):
+        repo.approve_with_receipt(
+            clashing,
+            expected_revision=second.revision,
+            expected_arguments_digest=second.arguments_digest,
+            expected_policy_version=second.policy_version,
+            now=APPROVAL_NOW,
+        )
+    # The action UPDATE rolled back with the failed INSERT: still PENDING.
+    assert repo.get_action(second.id).status is domain.ProposedActionStatus.PENDING
+    assert repo.get_receipt(second.id, second.revision) is None

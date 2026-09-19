@@ -303,12 +303,15 @@ class ActionApprovalEngine:
                 reasons.append(
                     rule("action.high_proposed_meeting", "proposed meeting content triages HIGH")
                 )
-            if self._notifies_externally(args.send_updates, [a.internal for a in args.attendees]):
+            if self._notification_escalates(args.send_updates, len(args.attendees)):
                 risk = _max_risk(risk, ActionRisk.HIGH)
                 reasons.append(
                     rule(
                         "action.notification_impact",
-                        f"mutation notifies external parties (send_updates={args.send_updates.value})",
+                        f"mutation sends updates (send_updates={args.send_updates.value}) to "
+                        "attendees whose internal/external identity is not server-verified; "
+                        "treated as potentially external (model-supplied Participant.internal "
+                        "is never authorization evidence)",
                     )
                 )
             return risk, reasons, None
@@ -330,25 +333,32 @@ class ActionApprovalEngine:
                     f"mutation of HIGH-priority meeting {meeting.ref.event_id!r} is always HIGH",
                 )
             )
-        if self._notifies_externally(args.send_updates, [a.internal for a in meeting.attendees]):
+        if self._notification_escalates(args.send_updates, len(meeting.attendees)):
             risk = _max_risk(risk, ActionRisk.HIGH)
             reasons.append(
                 rule(
                     "action.notification_impact",
-                    f"mutation notifies external parties (send_updates={args.send_updates.value})",
+                    f"mutation sends updates (send_updates={args.send_updates.value}) to "
+                    "attendees whose internal/external identity is not server-verified; "
+                    "treated as potentially external",
                 )
             )
         return risk, reasons, meeting
 
-    def _notifies_externally(self, send_updates: SendUpdates, internals: list[bool | None]) -> bool:
+    def _notification_escalates(self, send_updates: SendUpdates, attendee_count: int) -> bool:
+        """Conservative MVP trust boundary for notification risk.
+
+        No server-verified internal/external attendee classification exists
+        yet, and model-supplied ``Participant.internal`` is deliberately NOT
+        read here - LLM output can never lower this risk by claiming
+        ``internal=true``. Until a trusted identity source lands (A04+), any
+        attendee counts as potentially external when the mutation actually
+        sends updates (POLICY notify_values: all / external_only). With
+        send_updates=none nothing is sent, so no escalation applies."""
         esc = self._policy.config.notification_escalation
-        if not esc.escalate_external_notifications_to_high:
+        if not esc.escalate_external_notifications_to_high or attendee_count == 0:
             return False
-        if send_updates.value not in esc.notify_values:
-            return False
-        # Only explicit external evidence escalates; unknown internals are
-        # never invented as "external".
-        return any(flag is False for flag in internals)
+        return send_updates in esc.notify_values
 
     def _approval_flags(self, risk: ActionRisk) -> tuple[bool, bool]:
         ap = self._policy.config.approval
@@ -405,12 +415,16 @@ class ActionApprovalEngine:
         now = context.now
         expires_at = now + timedelta(seconds=self._policy.config.proposal.ttl_seconds)
         impact = self._impact(args, risk, meeting)
-        reason_text = (
-            f"{context.suggested_reason} | {reasons[0].text}"
-            if context.suggested_reason
-            else reasons[0].text if reasons
-            else "deterministic policy evaluation"
-        )
+        # The deterministic policy explanation is authoritative and FIRST.
+        # Any model/user suggestion is appended clearly labelled as
+        # non-authoritative text - it never replaces the rule reason and is
+        # never presented as evidence.
+        deterministic = reasons[0].text if reasons else "deterministic policy evaluation"
+        reason_text = f"Policy: {deterministic}"
+        if context.suggested_reason:
+            reason_text += (
+                f" | Non-authoritative model suggestion: {context.suggested_reason}"
+            )
 
         action = ProposedAction(
             id=f"action-{uuid.uuid4()}",
@@ -479,23 +493,53 @@ class ActionApprovalEngine:
             )
 
         if action.status == ProposedActionStatus.APPROVED:
-            # Already approved (concurrent confirmation winner): represent the
-            # existing state safely; never issue a second receipt.
+            # Already approved (concurrent winner or replay). Idempotency is
+            # narrow: only an APPROVE on a channel that is STILL allowed for
+            # this risk may observe it - a disallowed channel never gets to
+            # "successfully confirm" anything (a VOICE replay against a HIGH
+            # action stays channel_not_allowed). REJECT after approval fails.
+            # The durable receipt MUST exist and match; an APPROVED action
+            # without its exact receipt is a storage/authorization invariant
+            # violation and fails closed - never repaired here.
+            if request.choice == ApprovalChoice.REJECT:
+                raise ActionPolicyError(
+                    "invalid_status", "action is already approved; rejection no longer applies"
+                )
+            self._require_allowed_channel(channel, action.risk)
             existing = self._repo.get_receipt(action.id, action.revision)
+            if existing is None:
+                raise ActionPolicyError(
+                    "receipt_missing",
+                    "approved action has no durable receipt (authorization invariant violation)",
+                )
+            if (
+                existing.action_id != action.id
+                or existing.revision != action.revision
+                or existing.arguments_digest != action.arguments_digest
+                or existing.policy_version != action.policy_version
+            ):
+                raise ActionPolicyError(
+                    "receipt_binding_mismatch",
+                    "stored receipt does not match the approved action binding",
+                )
             return ConfirmationResult(action=action, receipt=existing, already_approved=True)
         if action.status != ProposedActionStatus.PENDING:
             raise ActionPolicyError(
                 "invalid_status", f"proposal is {action.status.value}, not pending"
             )
 
-        # Expiry gates approvals (>= expires_at fails), but rejecting an
-        # expired-but-pending proposal always stays possible.
-        if request.choice == ApprovalChoice.APPROVE and now >= action.expires_at:
-            self._repo.expire_action(action.id, now=now)
-            raise ActionPolicyError("expired", "proposal expired; a new proposal is required")
+        if request.choice == ApprovalChoice.APPROVE:
+            # Expiry gates approvals (>= expires_at fails); rejecting an
+            # expired-but-pending proposal always stays possible.
+            if now >= action.expires_at:
+                self._repo.expire_action(action.id, now=now)
+                raise ActionPolicyError("expired", "proposal expired; a new proposal is required")
+            # Channel validation happens BEFORE consuming the one-time
+            # challenge: a disallowed channel must not burn a valid challenge.
+            self._require_allowed_channel(channel, action.risk)
 
-        # One-time challenge: consumed atomically; replay/wrong-binding/expired
-        # all fail. A valid challenge never overrides the channel rules below.
+        # One-time challenge: consumed atomically for BOTH choices after all
+        # non-consuming checks; replay/wrong-binding/expired all fail.
         if not self.challenges.consume(
             request.challenge, action.id, action.revision, action.arguments_digest, now
         ):
@@ -513,15 +557,7 @@ class ActionApprovalEngine:
             assert updated is not None
             return ConfirmationResult(action=updated, receipt=None)
 
-        # Approval channel policy: HIGH is UI-only; rejection above stays
-        # possible on any authenticated channel (safe direction).
-        allowed_channels = self._allowed_channels(action.risk)
-        if channel not in allowed_channels:
-            raise ActionPolicyError(
-                "channel_not_allowed",
-                f"{action.risk.value} risk cannot be approved over {channel.value}",
-            )
-
+        # (APPROVE channel was validated before the challenge was consumed.)
         receipt = ApprovalReceipt(
             id=f"receipt-{uuid.uuid4()}",
             action_id=action.id,
@@ -557,6 +593,13 @@ class ActionApprovalEngine:
         if risk == ActionRisk.MEDIUM:
             return set(ap.medium_channels)
         return set(ap.low_channels)
+
+    def _require_allowed_channel(self, channel: ApprovalChannel, risk: ActionRisk) -> None:
+        if channel not in self._allowed_channels(risk):
+            raise ActionPolicyError(
+                "channel_not_allowed",
+                f"{risk.value} risk cannot be approved over {channel.value}",
+            )
 
 
 def _max_risk(a: ActionRisk, b: ActionRisk) -> ActionRisk:

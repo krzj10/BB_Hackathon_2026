@@ -19,11 +19,12 @@ import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from app.contracts.domain import ActionRisk, ApprovalChannel
+from app.contracts.domain import ActionRisk, ApprovalChannel, SendUpdates
 
 DEFAULT_POLICY_PATH = Path(__file__).resolve().parents[1] / "policy" / "POLICY.yaml"
 
@@ -38,7 +39,9 @@ class _Strict(BaseModel):
 
 
 class PolicyIdentity(_Strict):
-    schema_version: int = Field(ge=1)
+    # Only policy schema v1 semantics are implemented; a policy declaring any
+    # other version must fail closed rather than be silently misinterpreted.
+    schema_version: Literal[1]
     name: str = Field(min_length=1)
 
 
@@ -89,7 +92,9 @@ class ActionRiskPolicy(_Strict):
 
 
 class NotificationEscalationPolicy(_Strict):
-    notify_values: list[str] = Field(min_length=1)
+    # Canonical SendUpdates enum: a typo like "al" fails loading instead of
+    # silently changing escalation behavior.
+    notify_values: list[SendUpdates] = Field(min_length=1)
     escalate_external_notifications_to_high: bool
 
 
