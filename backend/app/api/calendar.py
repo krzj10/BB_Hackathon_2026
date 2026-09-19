@@ -12,7 +12,7 @@ import logging
 from fastapi import APIRouter, HTTPException, Query, Request
 
 from ..contracts.api import MeetingResponse, TodayCalendarResponse
-from ..google.auth import GoogleAuth
+from ..google.auth import GoogleAuth, GoogleAuthError
 from ..google.calendar import CalendarReadError, CalendarService
 from ..google.http import AuthorizedGoogleHttp, GoogleHttpError
 
@@ -27,10 +27,15 @@ def _service(request: Request) -> CalendarService:
         raise HTTPException(status_code=503, detail="google auth is not initialized")
     try:
         session = auth.authorized_session()
-    except Exception as exc:  # sanitized GoogleAuthError messages only
+    except GoogleAuthError as exc:  # sanitized by construction
         raise HTTPException(
             status_code=503,
             detail=f"calendar unavailable: {exc}; start authorization at /api/auth/google/start",
+        ) from None
+    except Exception:
+        logger.exception("unexpected failure preparing calendar session")
+        raise HTTPException(
+            status_code=503, detail="calendar is temporarily unavailable"
         ) from None
     factory = getattr(request.app.state, "google_http_factory", None)
     http = factory(session) if factory is not None else AuthorizedGoogleHttp(session)

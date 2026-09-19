@@ -19,9 +19,10 @@ import json
 import logging
 import os
 import secrets
+import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Callable
@@ -63,31 +64,39 @@ class CallbackResult:
 
 
 class StateStore:
-    """One-time OAuth state with expiry. consume() is single-use: replayed or
-    unknown values always return False."""
+    """One-time OAuth state with expiry, safe for concurrent handlers.
+
+    consume() is atomic and single-use: replayed or unknown values always
+    return False. A lock covers the mutations because FastAPI synchronous
+    route handlers may execute on different worker threads."""
 
     def __init__(self, ttl_seconds: float = 600.0, clock: Callable[[], float] = time.monotonic) -> None:
         self._ttl = ttl_seconds
         self._clock = clock
         self._issued: dict[str, float] = {}
+        self._lock = threading.Lock()
 
     def issue(self) -> str:
-        now = self._clock()
-        self._issued = {s for s in [k for k, exp in self._issued.items() if exp > now]} \
-            if False else {k: exp for k, exp in self._issued.items() if exp > now}
-        state = secrets.token_urlsafe(32)
-        self._issued[state] = now + self._ttl
-        return state
+        with self._lock:
+            now = self._clock()
+            self._issued = {
+                state: expiry for state, expiry in self._issued.items() if expiry > now
+            }
+            state = secrets.token_urlsafe(32)
+            self._issued[state] = now + self._ttl
+            return state
 
     def consume(self, state: str | None) -> bool:
-        """Validate and invalidate in one step (replay protection)."""
+        """Validate and invalidate in one atomic step (replay protection)."""
         if not state:
             return False
-        expiry = self._issued.pop(state, None)
+        with self._lock:
+            expiry = self._issued.pop(state, None)
         return expiry is not None and expiry > self._clock()
 
     def pending_count(self) -> int:
-        return len(self._issued)
+        with self._lock:
+            return len(self._issued)
 
 
 def _default_token_exchanger(client_id: str, client_secret: str, redirect_uri: str):
@@ -189,27 +198,32 @@ class GoogleAuth:
         return f"{AUTHORIZATION_ENDPOINT}?{urlencode(params)}"
 
     def handle_callback(self, query: dict) -> CallbackResult:
-        """Process the callback GET. ``query`` is the raw query mapping."""
+        """Process the callback GET. ``query`` is the raw query mapping.
+
+        The one-time state is validated and consumed FIRST, unconditionally -
+        provider errors and consent denials included. A callback carrying an
+        unknown, expired or already-consumed state is always INVALID_STATE, so
+        forged error/denial callbacks cannot be presented as genuine."""
+        if not self.state_store.consume(query.get("state")):
+            # Covers missing, unknown, expired AND replayed states, for every
+            # callback kind (success, denial, provider error).
+            return CallbackResult(
+                OAuthOutcome.INVALID_STATE,
+                "oauth state is missing, expired or already used (possible replay)",
+            )
+
         error = query.get("error")
+        if error == "access_denied":
+            return CallbackResult(
+                OAuthOutcome.DENIED, "consent was denied; no credentials were stored"
+            )
         if error:
-            self.state_store.consume(query.get("state"))  # burn any presented state
-            if error == "access_denied":
-                return CallbackResult(
-                    OAuthOutcome.DENIED, "consent was denied; no credentials were stored"
-                )
             return CallbackResult(OAuthOutcome.EXCHANGE_FAILED, f"provider error: {error}")
 
         if not self.configured:
             return CallbackResult(
                 OAuthOutcome.NOT_CONFIGURED,
                 "Google OAuth client id/secret are not configured",
-            )
-
-        if not self.state_store.consume(query.get("state")):
-            # Covers missing, unknown, expired AND replayed states.
-            return CallbackResult(
-                OAuthOutcome.INVALID_STATE,
-                "oauth state is missing, expired or already used (possible replay)",
             )
 
         code = query.get("code")
@@ -241,22 +255,22 @@ class GoogleAuth:
 
     # -- credential storage ------------------------------------------------------
 
-    def _store_credentials(self, info: dict, granted: tuple[str, ...]) -> None:
-        self._credentials_path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "refresh_token": info.get("refresh_token"),
-            "access_token": info.get("access_token"),
-            "token_uri": TOKEN_ENDPOINT,
-            "client_id": self._settings.google_client_id,
-            "scopes": list(granted),
-            "saved_at": datetime.now(timezone.utc).isoformat(),
-        }
-        if payload["refresh_token"] is None:
-            # Offline access is mandatory; a grant without a refresh token means
-            # the flow must be repeated with consent.
+    @staticmethod
+    def _expiry_from_token_response(info: dict) -> datetime:
+        """Convert Google's ``expires_in`` seconds into an aware absolute UTC
+        expiry. Missing/non-positive/non-numeric values fail closed: storing a
+        token whose validity cannot be determined would defeat the refresh
+        flow (an existing access token is never proof of validity)."""
+        raw = info.get("expires_in")
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)) or raw <= 0:
             raise GoogleAuthError(
-                "provider returned no refresh token; reconnect with offline access"
+                "token response missing a valid expires_in; refusing to store "
+                "credentials whose expiry is unknown"
             )
+        return datetime.now(timezone.utc) + timedelta(seconds=float(raw))
+
+    def _write_credentials(self, payload: dict) -> None:
+        self._credentials_path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(
             self._credentials_path,
             os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
@@ -268,6 +282,48 @@ class GoogleAuth:
             os.chmod(self._credentials_path, 0o600)
         except OSError:  # best-effort on non-POSIX; path stays gitignored
             pass
+
+    def _store_credentials(self, info: dict, granted: tuple[str, ...]) -> None:
+        if info.get("refresh_token") is None:
+            # Offline access is mandatory; a grant without a refresh token means
+            # the flow must be repeated with consent.
+            raise GoogleAuthError(
+                "provider returned no refresh token; reconnect with offline access"
+            )
+        expiry = self._expiry_from_token_response(info)
+        self._write_credentials(
+            {
+                "refresh_token": info["refresh_token"],
+                "access_token": info.get("access_token"),
+                # Explicit aware UTC ISO-8601 ("+00:00"); validity of the
+                # stored access token is decided by this, never by presence.
+                "expiry": expiry.isoformat(),
+                "token_uri": TOKEN_ENDPOINT,
+                "client_id": self._settings.google_client_id,
+                "scopes": list(granted),
+                "saved_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+
+    def _persist_refreshed(self, credentials: Credentials, previous_refresh_token: str) -> None:
+        """Persist a successful refresh: new access token + expiry, keeping the
+        previous refresh token when Google does not rotate it."""
+        expiry = credentials.expiry
+        if expiry is None:
+            raise GoogleAuthError("refreshed credentials arrived without an expiry")
+        if expiry.tzinfo is None:  # google-auth uses naive-UTC internally
+            expiry = expiry.replace(tzinfo=timezone.utc)
+        self._write_credentials(
+            {
+                "refresh_token": credentials.refresh_token or previous_refresh_token,
+                "access_token": credentials.token,
+                "expiry": expiry.astimezone(timezone.utc).isoformat(),
+                "token_uri": TOKEN_ENDPOINT,
+                "client_id": self._settings.google_client_id,
+                "scopes": list(credentials.scopes or REQUIRED_SCOPES),
+                "saved_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
 
     def _load_credentials(self) -> dict | None:
         if not self._credentials_path.exists():
@@ -290,7 +346,25 @@ class GoogleAuth:
 
     # -- authorized access ---------------------------------------------------------
 
+    #: Sentinel expiry for stored credentials whose expiry is missing or
+    #: corrupt: treat the access token as expired and force a refresh rather
+    #: than trusting mere presence of a token string.
+    _EXPIRED_SENTINEL = datetime(1970, 1, 1)
+
     def _build_credentials(self, data: dict) -> Credentials:
+        expiry = self._EXPIRED_SENTINEL
+        raw_expiry = data.get("expiry")
+        if isinstance(raw_expiry, str):
+            try:
+                parsed = datetime.fromisoformat(raw_expiry)
+            except ValueError:
+                parsed = None
+            if parsed is not None:
+                if parsed.tzinfo is None or parsed.tzinfo.utcoffset(parsed) is None:
+                    parsed = None
+                else:
+                    # google-auth compares against naive UTC internally.
+                    expiry = parsed.astimezone(timezone.utc).replace(tzinfo=None)
         return Credentials(
             token=data.get("access_token"),
             refresh_token=data["refresh_token"],
@@ -298,31 +372,51 @@ class GoogleAuth:
             client_id=data.get("client_id", self._settings.google_client_id),
             client_secret=self._settings.google_client_secret,
             scopes=tuple(data.get("scopes") or REQUIRED_SCOPES),
+            expiry=expiry,
         )
 
     def authorized_session(self):
-        """An AuthorizedSession that refreshes transparently. On refresh
-        failure marks reauthorization-required and raises a sanitized error -
-        callers must route the user back through authorization."""
+        """An AuthorizedSession, pre-refreshed when the persisted expiry says
+        the access token is no longer valid.
+
+        On a successful refresh the new access token and expiry are written
+        back to the credential file (the previous refresh token is preserved
+        when Google does not rotate it). On a rejected refresh the store is
+        marked reauthorization-required and only a sanitized error is raised.
+
+        Known boundary: a late 401-triggered auto-refresh inside
+        AuthorizedSession can still fail mid-request; that surfaces as a
+        sanitized transport/read error here. Flipping reauth state from inside
+        the SDK's auth flow needs custom transport plumbing deliberately
+        deferred to A04/A07 - the common expired-token path is handled above
+        through the persisted expiry before any request is made."""
         if not self.configured:
             raise GoogleAuthError("Google OAuth client id/secret are not configured")
         data = self._load_credentials()
         if data is None:
             raise GoogleAuthError("google account not connected; start the OAuth flow")
         credentials = self._build_credentials(data)
-        try:
-            if not credentials.valid:
+        if not credentials.valid:
+            try:
                 self._refresher(credentials)
-        except RefreshError as exc:
-            # Token expired/revoked (e.g. Testing-mode 7-day expiry).
-            self._reauth_required = True
-            self._last_refresh_error = "refresh rejected"
-            logger.warning("google refresh failed; reauthorization required")
-            raise GoogleAuthError(
-                "stored credentials could not be refreshed; reauthorization required"
-            ) from exc
-        except OSError as exc:
-            raise GoogleAuthError("token endpoint unreachable during refresh") from exc
+            except RefreshError as exc:
+                # Token revoked or expired beyond refresh (e.g. Testing-mode
+                # 7-day expiry). Never surface the provider message verbatim.
+                self._reauth_required = True
+                self._last_refresh_error = "refresh rejected"
+                logger.warning("google refresh failed; reauthorization required")
+                raise GoogleAuthError(
+                    "stored credentials could not be refreshed; reauthorization required"
+                ) from exc
+            except OSError as exc:
+                raise GoogleAuthError("token endpoint unreachable during refresh") from exc
+            try:
+                self._persist_refreshed(credentials, previous_refresh_token=data["refresh_token"])
+            except GoogleAuthError:
+                # A usable session exists but cannot be durably re-stored; the
+                # next process start will simply refresh again. Not fatal for
+                # this request; recorded for honesty in logs only.
+                logger.warning("google refreshed credentials could not be persisted")
         self._reauth_required = False
         if self._session_factory is not None:
             return self._session_factory(credentials)

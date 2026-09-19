@@ -208,13 +208,16 @@ class GmailService:
             token = payload.get("nextPageToken")
             if token is None or len(summaries) >= limit:
                 break
-        else:
-            if token is not None:
-                status = RetrievalStatus.PARTIAL
-                notes.append("search stopped at page budget; results are partial")
-        if len(summaries) >= limit:
-            # Deliberate bound, reported honestly rather than pretending "all".
-            notes.append(f"search bounded at limit={limit}; more matches may exist")
+        # A non-null continuation token after the loop means results remain
+        # behind a deliberate bound (limit or page budget): status must say
+        # PARTIAL, not merely carry a note. Exactly `limit` results with no
+        # next token stay COMPLETE.
+        if token is not None:
+            status = RetrievalStatus.PARTIAL
+            notes.append(
+                "search stopped at the result/page bound while nextPageToken "
+                "existed; more matches exist"
+            )
         return summaries, status, notes
 
     def _summarize(self, raw: dict[str, Any]) -> ThreadSummary | None:

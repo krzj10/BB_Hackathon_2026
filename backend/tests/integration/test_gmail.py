@@ -82,7 +82,17 @@ def test_search_is_bounded_by_limit() -> None:
     service = GmailService(FakeHttp([page]))
     summaries, status, notes = service.search("from:cfo@example.com", limit=2)
     assert [s.thread_id for s in summaries] == ["t1", "t2"]
-    assert any("bounded" in note for note in notes)  # honest bound reporting
+    # Limit stopped retrieval while a continuation token existed -> PARTIAL.
+    assert status is RetrievalStatus.PARTIAL
+    assert any("nextPageToken" in note for note in notes)
+
+
+def test_search_complete_when_no_continuation_token() -> None:
+    page = {"threads": [{"id": "t1"}, {"id": "t2"}]}  # no nextPageToken
+    service = GmailService(FakeHttp([page]))
+    summaries, status, notes = service.search("subject:x", limit=2)
+    assert [s.thread_id for s in summaries] == ["t1", "t2"]
+    assert status is RetrievalStatus.COMPLETE
 
 
 def test_search_paginates_until_limit_or_pages() -> None:

@@ -14,7 +14,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
 from ..contracts.api import IntegrationsResponse
-from ..google.auth import GoogleAuth, OAuthOutcome
+from ..google.auth import GoogleAuth, GoogleAuthError, OAuthOutcome
 
 logger = logging.getLogger("eva.api.auth_google")
 
@@ -33,9 +33,16 @@ def start(request: Request) -> dict[str, str]:
     """Issue a fresh one-time state and return the exact offline consent URL."""
     try:
         return {"authorize_url": _auth(request).authorization_url()}
-    except Exception as exc:
+    except GoogleAuthError as exc:
         # GoogleAuthError messages are sanitized by construction.
         raise HTTPException(status_code=503, detail=str(exc)) from None
+    except Exception:
+        # Unexpected failures must never leak str(exc) to the client; nothing
+        # secret is logged either (no args rendered).
+        logger.exception("unexpected failure issuing oauth start url")
+        raise HTTPException(
+            status_code=503, detail="authorization start is temporarily unavailable"
+        ) from None
 
 
 @router.get("/auth/google/callback")
@@ -45,9 +52,17 @@ def callback(
     state: str | None = Query(default=None),
     error: str | None = Query(default=None),
 ) -> JSONResponse:
-    result = _auth(request).handle_callback(
-        {"code": code, "state": state, "error": error}
-    )
+    try:
+        result = _auth(request).handle_callback(
+            {"code": code, "state": state, "error": error}
+        )
+    except GoogleAuthError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    except Exception:
+        logger.exception("unexpected failure handling oauth callback")
+        raise HTTPException(
+            status_code=500, detail="authorization callback failed unexpectedly"
+        ) from None
     body = {
         "outcome": result.outcome.value,
         "detail": result.detail,

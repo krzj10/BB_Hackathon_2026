@@ -94,32 +94,60 @@ def test_midnight_day_bounds_are_warsaw_aware() -> None:
 
 
 # ---------------------------------------------------------------------------
-# All-day semantics (never converted to timed; exclusive end preserved)
+# All-day semantics - REAL Google payload shape (start.date / end.date;
+# end.date is already the exclusive end). No "endDate" anywhere.
 # ---------------------------------------------------------------------------
 
 
-def test_all_day_span_maps_google_exclusive_end() -> None:
-    raw = timed_event(
-        start={"date": "2026-09-25"},
-        end={"endDate": "2026-09-27"},
-    )
+def test_all_day_one_day_event_maps_exclusive_end_directly() -> None:
+    raw = timed_event(start={"date": "2026-09-25"}, end={"date": "2026-09-26"})
     meeting = normalize_event("primary", raw, RETRIEVED)
     assert isinstance(meeting.span, AllDaySpan)
     assert meeting.span.start_date == date(2026, 9, 25)
+    assert meeting.span.end_exclusive == date(2026, 9, 26)
+
+
+def test_all_day_multi_day_event_preserves_google_exclusive_end() -> None:
+    raw = timed_event(start={"date": "2026-09-25"}, end={"date": "2026-09-27"})
+    meeting = normalize_event("primary", raw, RETRIEVED)
+    assert isinstance(meeting.span, AllDaySpan)
+    assert meeting.span.start_date == date(2026, 9, 25)
+    # Exactly 2026-09-27 - never reinterpreted as 2026-09-26.
     assert meeting.span.end_exclusive == date(2026, 9, 27)
 
 
-def test_all_day_without_end_date_gets_implicit_exclusive_end() -> None:
-    raw = timed_event(start={"date": "2026-09-25"}, end={"date": "2026-09-25"})
-    meeting = normalize_event("primary", raw, RETRIEVED)
-    assert isinstance(meeting.span, AllDaySpan)
-    assert meeting.span.end_exclusive == date(2026, 9, 26)
+def test_all_day_missing_end_date_is_rejected_not_invented() -> None:
+    raw = timed_event(start={"date": "2026-09-25"}, end={})
+    with pytest.raises(ValueError):
+        normalize_event("primary", raw, RETRIEVED)
+
+
+def test_non_google_end_date_field_is_not_honored() -> None:
+    """A payload using the non-Google 'endDate' key must be treated as
+    malformed (rejected), proving normalization does not depend on it."""
+    raw = timed_event(start={"date": "2026-09-25"}, end={"endDate": "2026-09-27"})
+    with pytest.raises(ValueError):
+        normalize_event("primary", raw, RETRIEVED)
 
 
 def test_mixed_span_representation_is_rejected() -> None:
     raw = timed_event(start={"date": "2026-09-25"}, end={"dateTime": "2026-09-26T00:00:00+02:00"})
     with pytest.raises(ValueError):
         normalize_event("primary", raw, RETRIEVED)
+
+
+def test_all_day_span_flows_through_service_as_partial_when_malformed() -> None:
+    page = _page(
+        [
+            timed_event("evt-allday", start={"date": "2026-09-25"}, end={"date": "2026-09-27"}),
+            timed_event("evt-noend", start={"date": "2026-10-01"}, end={}),
+        ]
+    )
+    service = CalendarService(FakeHttp([page]))
+    meetings, status, notes = service.list_events()
+    assert [m.ref.event_id for m in meetings] == ["evt-allday"]
+    assert meetings[0].span.end_exclusive == date(2026, 9, 27)
+    assert status.value == "partial"
 
 
 # ---------------------------------------------------------------------------

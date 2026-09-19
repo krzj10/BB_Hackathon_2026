@@ -5,9 +5,12 @@ Normalization rules (deterministic; no live Google needed for tests):
 - timed events -> TimedSpan with the provider's IANA timezone preserved and
   aware start/end datetimes (Google's offset-bearing ISO strings are parsed,
   never re-based to host-local time);
-- all-day events -> AllDaySpan. Google's ``endDate`` is already exclusive and
-  maps straight onto ``end_exclusive``; when absent, the implicit exclusive
-  end is ``start + 1 day``. All-day events are NEVER converted to timed;
+- all-day events -> AllDaySpan. Real Google all-day payloads carry
+  ``{"start": {"date": ...}, "end": {"date": ...}}`` and Google's ``end.date``
+  is ALREADY the exclusive end date: it maps directly onto
+  ``end_exclusive`` with no reinterpretation. A missing or mixed
+  (date/dateTime) span is rejected as malformed, never invented; all-day
+  events are NEVER converted to timed;
 - organizer email, ETag (resource version), recurringEventId, description and
   location are preserved; attendee counts that Google does not return stay
   null (never invented zeros);
@@ -102,16 +105,18 @@ def normalize_event(calendar_id: str, raw: dict[str, Any], retrieved_at: datetim
         "date" in start
         and "dateTime" not in start
         and "dateTime" not in end
-        and ("date" in end or "endDate" in end)
+        and "date" in end
     ):
-        start_date = date.fromisoformat(start["date"])
-        if "endDate" in end:
-            end_exclusive = date.fromisoformat(end["endDate"])
-        else:  # Google's implicit rule: single-day event, exclusive end +1
-            end_exclusive = start_date + timedelta(days=1)
-        span = AllDaySpan(start_date=start_date, end_exclusive=end_exclusive)
+        # Real Google all-day shape: {"start": {"date": ...}, "end": {"date":
+        # ...}}. Google's end.date is ALREADY the exclusive end date, so it
+        # maps straight onto end_exclusive - never reinterpreted or shifted.
+        span = AllDaySpan(
+            start_date=date.fromisoformat(start["date"]),
+            end_exclusive=date.fromisoformat(end["date"]),
+        )
     else:
-        # Mixed or empty representations are never silently coerced.
+        # Missing ends and mixed timed/all-day representations are rejected
+        # (reported as honest partial retrieval by callers), never invented.
         raise ValueError(f"event {event_id!r} has an unsupported span representation")
 
     organizer = raw.get("organizer") or {}

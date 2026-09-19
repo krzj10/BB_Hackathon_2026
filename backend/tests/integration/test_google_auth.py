@@ -7,6 +7,7 @@ distinctive marker strings."""
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -44,6 +45,7 @@ def make_auth(tmp_path: Path, *, exchanger=None, refresher=None) -> GoogleAuth:
             "access_token": ACCESS_TOKEN,
             "refresh_token": REFRESH_TOKEN,
             "scope": " ".join(REQUIRED_SCOPES),
+            "expires_in": 3600,
         }
     return GoogleAuth(
         make_settings(tmp_path), token_exchanger=exchanger, refresher=refresher
@@ -51,7 +53,7 @@ def make_auth(tmp_path: Path, *, exchanger=None, refresher=None) -> GoogleAuth:
 
 
 # ---------------------------------------------------------------------------
-# State store: one-time, expiry, replay
+# State store: one-time, expiry, replay, thread-safety
 # ---------------------------------------------------------------------------
 
 
@@ -71,6 +73,29 @@ def test_state_expires() -> None:
     state = store.issue()
     now[0] += 61
     assert store.consume(state) is False
+
+
+def test_concurrent_consume_yields_exactly_one_winner() -> None:
+    import threading
+
+    store = StateStore()
+    state = store.issue()
+    barrier = threading.Barrier(2)
+    results: list[bool] = []
+    lock = threading.Lock()
+
+    def attempt() -> None:
+        barrier.wait()  # deterministic simultaneous start, no sleeps
+        won = store.consume(state)
+        with lock:
+            results.append(won)
+
+    threads = [threading.Thread(target=attempt) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    assert sorted(results) == [False, True]
 
 
 # ---------------------------------------------------------------------------
@@ -109,9 +134,46 @@ def test_callback_success_stores_offline_credentials(tmp_path) -> None:
     stored = json.loads(path.read_text(encoding="utf-8"))
     assert stored["refresh_token"] == REFRESH_TOKEN  # file itself is gitignored
 
+    # expires_in became an aware absolute UTC expiry (~1h ahead), persisted.
+    expiry = datetime.fromisoformat(stored["expiry"])
+    assert expiry.tzinfo is not None and expiry.utcoffset() == timedelta(0)
+    lead = expiry - datetime.now(timezone.utc)
+    assert timedelta(minutes=55) < lead <= timedelta(minutes=61)
+
     status = auth.status()
     assert status.connected is True
     assert set(status.granted_scopes) == set(REQUIRED_SCOPES)
+
+
+def test_callback_without_expires_in_stores_nothing(tmp_path) -> None:
+    def exchanger(code):
+        return {
+            "access_token": ACCESS_TOKEN,
+            "refresh_token": REFRESH_TOKEN,
+            "scope": " ".join(REQUIRED_SCOPES),  # no expires_in
+        }
+
+    auth = make_auth(tmp_path, exchanger=exchanger)
+    state = auth.state_store.issue()
+    result = auth.handle_callback({"code": "code-1", "state": state})
+    assert result.outcome is OAuthOutcome.EXCHANGE_FAILED  # fail closed
+    assert not Path(auth._settings.google_credentials_path).exists()
+
+
+def test_callback_malformed_expires_in_stores_nothing(tmp_path) -> None:
+    def exchanger(code):
+        return {
+            "access_token": ACCESS_TOKEN,
+            "refresh_token": REFRESH_TOKEN,
+            "scope": " ".join(REQUIRED_SCOPES),
+            "expires_in": "soon",  # malformed
+        }
+
+    auth = make_auth(tmp_path, exchanger=exchanger)
+    state = auth.state_store.issue()
+    result = auth.handle_callback({"code": "code-1", "state": state})
+    assert result.outcome is OAuthOutcome.EXCHANGE_FAILED
+    assert not Path(auth._settings.google_credentials_path).exists()
 
 
 def test_callback_replay_fails(tmp_path) -> None:
@@ -134,6 +196,40 @@ def test_callback_consent_denied_is_truthful_and_stores_nothing(tmp_path) -> Non
     result = auth.handle_callback({"state": state, "error": "access_denied"})
     assert result.outcome is OAuthOutcome.DENIED
     assert not Path(auth._settings.google_credentials_path).exists()
+
+
+# State binding applies to EVERY callback kind - denials and provider errors
+# included. Forged error callbacks must never be presented as genuine.
+
+
+def test_denial_with_unknown_state_is_invalid_state(tmp_path) -> None:
+    auth = make_auth(tmp_path)
+    result = auth.handle_callback({"state": "attacker-state", "error": "access_denied"})
+    assert result.outcome is OAuthOutcome.INVALID_STATE
+
+
+def test_denial_without_state_is_invalid_state(tmp_path) -> None:
+    auth = make_auth(tmp_path)
+    result = auth.handle_callback({"error": "access_denied"})
+    assert result.outcome is OAuthOutcome.INVALID_STATE
+
+
+def test_denial_state_replay_is_invalid_state(tmp_path) -> None:
+    auth = make_auth(tmp_path)
+    state = auth.state_store.issue()
+    first = auth.handle_callback({"state": state, "error": "access_denied"})
+    assert first.outcome is OAuthOutcome.DENIED  # valid denial consumes state
+    replay = auth.handle_callback({"state": state, "error": "access_denied"})
+    assert replay.outcome is OAuthOutcome.INVALID_STATE
+
+
+def test_other_provider_error_requires_valid_state(tmp_path) -> None:
+    auth = make_auth(tmp_path)
+    forged = auth.handle_callback({"state": "never-issued", "error": "server_error"})
+    assert forged.outcome is OAuthOutcome.INVALID_STATE  # not provider-error
+    state = auth.state_store.issue()
+    genuine = auth.handle_callback({"state": state, "error": "server_error"})
+    assert genuine.outcome is OAuthOutcome.EXCHANGE_FAILED
 
 
 def test_callback_missing_scope_is_reported_and_stores_nothing(tmp_path) -> None:
@@ -165,7 +261,11 @@ def test_callback_exchange_failure_is_sanitized(tmp_path) -> None:
 
 def test_callback_without_refresh_token_is_rejected(tmp_path) -> None:
     def exchanger(code):
-        return {"access_token": ACCESS_TOKEN, "scope": " ".join(REQUIRED_SCOPES)}
+        return {
+            "access_token": ACCESS_TOKEN,
+            "scope": " ".join(REQUIRED_SCOPES),
+            "expires_in": 3600,
+        }
 
     auth = make_auth(tmp_path, exchanger=exchanger)
     state = auth.state_store.issue()
@@ -175,21 +275,71 @@ def test_callback_without_refresh_token_is_rejected(tmp_path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Refresh failure -> reauthorization-required
+# Refresh: expiry-driven, persistence write-back, reauthorization-required
 # ---------------------------------------------------------------------------
+
+
+def _force_expired_credentials(auth: GoogleAuth) -> None:
+    """Rewrite the stored credential file so the (still non-empty) access
+    token is expired. Expiry - not token presence - decides validity."""
+    path = Path(auth._settings.google_credentials_path)
+    stored = json.loads(path.read_text(encoding="utf-8"))
+    stored["expiry"] = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    path.write_text(json.dumps(stored), encoding="utf-8")
+
+
+def test_expired_access_token_triggers_refresher(tmp_path) -> None:
+    auth = make_auth(tmp_path)
+    state = auth.state_store.issue()
+    auth.handle_callback({"code": "code-1", "state": state})
+    _force_expired_credentials(auth)
+
+    calls: list[str] = []
+
+    def succeeding_refresher(credentials):
+        calls.append("refresh")
+        credentials.token = "REFRESHED-ACCESS-TOKEN"
+        # google-auth convention: naive UTC expiry internally.
+        credentials.expiry = datetime.now(timezone.utc).replace(
+            tzinfo=None
+        ) + timedelta(hours=1)
+
+    auth._refresher = succeeding_refresher
+    session = auth.authorized_session()
+    assert session is not None
+    assert calls == ["refresh"]  # non-empty but expired token was NOT trusted
+
+
+def test_successful_refresh_persists_token_and_expiry(tmp_path) -> None:
+    auth = make_auth(tmp_path)
+    state = auth.state_store.issue()
+    auth.handle_callback({"code": "code-1", "state": state})
+    _force_expired_credentials(auth)
+
+    def succeeding_refresher(credentials):
+        credentials.token = "REFRESHED-ACCESS-TOKEN"
+        credentials.expiry = datetime.now(timezone.utc).replace(
+            tzinfo=None
+        ) + timedelta(hours=1)
+        # Google usually omits refresh_token on refresh: the stored one stays.
+
+    auth._refresher = succeeding_refresher
+    auth.authorized_session()
+
+    path = Path(auth._settings.google_credentials_path)
+    stored = json.loads(path.read_text(encoding="utf-8"))
+    assert stored["access_token"] == "REFRESHED-ACCESS-TOKEN"  # new token persisted
+    expiry = datetime.fromisoformat(stored["expiry"])
+    assert expiry.tzinfo is not None and expiry > datetime.now(timezone.utc)
+    assert stored["refresh_token"] == REFRESH_TOKEN  # preserved, not rotated away
+    assert auth.status().connected is True
 
 
 def test_refresh_failure_marks_reauthorization_required(tmp_path) -> None:
     auth = make_auth(tmp_path)
     state = auth.state_store.issue()
-    assert auth.handle_callback({"code": "code-1", "state": state}).outcome is OAuthOutcome.CONNECTED
-
-    # Force the stored credentials to look stale (no access token) and make
-    # refresh fail exactly like Google's 7-day testing-mode expiry.
-    path = Path(auth._settings.google_credentials_path)
-    stored = json.loads(path.read_text(encoding="utf-8"))
-    stored["access_token"] = None
-    path.write_text(json.dumps(stored), encoding="utf-8")
+    auth.handle_callback({"code": "code-1", "state": state})
+    _force_expired_credentials(auth)  # access token stays non-empty; expiry past
 
     def failing_refresher(credentials):
         raise RefreshError("Token has been expired or revoked.")
@@ -266,6 +416,18 @@ def test_route_start_returns_authorize_url(tmp_path) -> None:
     url = response.json()["authorize_url"]
     assert "access_type=offline" in url and "state=" in url
     assert CLIENT_SECRET not in url
+
+
+def test_route_start_unexpected_failure_is_generic(tmp_path) -> None:
+    class ExplodingAuth:
+        def authorization_url(self):
+            raise RuntimeError("internal detail with sensitive context")
+
+    client = make_client(tmp_path, auth=ExplodingAuth())
+    response = client.get("/api/auth/google/start")
+    assert response.status_code == 503
+    assert response.json()["detail"] == "authorization start is temporarily unavailable"
+    assert "sensitive" not in response.text
 
 
 def test_route_callback_flow_and_replay(tmp_path) -> None:
