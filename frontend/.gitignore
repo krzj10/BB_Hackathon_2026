@@ -11,3 +11,8 @@ node_modules/
 
 # Test coverage
 coverage/
+
+# The root .gitignore carries a Python `lib/` rule that matches this
+# directory at any depth. Re-include our first-party frontend lib.
+!src/lib/
+!src/lib/**

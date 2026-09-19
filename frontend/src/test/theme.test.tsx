@@ -1,5 +1,5 @@
 import { fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ThemeProvider, useTheme } from "../components/theme/ThemeProvider";
 import { ThemeToggle } from "../components/theme/ThemeToggle";
 
@@ -12,12 +12,26 @@ function renderWithProvider(ui: React.ReactElement) {
   return render(<ThemeProvider>{ui}</ThemeProvider>);
 }
 
+function mockSystemPreference(prefersDark: boolean) {
+  vi.spyOn(window, "matchMedia").mockImplementation((query: string) => ({
+    matches: query === "(prefers-color-scheme: dark)" ? prefersDark : false,
+    media: query,
+    onchange: null,
+    addListener: () => {},
+    removeListener: () => {},
+    addEventListener: () => {},
+    removeEventListener: () => {},
+    dispatchEvent: () => false,
+  }));
+}
+
 beforeEach(() => {
   localStorage.clear();
   document.documentElement.classList.remove("dark");
 });
 
 afterEach(() => {
+  vi.restoreAllMocks();
   document.documentElement.classList.remove("dark");
 });
 
@@ -31,6 +45,35 @@ describe("theme", () => {
     );
     expect(screen.getByTestId("theme-value")).toHaveTextContent("system");
     expect(document.documentElement).not.toHaveClass("dark");
+  });
+
+  it("resolves system theme to dark when the OS prefers dark (no flash regression)", () => {
+    mockSystemPreference(true);
+
+    renderWithProvider(<ThemeProbe />);
+
+    expect(screen.getByTestId("theme-value")).toHaveTextContent("system");
+    expect(document.documentElement).toHaveClass("dark");
+  });
+
+  it("a persisted light choice overrides a dark system preference", () => {
+    localStorage.setItem("eva-theme", "light");
+    mockSystemPreference(true);
+
+    renderWithProvider(<ThemeProbe />);
+
+    expect(screen.getByTestId("theme-value")).toHaveTextContent("light");
+    expect(document.documentElement).not.toHaveClass("dark");
+  });
+
+  it("a persisted dark choice overrides a light system preference", () => {
+    localStorage.setItem("eva-theme", "dark");
+    mockSystemPreference(false);
+
+    renderWithProvider(<ThemeProbe />);
+
+    expect(screen.getByTestId("theme-value")).toHaveTextContent("dark");
+    expect(document.documentElement).toHaveClass("dark");
   });
 
   it("toggles to dark, applies the .dark class and persists the choice", () => {

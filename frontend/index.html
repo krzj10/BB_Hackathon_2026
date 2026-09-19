@@ -8,15 +8,19 @@
     <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#131316" />
     <title>EVA</title>
     <script>
-      // Apply the stored theme before first paint to avoid a flash.
+      // Pre-paint theme resolution to avoid a flash. Truth table mirrors
+      // src/lib/theme.ts (keep both in sync): "dark" => dark, "light" => light,
+      // "system"/missing/invalid/storage-failure => prefers-color-scheme.
       (function () {
+        var stored = null;
         try {
-          var stored = localStorage.getItem("eva-theme");
-          var dark = stored
-            ? stored === "dark"
-            : window.matchMedia("(prefers-color-scheme: dark)").matches;
-          if (dark) document.documentElement.classList.add("dark");
+          var value = localStorage.getItem("eva-theme");
+          if (value === "dark" || value === "light" || value === "system") stored = value;
         } catch (e) {}
+        var prefersDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+        if (stored === "dark" || (stored !== "light" && prefersDark)) {
+          document.documentElement.classList.add("dark");
+        }
       })();
     </script>
   </head>

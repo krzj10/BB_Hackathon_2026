@@ -16,9 +16,11 @@
   --background: oklch(0.984 0.002 260);
   --surface: oklch(0.972 0.003 260);
   --card: oklch(1 0 0);
+  --muted: oklch(0.955 0.003 260);
 
   /* Text */
   --foreground: oklch(0.21 0.01 260);
+  --card-foreground: oklch(0.21 0.01 260);
   --muted-foreground: oklch(0.5 0.012 260);
   --subtle-foreground: oklch(0.63 0.01 260);
 
@@ -51,9 +53,11 @@
   --background: oklch(0.145 0.005 262);
   --surface: oklch(0.175 0.005 262);
   --card: oklch(0.2 0.006 262);
+  --muted: oklch(0.235 0.006 262);
 
   /* Text */
   --foreground: oklch(0.925 0.005 262);
+  --card-foreground: oklch(0.925 0.005 262);
   --muted-foreground: oklch(0.68 0.008 262);
   --subtle-foreground: oklch(0.56 0.008 262);
 
@@ -86,7 +90,9 @@
   --color-background: var(--background);
   --color-surface: var(--surface);
   --color-card: var(--card);
+  --color-muted: var(--muted);
   --color-foreground: var(--foreground);
+  --color-card-foreground: var(--card-foreground);
   --color-muted-foreground: var(--muted-foreground);
   --color-subtle-foreground: var(--subtle-foreground);
   --color-border: var(--border);
@@ -164,5 +170,17 @@
   100% {
     transform: scale(1.9);
     opacity: 0;
+  }
+}
+
+/* Reduced motion: drop all continuous orb motion (breathe/pulse/spin/echo).
+   State stays distinguishable via the static treatment — accent core dot,
+   static listening ring, static thinking arc, static speaking rings. */
+@media (prefers-reduced-motion: reduce) {
+  .animate-orb-breathe,
+  .animate-orb-ring,
+  .animate-orb-spin,
+  .animate-orb-echo {
+    animation: none;
   }
 }

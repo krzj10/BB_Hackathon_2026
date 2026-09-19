@@ -54,7 +54,7 @@ export function VoiceOrb({ className }: { className?: string }) {
         aria-label={`EVA voice orb — ${STATE_LABELS[state]} Activate to cycle preview states.`}
         className={cn(
           "relative grid size-16 place-items-center rounded-full bg-orb ring-1 ring-inset ring-white/15",
-          "transition-transform duration-200 ease-smooth hover:scale-105 active:scale-95",
+          "transition-transform duration-200 ease-smooth motion-safe:hover:scale-105 motion-safe:active:scale-95",
           "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background",
           state === "idle" && "animate-orb-breathe shadow-orb"
         )}

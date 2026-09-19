@@ -1,9 +1,12 @@
 import * as React from "react";
+import {
+  isDarkTheme,
+  readStoredTheme,
+  THEME_STORAGE_KEY,
+  type Theme,
+} from "../../lib/theme";
 
-export type Theme = "light" | "dark" | "system";
 type ResolvedTheme = "light" | "dark";
-
-const STORAGE_KEY = "eva-theme";
 
 type ThemeContextValue = {
   theme: Theme;
@@ -13,19 +16,6 @@ type ThemeContextValue = {
 
 const ThemeContext = React.createContext<ThemeContextValue | null>(null);
 
-function systemPrefersDark(): boolean {
-  return window.matchMedia("(prefers-color-scheme: dark)").matches;
-}
-
-function readStoredTheme(): Theme {
-  try {
-    const stored = localStorage.getItem(STORAGE_KEY);
-    return stored === "light" || stored === "dark" ? stored : "system";
-  } catch {
-    return "system";
-  }
-}
-
 function applyTheme(resolved: ResolvedTheme) {
   document.documentElement.classList.toggle("dark", resolved === "dark");
 }
@@ -33,16 +23,15 @@ function applyTheme(resolved: ResolvedTheme) {
 export function ThemeProvider({ children }: { children: React.ReactNode }) {
   const [theme, setThemeState] = React.useState<Theme>(() => readStoredTheme());
   const [resolvedTheme, setResolvedTheme] = React.useState<ResolvedTheme>(() =>
-    theme === "system" ? (systemPrefersDark() ? "dark" : "light") : theme
+    isDarkTheme(theme) ? "dark" : "light"
   );
 
   React.useEffect(() => {
-    const resolved: ResolvedTheme =
-      theme === "system" ? (systemPrefersDark() ? "dark" : "light") : theme;
+    const resolved: ResolvedTheme = isDarkTheme(theme) ? "dark" : "light";
     setResolvedTheme(resolved);
     applyTheme(resolved);
     try {
-      localStorage.setItem(STORAGE_KEY, theme);
+      localStorage.setItem(THEME_STORAGE_KEY, theme);
     } catch {
       // Storage unavailable (private mode) — session-only theme is fine.
     }

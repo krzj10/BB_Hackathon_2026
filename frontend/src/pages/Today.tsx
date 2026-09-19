@@ -29,15 +29,19 @@ const warshawDate = new Intl.DateTimeFormat("en-GB", {
   timeZone: "Europe/Warsaw",
 });
 
-const warshawTime = new Intl.DateTimeFormat("en-GB", {
-  hour: "2-digit",
-  minute: "2-digit",
+/** Warsaw wall-clock hour, so the greeting matches the displayed date. */
+const warshawHour = new Intl.DateTimeFormat("en-GB", {
+  hour: "numeric",
+  hourCycle: "h23",
   timeZone: "Europe/Warsaw",
 });
 
+/** Fixed preview time between the 11:00 and 14:00 placeholder events. */
+const PREVIEW_NOW_TIME = "11:40";
+
 export default function Today() {
   const now = new Date();
-  const hour = now.getHours();
+  const hour = Number(warshawHour.format(now));
   const greeting = hour < 12 ? "Good morning" : hour < 18 ? "Good afternoon" : "Good evening";
 
   return (
@@ -83,7 +87,7 @@ export default function Today() {
 
           <ol className="mt-3 divide-y divide-border/60 border-y border-border/60">
             {/* Past event — muted */}
-            <li className="flex gap-4 py-3.5 pl-4 opacity-60">
+            <li className="relative flex gap-4 py-3.5 pl-4 opacity-60">
               <span
                 aria-hidden
                 className="absolute left-0 mt-2 size-1.5 rounded-full bg-border-strong"
@@ -119,18 +123,18 @@ export default function Today() {
               </div>
             </li>
 
-            {/* Now marker */}
-            <li aria-label={`Current time ${warshawTime.format(now)}`} className="relative py-0">
+            {/* Now marker — fixed preview time consistent with its position */}
+            <li aria-label={`Now marker (preview) — ${PREVIEW_NOW_TIME}`} className="relative py-0">
               <div className="absolute inset-x-0 top-1/2 flex items-center gap-3">
                 <span className="h-px flex-1 bg-primary/40" />
                 <span className="rounded-full bg-primary/10 px-2 py-0.5 font-mono text-[10.5px] tabular-nums text-primary">
-                  Now · {warshawTime.format(now)}
+                  Now · {PREVIEW_NOW_TIME}
                 </span>
                 <span className="h-px flex-1 bg-primary/40" />
               </div>
             </li>
 
-            <li className="flex gap-4 py-3.5 pl-4">
+            <li className="relative flex gap-4 py-3.5 pl-4">
               <span
                 aria-hidden
                 className="absolute left-0 mt-2 size-1.5 rounded-full bg-border-strong"
