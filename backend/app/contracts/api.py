@@ -88,6 +88,23 @@ class ProposedActionResponse(ContractModel):
     action: ProposedAction
 
 
+class ApprovalChallengeResponse(ContractModel):
+    """Direct response of POST /api/actions/{action_id}/challenge (route is
+    A04-owned; the contract is frozen here).
+
+    The raw one-time challenge travels ONLY in this direct authenticated API
+    response - never inside ProposedAction, ActionProposedPayload,
+    ActionStatusChangedPayload, EventEnvelope, ToolResult or any other durable
+    event/cache surface. There is deliberately no channel field: the approval
+    channel stays server-derived at confirmation time."""
+
+    action_id: str = Field(min_length=1)
+    revision: int = Field(ge=1)
+    arguments_digest: str = Field(min_length=1)
+    challenge: str = Field(min_length=1)
+    expires_at: AwareDatetime
+
+
 class ActionConfirmResponse(ContractModel):
     action: ProposedAction
     receipt: ApprovalReceipt | None = None

@@ -2570,6 +2570,46 @@
       "title": "ProposedActionResponse",
       "type": "object"
     },
+    "ApprovalChallengeResponse": {
+      "additionalProperties": false,
+      "description": "Direct response of POST /api/actions/{action_id}/challenge (route is\nA04-owned; the contract is frozen here).\n\nThe raw one-time challenge travels ONLY in this direct authenticated API\nresponse - never inside ProposedAction, ActionProposedPayload,\nActionStatusChangedPayload, EventEnvelope, ToolResult or any other durable\nevent/cache surface. There is deliberately no channel field: the approval\nchannel stays server-derived at confirmation time.",
+      "properties": {
+        "action_id": {
+          "minLength": 1,
+          "title": "Action Id",
+          "type": "string"
+        },
+        "revision": {
+          "minimum": 1,
+          "title": "Revision",
+          "type": "integer"
+        },
+        "arguments_digest": {
+          "minLength": 1,
+          "title": "Arguments Digest",
+          "type": "string"
+        },
+        "challenge": {
+          "minLength": 1,
+          "title": "Challenge",
+          "type": "string"
+        },
+        "expires_at": {
+          "format": "date-time",
+          "title": "Expires At",
+          "type": "string"
+        }
+      },
+      "required": [
+        "action_id",
+        "revision",
+        "arguments_digest",
+        "challenge",
+        "expires_at"
+      ],
+      "title": "ApprovalChallengeResponse",
+      "type": "object"
+    },
     "ActionConfirmResponse": {
       "additionalProperties": false,
       "properties": {

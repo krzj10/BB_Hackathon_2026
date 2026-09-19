@@ -1,0 +1,82 @@
+# EVA deterministic policy kernel (A03) - AUTHORITATIVE configuration.
+#
+# This file is the single source of truth for triage thresholds, risk floors
+# and approval-channel rules. USER.md preferences, ORG.md descriptions, Focus
+# state, email content, LLM output and frontend requests can NEVER override
+# anything here (enforced in code: these values are read only from this file).
+#
+# The effective policy_version is derived from the validated content of this
+# file (canonical serialization + SHA-256), so any security-relevant edit
+# changes the version and invalidates outstanding proposals.
+#
+# Generic configuration only - no real users, companies or private data.
+
+policy:
+  schema_version: 1
+  name: eva-core
+
+proposal:
+  # Proposals expire this many seconds after creation (5 minutes).
+  ttl_seconds: 300
+
+financial_high:
+  # v1 supports exactly one decision currency; no conversion is performed.
+  currency: PLN
+  # >= threshold minor units (100000 = 1000.00 PLN) WITH current financial
+  # decision intent => HIGH. An amount without decision intent never
+  # triggers this rule.
+  threshold_minor_units: 100000
+
+meeting_triage:
+  # Case-insensitive substring markers over title/description/location/agenda.
+  high_markers:
+    - board
+    - zarzad
+    - investor
+    - inwestor
+    - contract negotiation
+    - negocjacje umowy
+    - strategic
+    - strategiczne
+    - due diligence
+  medium_markers:
+    - team
+    - zespol
+    - project
+    - projekt
+    - customer
+    - klient
+    - supplier
+    - dostawca
+    - review
+    - sprint
+  low_markers:
+    - catch-up
+    - coffee
+    - kawa
+    - informal
+    - nieformaln
+
+action_risk:
+  read_floor: low
+  calendar_mutation_floor: medium
+  local_write_floor: medium
+  # NOTE: "any mutation of a HIGH-priority meeting is HIGH" is a code-level
+  # invariant, deliberately NOT configuration (it cannot be weakened).
+
+notification_escalation:
+  # send_updates values considered sensitive notification effects.
+  notify_values: ["all", "external_only"]
+  # Calendar mutations that explicitly notify external parties escalate to
+  # HIGH (participant evidence must say so; unknown internals never invent it).
+  escalate_external_notifications_to_high: true
+
+approval:
+  low_requires_approval: false
+  low_channels: ["ui", "voice"]
+  medium_requires_approval: true
+  medium_channels: ["ui", "voice"]
+  # HIGH is UI-only. This is enforced by the loader: a policy that adds any
+  # non-ui channel here (or sets requires_approval to false) is invalid.
+  high_requires_approval: true
+  high_channels: ["ui"]
