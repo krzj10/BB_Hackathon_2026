@@ -1,8 +1,5 @@
 import type { MeetingSpan, Money } from "../api/types.generated";
 
-/** Fixed preview "now" between the canonical fixture meetings; real scheduling arrives with A00-driven data wiring. */
-export const PREVIEW_NOW = "12:00";
-
 const timeIn = (timeZone: string) =>
   new Intl.DateTimeFormat("en-GB", {
     hour: "2-digit",
@@ -16,8 +13,12 @@ export function formatSpanStart(span: MeetingSpan, fallbackTimeZone = "Europe/Wa
   return timeIn(span.timezone || fallbackTimeZone).format(new Date(span.start));
 }
 
-export function formatSpanEnd(span: MeetingSpan, fallbackTimeZone = "Europe/Warsaw"): string {
-  if (span.kind === "all_day") return "23:59";
+/** All-day spans have an exclusive end date, not a wall-clock end time — returns null for them. */
+export function formatSpanEnd(
+  span: MeetingSpan,
+  fallbackTimeZone = "Europe/Warsaw"
+): string | null {
+  if (span.kind === "all_day") return null;
   return timeIn(span.timezone || fallbackTimeZone).format(new Date(span.end));
 }
 

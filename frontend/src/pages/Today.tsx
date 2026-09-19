@@ -3,7 +3,7 @@ import { Bell, CircleDollarSign } from "lucide-react";
 import { Badge } from "../components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card";
 import { Separator } from "../components/ui/separator";
-import { getEvaClient, ApiError } from "../api/client";
+import { getEvaClient } from "../api/client";
 import type {
   AttentionItem,
   Decision,
@@ -37,8 +37,9 @@ function greetingFor(hour: number): string {
 }
 
 function MeetingRow({ meeting }: { meeting: Meeting }) {
+  const isAllDay = meeting.span.kind === "all_day";
   const start = formatSpanStart(meeting.span);
-  const end = formatSpanEnd(meeting.span);
+  const end = isAllDay ? null : formatSpanEnd(meeting.span);
   return (
     <li className="relative flex gap-4 py-3.5 pl-4">
       <span
@@ -60,10 +61,14 @@ function MeetingRow({ meeting }: { meeting: Meeting }) {
           {meeting.priority === "high" && <Badge variant="danger">High</Badge>}
           {meeting.priority === "medium" && <Badge variant="secondary">Medium</Badge>}
         </div>
-        <p className="mt-0.5 text-[12.5px] text-muted-foreground">
-          {start}–{end}
-          {meeting.location ? ` · ${meeting.location}` : ""}
-        </p>
+        {(() => {
+          const secondary: string[] = [];
+          if (!isAllDay && end) secondary.push(`${start}–${end}`);
+          if (meeting.location) secondary.push(meeting.location);
+          return secondary.length > 0 ? (
+            <p className="mt-0.5 text-[12.5px] text-muted-foreground">{secondary.join(" · ")}</p>
+          ) : null;
+        })()}
       </div>
     </li>
   );
@@ -71,7 +76,7 @@ function MeetingRow({ meeting }: { meeting: Meeting }) {
 
 function TimelineNowMarker() {
   return (
-    <li aria-label="Current time marker" className="relative py-0">
+    <li aria-label="Preview marker" className="relative py-0">
       <div className="absolute inset-x-0 top-1/2 flex items-center gap-3">
         <span className="h-px flex-1 bg-primary/40" />
         <span className="rounded-full bg-primary/10 px-2 py-0.5 font-mono text-[10.5px] tabular-nums text-primary">
@@ -119,29 +124,6 @@ function DecisionRow({ decision }: { decision: Decision }) {
         </p>
       </div>
     </li>
-  );
-}
-
-function FocusBadge({ focus }: { focus: FocusCurrentResponse }) {
-  const session = focus.session;
-  if (!session) {
-    return (
-      <>
-        <Stat label="Focus" value="Off" />
-        <Separator orientation="vertical" className="h-4" />
-      </>
-    );
-  }
-  return (
-    <>
-      <Stat
-        label="Focus"
-        value={`${session.threshold} until ${formatSpanEnd(
-          { kind: "timed", start: session.starts_at, end: session.ends_at, timezone: "Europe/Warsaw" }
-        )}`}
-      />
-      <Separator orientation="vertical" className="h-4" />
-    </>
   );
 }
 
@@ -215,8 +197,6 @@ function TimelineSection({ today }: { today: TodayCalendarResponse }) {
   const meetings = [...today.meetings].sort((a, b) =>
     compareSpanTimes(a.span, b.span)
   );
-  const now = new Date();
-  const currentHour = warsawHour(now);
 
   return (
     <section aria-labelledby="today-timeline" className="lg:col-span-3">
@@ -234,15 +214,10 @@ function TimelineSection({ today }: { today: TodayCalendarResponse }) {
       </div>
 
       <ol className="mt-3 divide-y divide-border/60 border-y border-border/60">
-        {meetings
-          .filter((meeting) => {
-            if (meeting.span.kind !== "timed") return true;
-            return new Date(meeting.span.end).getTime() > now.getTime() - 30 * 60 * 1000;
-          })
-          .map((meeting) => (
-            <MeetingRow key={`${meeting.ref.calendar_id}:${meeting.ref.event_id}`} meeting={meeting} />
-          ))}
-        {currentHour >= 12 && currentHour < 14 && <TimelineNowMarker />}
+        {meetings.map((meeting) => (
+          <MeetingRow key={`${meeting.ref.calendar_id}:${meeting.ref.event_id}`} meeting={meeting} />
+        ))}
+        {meetings.length > 0 && <TimelineNowMarker />}
       </ol>
       {today.retrieval_status !== "complete" && (
         <p className="mt-3 text-[12px] text-subtle-foreground">
@@ -253,19 +228,30 @@ function TimelineSection({ today }: { today: TodayCalendarResponse }) {
   );
 }
 
-function AttentionSection({ items }: { items: AttentionItem[] }) {
+function AttentionSection({ query }: { query: { status: string; data?: { items: AttentionItem[] }; error?: Error } }) {
   return (
     <Card>
       <CardHeader>
         <CardTitle>Attention</CardTitle>
-        {items.length > 0 && <Badge variant="secondary">{items.length}</Badge>}
+        {query.status === "ready" && query.data!.items.length > 0 && (
+          <Badge variant="secondary">{query.data!.items.length}</Badge>
+        )}
       </CardHeader>
       <CardContent>
-        {items.length === 0 ? (
+        {query.status === "loading" && (
+          <p className="py-2 text-[13px] text-muted-foreground">Loading attention…</p>
+        )}
+        {query.status === "error" && (
+          <p className="py-2 text-[13px] text-danger" role="alert">
+            Attention could not be loaded: {query.error?.message}
+          </p>
+        )}
+        {query.status === "ready" && query.data!.items.length === 0 && (
           <p className="py-2 text-[13px] text-muted-foreground">Nothing needs attention.</p>
-        ) : (
+        )}
+        {query.status === "ready" && query.data!.items.length > 0 && (
           <ul className="divide-y divide-border/60">
-            {items.map((item) => (
+            {query.data!.items.map((item) => (
               <AttentionRow key={item.id} item={item} />
             ))}
           </ul>
@@ -275,26 +261,39 @@ function AttentionSection({ items }: { items: AttentionItem[] }) {
   );
 }
 
-function DecisionSection({ items }: { items: Decision[] }) {
+function DecisionSection({ query }: { query: { status: string; data?: { items: Decision[] }; error?: Error } }) {
   return (
     <Card>
       <CardHeader>
         <CardTitle>Decisions</CardTitle>
-        {items.length > 0 && <Badge variant="warning">{items.length}</Badge>}
+        {query.status === "ready" && query.data!.items.length > 0 && (
+          <Badge variant="warning">{query.data!.items.length}</Badge>
+        )}
       </CardHeader>
       <CardContent>
-        {items.length === 0 ? (
-          <p className="py-2 text-[13px] text-muted-foreground">No decisions to record.</p>
-        ) : (
-          <ul className="divide-y divide-border/60">
-            {items.map((decision) => (
-              <DecisionRow key={decision.id} decision={decision} />
-            ))}
-          </ul>
+        {query.status === "loading" && (
+          <p className="py-2 text-[13px] text-muted-foreground">Loading decisions…</p>
         )}
-        <p className="mt-3 text-[11.5px] leading-relaxed text-subtle-foreground">
-          Preview only — outcome recording arrives in B02B.
-        </p>
+        {query.status === "error" && (
+          <p className="py-2 text-[13px] text-danger" role="alert">
+            Decisions could not be loaded: {query.error?.message}
+          </p>
+        )}
+        {query.status === "ready" && query.data!.items.length === 0 && (
+          <p className="py-2 text-[13px] text-muted-foreground">No decisions to record.</p>
+        )}
+        {query.status === "ready" && query.data!.items.length > 0 && (
+          <>
+            <ul className="divide-y divide-border/60">
+              {query.data!.items.map((decision) => (
+                <DecisionRow key={decision.id} decision={decision} />
+              ))}
+            </ul>
+            <p className="mt-3 text-[11.5px] leading-relaxed text-subtle-foreground">
+              Preview only — outcome recording arrives in B02B.
+            </p>
+          </>
+        )}
       </CardContent>
     </Card>
   );
@@ -307,23 +306,48 @@ export default function Today() {
   const attention = useEvaQuery(`attention:${reloadKey}`, (c) => c.getAttention(), client);
   const decisions = useEvaQuery(`decisions:${reloadKey}`, (c) => c.getDecisions(), client);
   const focus = useEvaQuery(`focus:${reloadKey}`, (c) => c.getCurrentFocus(), client);
+  const retry = () => setReloadKey((n) => n + 1);
 
   if (today.status === "loading") return <TodayLoading />;
   if (today.status === "error") {
-    return <TodayError onRetry={() => setReloadKey((n) => n + 1)} />;
+    return <TodayError onRetry={retry} />;
   }
 
   const todayData = today.data;
-  const attentionItems = attention.status === "ready" ? attention.data.items : [];
-  const decisionItems = decisions.status === "ready" ? decisions.data.items : [];
+  const sortedMeetings = [...todayData.meetings].sort((a, b) =>
+    compareSpanTimes(a.span, b.span)
+  );
+  const nextUp =
+    sortedMeetings.length > 0
+      ? `${sortedMeetings[0].title} · ${formatSpanStart(sortedMeetings[0].span)}`
+      : "Nothing scheduled";
 
+  const attentionReady = attention.status === "ready";
+  const decisionsReady = decisions.status === "ready";
+  const attentionItems = attentionReady ? attention.data.items : [];
+  const decisionItems = decisionsReady ? decisions.data.items : [];
+
+  // Full-page empty only when all three primary reads completed successfully and are genuinely empty.
   if (
+    attentionReady &&
+    decisionsReady &&
     todayData.meetings.length === 0 &&
     attentionItems.length === 0 &&
     decisionItems.length === 0
   ) {
     return <TodayEmpty />;
   }
+
+  const hasPartialFailure =
+    attention.status === "error" || decisions.status === "error" || focus.status === "error";
+
+  const focusStat = (() => {
+    if (focus.status === "loading") return "…";
+    if (focus.status === "error") return "Unavailable";
+    const session = (focus.data as FocusCurrentResponse).session;
+    if (!session) return "Off";
+    return `${session.threshold} until ${formatTimeInWarsaw(session.ends_at)}`;
+  })();
 
   return (
     <div className="mx-auto w-full max-w-5xl px-5 py-8 lg:px-8 lg:py-10">
@@ -343,20 +367,19 @@ export default function Today() {
 
       {/* Status strip — quiet inline stats, not cards */}
       <div className="mt-6 flex flex-wrap items-center gap-x-5 gap-y-3">
+        <Stat label="Next up" value={nextUp} />
+        <Separator orientation="vertical" className="h-4" />
+        <Stat label="Focus" value={focusStat} />
+        <Separator orientation="vertical" className="h-4" />
         <Stat
-          label="Next up"
-          value={
-            todayData.meetings.length > 0
-              ? `${todayData.meetings[0].title} · ${formatSpanStart(todayData.meetings[0].span)}`
-              : "Nothing scheduled"
-          }
+          label="Attention"
+          value={attentionReady ? `${attentionItems.length} new` : "…"}
         />
         <Separator orientation="vertical" className="h-4" />
-        {focus.status === "ready" ? <FocusBadge focus={focus.data} /> : <Stat label="Focus" value="…" />}
-        <Separator orientation="vertical" className="h-4" />
-        <Stat label="Attention" value={`${attentionItems.length} new`} />
-        <Separator orientation="vertical" className="h-4" />
-        <Stat label="Decisions" value={`${decisionItems.length} pending`} />
+        <Stat
+          label="Decisions"
+          value={decisionsReady ? `${decisionItems.length} pending` : "…"}
+        />
       </div>
 
       {/* Main grid */}
@@ -365,19 +388,28 @@ export default function Today() {
 
         {/* Right rail */}
         <div className="space-y-6 lg:col-span-2">
-          <AttentionSection items={attentionItems} />
-          <DecisionSection items={decisionItems} />
+          <AttentionSection query={attention} />
+          <DecisionSection query={decisions} />
         </div>
       </div>
 
-      {(attention.status === "error" || decisions.status === "error" || focus.status === "error") && (
-        <p role="alert" className="mt-6 text-[12.5px] text-danger">
-          Some panels could not be loaded
-          {attention.status === "error" ? ` (${(attention.error as ApiError).message})` : ""}
-          {decisions.status === "error" ? ` (${(decisions.error as ApiError).message})` : ""}
-          {focus.status === "error" ? ` (${(focus.error as ApiError).message})` : ""}
-          . Retry from the toolbar when ready.
-        </p>
+      {hasPartialFailure && (
+        <div role="alert" className="mt-6 flex flex-wrap items-center gap-3 text-[12.5px] text-danger">
+          <span>
+            Some panels could not be loaded
+            {attention.status === "error" ? ` — attention: ${attention.error?.message}` : ""}
+            {decisions.status === "error" ? ` — decisions: ${decisions.error?.message}` : ""}
+            {focus.status === "error" ? ` — focus: ${focus.error?.message}` : ""}
+            .
+          </span>
+          <button
+            type="button"
+            onClick={retry}
+            className="rounded-control border border-border-strong px-3 py-1 text-[12px] font-medium text-foreground transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            Retry
+          </button>
+        </div>
       )}
     </div>
   );
