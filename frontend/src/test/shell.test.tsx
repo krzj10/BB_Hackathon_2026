@@ -57,13 +57,12 @@ describe("Today page visual structure", () => {
   });
 });
 
-describe("section placeholders", () => {
-  it("renders the Briefings holding surface", () => {
+describe("Briefings page", () => {
+  it("renders the Briefings screen with meeting details", async () => {
     renderAppAt("/briefings");
 
-    expect(
-      screen.getByRole("heading", { level: 2, name: "Briefings" })
-    ).toBeInTheDocument();
-    expect(screen.getByText("Arrives with B02B")).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { level: 1, name: "ACME Contract Review" })).toBeInTheDocument();
+    expect(await screen.findByText("Language: PL")).toBeInTheDocument();
+    expect(await screen.findByText("Spoken Summary")).toBeInTheDocument();
   });
 });

@@ -1,7 +1,10 @@
 import { Navigate, Route, Routes } from "react-router-dom";
-import { Bell, Calendar, FileText, Library, ListChecks, Settings } from "lucide-react";
+import { Calendar, Library, Settings } from "lucide-react";
 import { AppShell } from "./components/layout/AppShell";
 import Today from "./pages/Today";
+import Briefings from "./pages/Briefings";
+import Attention from "./pages/Attention";
+import Decisions from "./pages/Decisions";
 import { SectionPlaceholder } from "./pages/SectionPlaceholder";
 
 export default function App() {
@@ -9,36 +12,9 @@ export default function App() {
     <Routes>
       <Route element={<AppShell />}>
         <Route index element={<Today />} />
-        <Route
-          path="briefings"
-          element={
-            <SectionPlaceholder
-              title="Briefings"
-              description="Executive briefings, prepared from your calendar and mail."
-              icon={FileText}
-            />
-          }
-        />
-        <Route
-          path="attention"
-          element={
-            <SectionPlaceholder
-              title="Attention"
-              description="One quiet queue for everything that needs your attention."
-              icon={Bell}
-            />
-          }
-        />
-        <Route
-          path="decisions"
-          element={
-            <SectionPlaceholder
-              title="Decisions"
-              description="Decisions surfaced from attention, ready to record."
-              icon={ListChecks}
-            />
-          }
-        />
+        <Route path="briefings" element={<Briefings />} />
+        <Route path="attention" element={<Attention />} />
+        <Route path="decisions" element={<Decisions />} />
         <Route
           path="calendar"
           element={

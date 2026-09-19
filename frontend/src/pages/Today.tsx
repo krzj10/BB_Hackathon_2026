@@ -12,6 +12,7 @@ import type {
   TodayCalendarResponse,
 } from "../api/types.generated";
 import { useEvaQuery } from "../hooks/useEvaQuery";
+import { FocusPanel } from "../components/focus/FocusPanel";
 import {
   compareSpanTimes,
   formatDay,
@@ -388,6 +389,7 @@ export default function Today() {
 
         {/* Right rail */}
         <div className="space-y-6 lg:col-span-2">
+          <FocusPanel />
           <AttentionSection query={attention} />
           <DecisionSection query={decisions} />
         </div>

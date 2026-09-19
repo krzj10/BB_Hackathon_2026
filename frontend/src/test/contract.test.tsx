@@ -16,7 +16,42 @@ import type {
   Meeting,
   TodayCalendarResponse,
   VoiceState,
+  ExecutiveBriefing,
+  AttentionExplanationResponse,
+  FocusSessionResponse,
+  FocusStopResponse,
+  FocusSummaryResponse,
+  DecisionResponse,
+  ActionResponse,
+  ActionConfirmResponse,
 } from "../api/types.generated";
+
+function stubEvaClient(): Pick<
+  EvaClient,
+  | "getBriefing"
+  | "getAttentionExplanation"
+  | "startFocus"
+  | "stopFocus"
+  | "getFocusSummary"
+  | "getDecision"
+  | "recordDecisionOutcome"
+  | "deferDecision"
+  | "getAction"
+  | "confirmAction"
+> {
+  return {
+    getBriefing: async () => ({} as ExecutiveBriefing),
+    getAttentionExplanation: async () => ({} as AttentionExplanationResponse),
+    startFocus: async () => ({} as FocusSessionResponse),
+    stopFocus: async () => ({} as FocusStopResponse),
+    getFocusSummary: async () => ({} as FocusSummaryResponse),
+    getDecision: async () => ({} as DecisionResponse),
+    recordDecisionOutcome: async () => ({} as ActionResponse),
+    deferDecision: async () => ({} as ActionResponse),
+    getAction: async () => ({} as ActionResponse),
+    confirmAction: async () => ({} as ActionConfirmResponse),
+  };
+}
 
 afterEach(() => {
   vi.useRealTimers();
@@ -110,6 +145,7 @@ describe("Today renders through the typed transport", () => {
       getAttention: async () => ({ items: [] }),
       getDecisions: async () => ({ items: [] }),
       getCurrentFocus: async () => ({ session: null }),
+      ...stubEvaClient(),
     };
 
     vi.resetModules();
@@ -134,6 +170,7 @@ describe("Today renders through the typed transport", () => {
       getAttention: async () => ({ items: [] }),
       getDecisions: async () => ({ items: [] }),
       getCurrentFocus: async () => ({ session: null }),
+      ...stubEvaClient(),
     };
 
     vi.resetModules();
@@ -249,6 +286,7 @@ describe("Today hardening — deterministic fixture mode and truthful state aggr
       getAttention: () => new Promise<AttentionListResponse>(() => {}),
       getDecisions: async () => ({ items: [] }),
       getCurrentFocus: async () => ({ session: null }),
+      ...stubEvaClient(),
     };
 
     vi.resetModules();
@@ -280,6 +318,7 @@ describe("Today hardening — deterministic fixture mode and truthful state aggr
       },
       getDecisions: async () => ({ items: [fixtureDecision] as unknown as DecisionListResponse["items"] }),
       getCurrentFocus: async () => ({ session: null }),
+      ...stubEvaClient(),
     };
 
     vi.resetModules();
@@ -311,6 +350,7 @@ describe("Today hardening — deterministic fixture mode and truthful state aggr
       getAttention: async () => ({ items: [] }),
       getDecisions: async () => ({ items: [] }),
       getCurrentFocus: async () => ({ session: null }),
+      ...stubEvaClient(),
     };
 
     vi.resetModules();
@@ -342,6 +382,7 @@ describe("Today hardening — deterministic fixture mode and truthful state aggr
       },
       getDecisions: async () => ({ items: [] }),
       getCurrentFocus: async () => ({ session: null }),
+      ...stubEvaClient(),
     };
 
     vi.resetModules();
@@ -379,6 +420,7 @@ describe("Today hardening — deterministic fixture mode and truthful state aggr
       getAttention: async () => ({ items: [] }),
       getDecisions: async () => ({ items: [] }),
       getCurrentFocus: async () => ({ session: null }),
+      ...stubEvaClient(),
     };
 
     vi.resetModules();
@@ -418,6 +460,7 @@ describe("Today hardening — deterministic fixture mode and truthful state aggr
       getAttention: async () => ({ items: [] }),
       getDecisions: async () => ({ items: [] }),
       getCurrentFocus: async () => ({ session: null }),
+      ...stubEvaClient(),
     };
 
     vi.resetModules();

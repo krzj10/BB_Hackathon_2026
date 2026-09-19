@@ -1,0 +1,471 @@
+import * as React from "react";
+import { Badge } from "../components/ui/badge";
+import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card";
+import { getEvaClient } from "../api/client";
+import type { Decision, DecisionResponse } from "../api/types.generated";
+import { useEvaQuery } from "../hooks/useEvaQuery";
+import { formatDeadline, formatMoney, formatTimeInWarsaw } from "../lib/format";
+
+function formatRisk(risk: Decision["risk"]): { label: string; className: string } {
+  switch (risk) {
+    case "high":
+      return { label: "High risk", className: "bg-danger/10 text-danger border-danger/30" };
+    case "medium":
+      return { label: "Medium risk", className: "bg-primary/10 text-primary border-primary/30" };
+    default:
+      return { label: "Low risk", className: "bg-muted text-muted-foreground border-border/60" };
+  }
+}
+
+function formatStatus(status: Decision["status"]): { label: string; className: string } {
+  switch (status) {
+    case "needs_review":
+      return { label: "Needs review", className: "bg-primary/10 text-primary border-primary/30" };
+    case "deferred":
+      return { label: "Deferred", className: "bg-amber/10 text-amber-600 dark:text-amber-400 border-amber/30" };
+    case "resolved":
+      return { label: "Resolved", className: "bg-green/10 text-green-600 dark:text-green-400 border-green/30" };
+    case "dismissed":
+      return { label: "Dismissed", className: "bg-muted text-muted-foreground border-border/60" };
+    default:
+      return { label: status, className: "bg-muted text-muted-foreground border-border/60" };
+  }
+}
+
+function DecisionDetail({ decision, onClose, onRecordOutcome, onDefer }: {
+  decision: Decision;
+  onClose: () => void;
+  onRecordOutcome: (outcome: "accept" | "reject") => void;
+  onDefer: () => void;
+}) {
+  const riskStyle = formatRisk(decision.risk);
+  const statusStyle = formatStatus(decision.status);
+
+  return (
+    <div className="mx-auto w-full max-w-3xl px-6 py-8" role="dialog" aria-labelledby="decision-detail-title" aria-modal="true">
+      <button
+        type="button"
+        className="absolute right-6 top-6 rounded-full p-1 text-muted-foreground hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        onClick={onClose}
+        aria-label="Close detail"
+      >
+        ✕
+      </button>
+
+      <header className="mb-6">
+        <div className="flex items-center gap-2 mb-2">
+          <span className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-[11px] font-medium ${riskStyle.className}`}>
+            {riskStyle.label}
+          </span>
+          <span className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-[11px] font-medium ${statusStyle.className}`}>
+            {statusStyle.label}
+          </span>
+        </div>
+        <h1 id="decision-detail-title" className="text-[22px] font-semibold leading-snug">{decision.title}</h1>
+        {decision.money && (
+          <p className="mt-2 text-[18px] font-mono tabular-nums text-foreground">{formatMoney(decision.money)}</p>
+        )}
+        <div className="mt-3 flex flex-wrap items-center gap-3 text-[12.5px] text-muted-foreground">
+          {decision.deadline && (
+            <span className="text-amber-600 dark:text-amber-400">Deadline {formatDeadline(decision.deadline)}</span>
+          )}
+          {decision.suggested_next_step && (
+            <span>Suggested: {decision.suggested_next_step}</span>
+          )}
+        </div>
+      </header>
+
+      <div className="space-y-6">
+        {decision.context && decision.context.length > 0 && (
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-[14px] flex items-center gap-2">
+                <span className="text-muted-foreground">📋</span>
+                Context
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              <ul className="space-y-1 pl-4 list-disc text-[13px]">
+                {decision.context.map((c, i) => (
+                  <li key={i}>{c.text}</li>
+                ))}
+              </ul>
+            </CardContent>
+          </Card>
+        )}
+
+        {decision.alternatives && decision.alternatives.length > 0 && (
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-[14px] flex items-center gap-2">
+                <span className="text-muted-foreground">🔀</span>
+                Alternatives
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              <ul className="space-y-1 pl-4 list-disc text-[13px]">
+                {decision.alternatives.map((a, i) => (
+                  <li key={i}>{a.text}</li>
+                ))}
+              </ul>
+            </CardContent>
+          </Card>
+        )}
+
+        {decision.risks && decision.risks.length > 0 && (
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-[14px] flex items-center gap-2">
+                <span className="text-muted-foreground">⚠️</span>
+                Risks
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              <ul className="space-y-1 pl-4 list-disc text-[13px] text-red-600 dark:text-red-400">
+                {decision.risks.map((r, i) => (
+                  <li key={i}>{r.text}</li>
+                ))}
+              </ul>
+            </CardContent>
+          </Card>
+        )}
+
+        {decision.preference_conflicts && decision.preference_conflicts.length > 0 && (
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-[14px] flex items-center gap-2">
+                <span className="text-muted-foreground">⚔️</span>
+                Preference Conflicts
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              <ul className="space-y-1 pl-4 list-disc text-[13px] text-amber-600 dark:text-amber-400">
+                {decision.preference_conflicts.map((c, i) => (
+                  <li key={i}>{c.text}</li>
+                ))}
+              </ul>
+            </CardContent>
+          </Card>
+        )}
+
+        {decision.sources && decision.sources.length > 0 && (
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-[14px] flex items-center gap-2">
+                <span className="text-muted-foreground">📎</span>
+                Sources & Evidence
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              <ul className="space-y-2">
+                {decision.sources.map((src) => (
+                  <li key={src.id} className="flex items-start gap-3 p-2 rounded-lg border border-border/60 hover:bg-accent transition-colors">
+                    <span className="mt-0.5 text-muted-foreground">📄</span>
+                    <div className="min-w-0 flex-1">
+                      <p className="text-[13px] font-medium">{src.title}</p>
+                      <p className="mt-0.5 text-[12px] text-muted-foreground">
+                        {src.kind.replace("_", " ")} · {formatTimeInWarsaw(src.retrieved_at)}
+                      </p>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            </CardContent>
+          </Card>
+        )}
+
+        {/* Outcome recording controls */}
+        {decision.status === "needs_review" && (
+          <Card className="border-primary/30">
+            <CardHeader>
+              <CardTitle className="text-[14px] flex items-center gap-2">
+                <span className="text-muted-foreground">📝</span>
+                Record Outcome
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-3">
+              <p className="text-[13px] text-muted-foreground">
+                <strong>Important:</strong> Recording ACCEPT or REJECT is an <strong>internal/local decision record</strong> only.
+                It does <strong>not</strong> imply EVA sends payment, purchases anything, signs a contract, commits to a supplier,
+                or sends any external instruction.
+              </p>
+              <div className="flex flex-wrap gap-3">
+                <button
+                  type="button"
+                  onClick={() => onRecordOutcome("accept")}
+                  className="rounded-control bg-green-600 px-4 py-2 text-[13.5px] font-medium text-white transition-colors hover:bg-green-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-green-500"
+                >
+                  RECORD ACCEPT
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onRecordOutcome("reject")}
+                  className="rounded-control bg-red-600 px-4 py-2 text-[13.5px] font-medium text-white transition-colors hover:bg-red-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500"
+                >
+                  RECORD REJECT
+                </button>
+                <button
+                  type="button"
+                  onClick={onDefer}
+                  className="rounded-control border border-border-strong px-4 py-2 text-[13.5px] font-medium text-foreground transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  DEFER
+                </button>
+              </div>
+              <p className="text-[12px] text-subtle-foreground">
+                DEFER is not equivalent to reject/accept. It postpones the decision.
+              </p>
+            </CardContent>
+          </Card>
+        )}
+
+        {decision.status === "resolved" && decision.outcome && (
+          <Card className="border-green/30 bg-green-50/30 dark:bg-green-950/10">
+            <CardHeader>
+              <CardTitle className="text-[14px] flex items-center gap-2">
+                <span className="text-muted-foreground">✅</span>
+                Outcome Recorded
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-1">
+              <p className="text-[13px] font-medium text-green-700 dark:text-green-300">
+                Outcome: {decision.outcome.toUpperCase()}
+              </p>
+              {decision.outcome_recorded_at && (
+                <p className="text-[12.5px] text-muted-foreground">
+                  Recorded {formatTimeInWarsaw(decision.outcome_recorded_at)}
+                </p>
+              )}
+              {decision.proposed_action_id && (
+                <p className="text-[12.5px] text-muted-foreground">
+                  Proposed action: {decision.proposed_action_id}
+                </p>
+              )}
+            </CardContent>
+          </Card>
+        )}
+
+        {decision.status === "deferred" && (
+          <Card className="border-amber/30 bg-amber-50/30 dark:bg-amber-950/10">
+            <CardHeader>
+              <CardTitle className="text-[14px] flex items-center gap-2">
+                <span className="text-muted-foreground">⏸️</span>
+                Deferred
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              <p className="text-[13px] text-amber-700 dark:text-amber-300">
+                This decision has been deferred. It will remain in your queue until reviewed.
+              </p>
+            </CardContent>
+          </Card>
+        )}
+
+        {decision.status === "dismissed" && (
+          <Card className="border-muted bg-muted/30">
+            <CardHeader>
+              <CardTitle className="text-[14px] flex items-center gap-2">
+                <span className="text-muted-foreground">🗑️</span>
+                Dismissed
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              <p className="text-[13px] text-muted-foreground">
+                This decision was dismissed and no outcome was recorded.
+              </p>
+            </CardContent>
+          </Card>
+        )}
+
+        <p className="text-center text-[12px] text-subtle-foreground">
+          Data from canonical fixtures: decision_finance_pln_needs_review.json / decision_finance_pln_resolved.json
+        </p>
+      </div>
+    </div>
+  );
+}
+
+function DecisionRow({ decision, onClick }: { decision: Decision; onClick: () => void }) {
+  const riskStyle = formatRisk(decision.risk);
+  const statusStyle = formatStatus(decision.status);
+
+  return (
+    <li className="group" onClick={onClick}>
+      <button
+        type="button"
+        className="w-full text-left flex gap-3 py-3 pr-4 hover:bg-accent/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+        aria-label={`Open ${decision.title}`}
+      >
+        <span className={`mt-0.5 grid size-6 shrink-0 place-items-center rounded-md ${riskStyle.className}`}>
+          💰
+        </span>
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2">
+            <p className="truncate text-[13.5px] font-medium leading-snug group-hover:underline">{decision.title}</p>
+            <Badge variant="outline" className={riskStyle.className}>
+              {riskStyle.label}
+            </Badge>
+          </div>
+          <p className="mt-0.5 text-[12px] text-muted-foreground flex flex-wrap gap-3">
+            {decision.money && <span>{formatMoney(decision.money)}</span>}
+            {decision.deadline && <span>Deadline {formatDeadline(decision.deadline)}</span>}
+            <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium ${statusStyle.className}`}>
+              {statusStyle.label}
+            </span>
+          </p>
+        </div>
+        <span className="shrink-0 text-muted-foreground">→</span>
+      </button>
+      <div className="h-px bg-border/60" />
+    </li>
+  );
+}
+
+function DecisionError({ onRetry }: { onRetry: () => void }) {
+  return (
+    <div className="mx-auto w-full max-w-md px-6 py-24 text-center">
+      <h2 className="text-[17px] font-semibold tracking-tight">Decisions unavailable</h2>
+      <p className="mt-2 text-[13.5px] leading-relaxed text-muted-foreground">
+        The decision inbox could not be loaded. Nothing was faked in its place — retry when
+        the connection to the EVA backend is available.
+      </p>
+      <button
+        type="button"
+        onClick={onRetry}
+        className="mt-6 rounded-control bg-primary px-4 py-2 text-[13.5px] font-medium text-primary-foreground transition-colors hover:bg-primary/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+      >
+        Retry
+      </button>
+    </div>
+  );
+}
+
+function DecisionLoading() {
+  return (
+    <div className="mx-auto w-full max-w-3xl px-6 py-8" aria-busy="true" aria-live="polite">
+      <div className="h-4 w-48 animate-pulse rounded-full bg-muted" />
+      <div className="mt-6 space-y-3">
+        {[...Array(5)].map((_, i) => (
+          <div key={i} className="h-14 animate-pulse rounded-card bg-muted" />
+        ))}
+      </div>
+      <p className="mt-6 text-[12.5px] text-muted-foreground">Loading decisions…</p>
+    </div>
+  );
+}
+
+function DecisionEmpty() {
+  return (
+    <div className="mx-auto w-full max-w-md px-6 py-24 text-center">
+      <h2 className="text-[17px] font-semibold tracking-tight">No decisions to record</h2>
+      <p className="mt-2 text-[13.5px] leading-relaxed text-muted-foreground">
+        Your decision inbox is empty. Press the orb and just ask whenever you need something.
+      </p>
+      <Badge variant="outline" className="mt-5">
+        Empty state
+      </Badge>
+    </div>
+  );
+}
+
+export default function Decisions() {
+  const [reloadKey, setReloadKey] = React.useState(0);
+  const [selectedDecision, setSelectedDecision] = React.useState<Decision | null>(null);
+  const client = getEvaClient();
+  const decisions = useEvaQuery(`decisions:${reloadKey}`, (c) => c.getDecisions(), client);
+  const retry = () => setReloadKey((n) => n + 1);
+
+  if (decisions.status === "loading") return <DecisionLoading />;
+  if (decisions.status === "error") return <DecisionError onRetry={retry} />;
+  if (decisions.status === "ready" && decisions.data.items.length === 0) return <DecisionEmpty />;
+
+  const items = decisions.data.items;
+
+  if (selectedDecision) {
+    const [detail, setDetail] = React.useState<DecisionResponse | null>(null);
+    const [detailStatus, setDetailStatus] = React.useState<"loading" | "ready" | "error">("loading");
+
+    React.useEffect(() => {
+      let cancelled = false;
+      setDetailStatus("loading");
+      client
+        .getDecision(selectedDecision.id)
+        .then((data) => {
+          if (!cancelled) {
+            setDetail(data);
+            setDetailStatus("ready");
+          }
+        })
+        .catch(() => {
+          if (!cancelled) setDetailStatus("error");
+        });
+      return () => {
+        cancelled = true;
+      };
+    }, [selectedDecision.id, client]);
+
+    if (detailStatus === "loading") {
+      return (
+        <div className="mx-auto w-full max-w-3xl px-6 py-8" aria-busy="true" aria-live="polite">
+          <div className="h-4 w-64 animate-pulse rounded-full bg-muted" />
+          <p className="mt-6 text-[12.5px] text-muted-foreground">Loading decision detail…</p>
+        </div>
+      );
+    }
+
+    if (detailStatus === "error" || !detail) {
+      return (
+        <div className="mx-auto w-full max-w-3xl px-6 py-8 text-center">
+          <h2 className="text-[17px] font-semibold tracking-tight">Decision detail unavailable</h2>
+          <button
+            type="button"
+            onClick={() => setSelectedDecision(null)}
+            className="mt-4 rounded-control border border-border-strong px-4 py-2 text-[13.5px] font-medium text-foreground transition-colors hover:bg-accent"
+          >
+            Back to inbox
+          </button>
+        </div>
+      );
+    }
+
+    return (
+      <DecisionDetail
+        decision={detail.decision}
+        onClose={() => setSelectedDecision(null)}
+        onRecordOutcome={(outcome) => {
+          client.recordDecisionOutcome(detail.decision.id, outcome).then(() => {
+            setReloadKey((n) => n + 1);
+            setSelectedDecision(null);
+          });
+        }}
+        onDefer={() => {
+          client.deferDecision(detail.decision.id).then(() => {
+            setReloadKey((n) => n + 1);
+            setSelectedDecision(null);
+          });
+        }}
+      />
+    );
+  }
+
+  return (
+    <div className="mx-auto w-full max-w-3xl px-6 py-8 lg:px-8 lg:py-10">
+      <header className="mb-6">
+        <h1 className="text-[26px] font-semibold leading-tight tracking-[-0.02em]">Decisions</h1>
+        <p className="mt-1.5 text-[13.5px] leading-relaxed text-muted-foreground">
+          Decisions surfaced from attention, ready to record outcomes. Tap a decision for details and controls.
+        </p>
+      </header>
+
+      <ul className="divide-y divide-border/60 border-y border-border/60 rounded-card overflow-hidden">
+        {items.map((decision) => (
+          <DecisionRow key={decision.id} decision={decision} onClick={() => setSelectedDecision(decision)} />
+        ))}
+      </ul>
+
+      <p className="mt-6 text-center text-[12px] text-subtle-foreground">
+        Data from canonical fixtures: decision_finance_pln_needs_review.json / decision_finance_pln_resolved.json
+      </p>
+    </div>
+  );
+}
