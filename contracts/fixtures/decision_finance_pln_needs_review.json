@@ -1,0 +1,45 @@
+{
+  "id": "dec-demo-finance-001",
+  "attention_item_id": "attn-demo-finance-001",
+  "title": "Faktura za migracje - 12 400 PLN",
+  "money": { "amount_minor_units": 1240000, "currency": "PLN" },
+  "deadline": "2026-09-25T17:00:00+02:00",
+  "context": [
+    {
+      "text": "Faktura za uslugi migracyjne, kwota 12 400 PLN, termin platnosci w korespondencji.",
+      "kind": "fact",
+      "source_ids": ["src-mail-010"]
+    }
+  ],
+  "alternatives": [
+    {
+      "text": "Rozlozenie platnosci na dwie transze - wzmiankowane w mailu.",
+      "kind": "inference",
+      "source_ids": ["src-mail-010"]
+    }
+  ],
+  "risks": [
+    {
+      "text": "Brak decyzji do piatku opozni start migracji.",
+      "kind": "inference",
+      "source_ids": ["src-mail-010"]
+    }
+  ],
+  "preference_conflicts": [],
+  "suggested_next_step": "Zatwierdz lub odrzuc po przejrzeniu faktury; zapis decyzji jest lokalny.",
+  "risk": "high",
+  "status": "needs_review",
+  "outcome": null,
+  "outcome_recorded_at": null,
+  "proposed_action_id": null,
+  "sources": [
+    {
+      "id": "src-mail-010",
+      "kind": "gmail_message",
+      "resource_id": "demo-thread-cfo-request/msg-001",
+      "title": "Decyzja: wydatki na migracje (syntetyczny)",
+      "url": null,
+      "retrieved_at": "2026-09-21T11:30:05+02:00"
+    }
+  ]
+}

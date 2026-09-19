@@ -1,0 +1,63 @@
+{
+  "id": "briefing-demo-acme-001-pl",
+  "meeting": {
+    "ref": { "calendar_id": "primary", "event_id": "evt-demo-acme-contract-review-001" },
+    "etag": "demo-etag-acme-001",
+    "title": "ACME Contract Review",
+    "span": {
+      "kind": "timed",
+      "start": "2026-09-21T14:00:00+02:00",
+      "end": "2026-09-21T15:00:00+02:00",
+      "timezone": "Europe/Warsaw"
+    },
+    "attendees": [],
+    "editable": true,
+    "priority": "high",
+    "priority_reasons": [],
+    "sources": []
+  },
+  "language": "pl",
+  "generated_at": "2026-09-21T08:05:00+02:00",
+  "previous_interactions": [
+    {
+      "text": "W korespondencji z 2 wrzesnia ACME prosilo o aktualizacje cennika.",
+      "kind": "fact",
+      "source_ids": ["src-mail-001"]
+    }
+  ],
+  "open_topics": [
+    {
+      "text": "Data migracji pozostaje nieustalona w dostepnej korespondencji.",
+      "kind": "inference",
+      "source_ids": ["src-mail-001"]
+    }
+  ],
+  "previous_decisions": [],
+  "risks": [
+    {
+      "text": "Brak potwierdzonej daty migracji moze wydluzyc negocjacje.",
+      "kind": "inference",
+      "source_ids": ["src-mail-001"]
+    }
+  ],
+  "suggestions": [
+    {
+      "text": "Zaproponuj dwa konkretne terminy migracji.",
+      "kind": "suggestion",
+      "source_ids": []
+    }
+  ],
+  "spoken_summary": "Przeglad kontraktu z ACME o 14:00. Gorna sprawa: otwarta data migracji.",
+  "sources": [
+    {
+      "id": "src-mail-001",
+      "kind": "gmail_message",
+      "resource_id": "demo-thread-acme-pricing/msg-001",
+      "title": "ACME pricing follow-up (syntetyczny)",
+      "url": null,
+      "retrieved_at": "2026-09-21T08:04:30+02:00"
+    }
+  ],
+  "retrieval_status": "partial",
+  "retrieval_notes": ["Korespondencja ograniczona do ostatnich 30 dni; watki starsze nieodpytane."]
+}

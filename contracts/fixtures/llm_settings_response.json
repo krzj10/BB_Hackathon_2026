@@ -1,0 +1,12 @@
+{
+  "provider": "openai_compatible",
+  "base_url": "https://demo-host.tailnet.example:8321/v1",
+  "model": "demo-served-model-id",
+  "api_key_present": true,
+  "fallback_base_url": null,
+  "fallback_model": null,
+  "fallback_api_key_present": false,
+  "configured": true,
+  "allow_cloud_inference": false,
+  "allow_workspace_cloud_inference": false
+}

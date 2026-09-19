@@ -1,0 +1,28 @@
+{
+  "name": "calendar.update_agenda",
+  "description": "Add or update the EVA-delimited agenda section within an owned event description, preserving all other text.",
+  "effect": "external_write",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "tool": { "const": "calendar.update_agenda" },
+      "ref": { "type": "object" },
+      "mode": { "enum": ["add", "update"] },
+      "agenda_markdown": { "type": "string" },
+      "expected_etag": { "type": ["string", "null"] },
+      "send_updates": { "enum": ["all", "external_only", "none"] }
+    },
+    "required": ["tool", "ref", "mode", "agenda_markdown"]
+  },
+  "output_schema": {
+    "type": "object",
+    "properties": {
+      "meeting": { "type": "object" },
+      "verified_by_read_back": { "type": "boolean" }
+    },
+    "required": ["meeting", "verified_by_read_back"]
+  },
+  "required_scopes": ["https://www.googleapis.com/auth/calendar.events.owned"],
+  "risk_floor": "medium",
+  "timeout_seconds": 30
+}

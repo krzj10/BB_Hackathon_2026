@@ -1,0 +1,9 @@
+{
+  "id": "rcpt-demo-agenda-acme-001",
+  "action_id": "act-demo-agenda-acme-001",
+  "revision": 1,
+  "arguments_digest": "sha256:demo-digest-agenda-0001",
+  "channel": "ui",
+  "approved_at": "2026-09-21T12:01:30+02:00",
+  "policy_version": "policy-v1"
+}

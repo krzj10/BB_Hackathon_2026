@@ -1,0 +1,18 @@
+{
+  "id": "dec-demo-finance-001",
+  "attention_item_id": "attn-demo-finance-001",
+  "title": "Faktura za migracje - 12 400 PLN",
+  "money": { "amount_minor_units": 1240000, "currency": "PLN" },
+  "deadline": "2026-09-25T17:00:00+02:00",
+  "context": [],
+  "alternatives": [],
+  "risks": [],
+  "preference_conflicts": [],
+  "suggested_next_step": null,
+  "risk": "high",
+  "status": "resolved",
+  "outcome": "accept",
+  "outcome_recorded_at": "2026-09-21T13:45:00+02:00",
+  "proposed_action_id": "act-demo-record-outcome-001",
+  "sources": []
+}

@@ -1,0 +1,52 @@
+{
+  "id": "attn-demo-finance-001",
+  "source": "gmail",
+  "source_id": "demo-thread-cfo-request/msg-001",
+  "sender_email": "cfo.demo@example.com",
+  "title": "Decyzja: wydatki na migracje - 12 400 PLN",
+  "content_preview": "Prosze o decyzje w sprawie faktury za migracje: 12 400 PLN do konca tygodnia.",
+  "received_at": "2026-09-21T11:30:00+02:00",
+  "attention_type": "decision_required",
+  "urgent": true,
+  "priority": "high",
+  "confidence": 0.93,
+  "reasons": [
+    {
+      "code": "attention.decision_required.financial_intent_amount",
+      "origin": "rule",
+      "text": "Current decision intent with amount >= 1000 PLN threshold.",
+      "source_ids": ["src-mail-010"],
+      "policy_version": "policy-v1"
+    },
+    {
+      "code": "attention.floor.important_sender",
+      "origin": "rule",
+      "text": "Exact sender address maps to configured CFO (minimum medium floor).",
+      "source_ids": ["src-mail-010"],
+      "policy_version": "policy-v1"
+    }
+  ],
+  "sources": [
+    {
+      "id": "src-mail-010",
+      "kind": "gmail_message",
+      "resource_id": "demo-thread-cfo-request/msg-001",
+      "title": "Decyzja: wydatki na migracje (syntetyczny)",
+      "url": null,
+      "retrieved_at": "2026-09-21T11:30:05+02:00"
+    }
+  ],
+  "deadline": "2026-09-25T17:00:00+02:00",
+  "related_meeting": null,
+  "decision_id": "dec-demo-finance-001",
+  "delivery": "deferred",
+  "delivery_reasons": [
+    {
+      "code": "focus.deferred.below_threshold_window",
+      "origin": "rule",
+      "text": "Stored during active Focus session; surfaced once on qualifying exception.",
+      "source_ids": [],
+      "policy_version": "policy-v1"
+    }
+  ]
+}

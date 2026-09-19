@@ -1,0 +1,36 @@
+{
+  "ref": { "calendar_id": "primary", "event_id": "evt-demo-team-sync-001" },
+  "etag": "demo-etag-team-001",
+  "title": "Team Sync",
+  "span": {
+    "kind": "timed",
+    "start": "2026-09-21T09:00:00+02:00",
+    "end": "2026-09-21T09:30:00+02:00",
+    "timezone": "Europe/Warsaw"
+  },
+  "attendees": [
+    { "email": "user.demo@example.com", "internal": true }
+  ],
+  "organizer_email": "teamlead.demo@example.com",
+  "editable": true,
+  "priority": "medium",
+  "priority_reasons": [
+    {
+      "code": "meeting.medium.team_project",
+      "origin": "rule",
+      "text": "Recurring team/project meeting floor.",
+      "source_ids": [],
+      "policy_version": "policy-v1"
+    }
+  ],
+  "sources": [
+    {
+      "id": "src-cal-002",
+      "kind": "calendar_event",
+      "resource_id": "primary:evt-demo-team-sync-001",
+      "title": "Team Sync (Google Calendar)",
+      "url": null,
+      "retrieved_at": "2026-09-21T08:00:00+02:00"
+    }
+  ]
+}
