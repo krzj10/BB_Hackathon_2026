@@ -604,6 +604,15 @@ export interface ProposedActionResponse {
   action: ProposedAction;
 }
 
+/** Direct response of POST /api/actions/{action_id}/challenge (route is A04-owned; the contract is frozen here). The raw one-time challenge travels ONLY in this direct authenticated API response - never inside ProposedAction, ActionProposedPayload, ActionStatusChangedPayload, EventEnvelope, ToolResult or any other durable event/cache surface. There is deliberately no channel field: the approval channel stays server-derived at confirmation time. */
+export interface ApprovalChallengeResponse {
+  action_id: string;
+  revision: number;
+  arguments_digest: string;
+  challenge: string;
+  expires_at: DateTime;
+}
+
 export interface ActionConfirmResponse {
   action: ProposedAction;
   receipt?: ApprovalReceipt | null;

@@ -837,3 +837,43 @@ def test_typescript_contract_gate_compiles_clean() -> None:
         text=True,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+# ---------------------------------------------------------------------------
+# ApprovalChallengeResponse (A03 remediation: challenge transport contract)
+# ---------------------------------------------------------------------------
+
+
+def _challenge_payload(**overrides) -> dict:
+    payload = {
+        "action_id": "act-demo-agenda-acme-001",
+        "revision": 1,
+        "arguments_digest": "sha256:demo-digest-agenda-0001",
+        "challenge": "synthetic-challenge-token-not-a-secret",
+        "expires_at": "2026-09-21T12:05:00+02:00",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_approval_challenge_response_valid() -> None:
+    model = api.ApprovalChallengeResponse.model_validate(_challenge_payload())
+    assert model.action_id == "act-demo-agenda-acme-001"
+    assert model.revision == 1
+    assert model.expires_at.tzinfo is not None
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"action_id": ""},
+        {"revision": 0},
+        {"arguments_digest": ""},
+        {"challenge": ""},
+        {"expires_at": "2026-09-21T12:05:00"},  # naive datetime rejected
+        {"channel": "ui"},  # extra field forbidden; channel is server-derived
+    ],
+)
+def test_approval_challenge_response_rejects(overrides: dict) -> None:
+    with pytest.raises(ValidationError):
+        api.ApprovalChallengeResponse.model_validate(_challenge_payload(**overrides))

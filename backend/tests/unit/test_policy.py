@@ -272,7 +272,58 @@ def test_board_investor_and_polish_markers_are_high(triage) -> None:
 
 def test_team_customer_floor_and_informal_low(triage) -> None:
     assert triage.evaluate(make_meeting(title="Projekt Alpha sprint", reasons=[])).priority is MeetingPriority.MEDIUM
-    assert triage.evaluate(make_meeting(title="Coffee catch-up", reasons=[])).priority is MeetingPriority.LOW
+    # LOW requires the informal marker AND affirmative internal evidence.
+    insider = Participant(email="colleague@example.com", name="Colleague", internal=True)
+    result = triage.evaluate(
+        make_meeting(title="Coffee catch-up", reasons=[], attendees=[insider])
+    )
+    assert result.priority is MeetingPriority.LOW
+    assert "meeting.internal_optional" in [r.code for r in result.reasons]
+
+
+# ---------------------------------------------------------------------------
+# LOW triage requires affirmative internal evidence (A03 remediation)
+# ---------------------------------------------------------------------------
+
+
+def _coffee(triage, attendees: list[Participant]):
+    return triage.evaluate(make_meeting(title="Coffee catch-up", reasons=[], attendees=attendees))
+
+
+def test_low_marker_with_explicit_external_is_not_low(triage) -> None:
+    result = _coffee(triage, [Participant(email="x@vendor.example", internal=False)])
+    assert result.priority is not MeetingPriority.LOW
+    assert "meeting.informal_internal_unconfirmed" in [r.code for r in result.reasons]
+
+
+def test_low_marker_with_unknown_internal_is_not_low(triage) -> None:
+    result = _coffee(triage, [Participant(email="x@example.com")])  # internal=None
+    assert result.priority is not MeetingPriority.LOW
+    assert "meeting.informal_internal_unconfirmed" in [r.code for r in result.reasons]
+
+
+def test_low_marker_without_attendees_is_not_low(triage) -> None:
+    result = _coffee(triage, [])
+    assert result.priority is not MeetingPriority.LOW
+    assert "meeting.informal_internal_unconfirmed" in [r.code for r in result.reasons]
+
+
+def test_low_marker_with_mixed_attendees_is_not_low(triage) -> None:
+    insider = Participant(email="a@example.com", internal=True)
+    outsider = Participant(email="b@vendor.example", internal=False)
+    unknown = Participant(email="c@example.com")
+    for mixed in ([insider, unknown], [insider, outsider]):
+        result = _coffee(triage, mixed)
+        assert result.priority is not MeetingPriority.LOW
+        assert "meeting.informal_internal_unconfirmed" in [r.code for r in result.reasons]
+
+
+def test_low_eligibility_uses_all_attendees_affirmatively_internal(triage) -> None:
+    insiders = [
+        Participant(email="a@example.com", internal=True),
+        Participant(email="b@example.com", internal=True),
+    ]
+    assert _coffee(triage, insiders).priority is MeetingPriority.LOW
 
 
 def test_a02_provisional_placeholder_does_not_block_escalation(triage) -> None:
@@ -653,15 +704,26 @@ def test_high_voice_denied_without_burning_challenge(engine) -> None:
     assert again.receipt is not None and again.receipt.id == result.receipt.id
 
 
-def test_high_approved_voice_replay_stays_channel_not_allowed(engine) -> None:
+def test_high_approved_voice_replay_stays_channel_not_allowed(engine, repo) -> None:
     action = propose(engine, "calendar.create_event", create_args(title="Board strategy session"))
     first = engine.confirm(request_for(action, engine=engine), channel=ApprovalChannel.UI, now=NOW + timedelta(seconds=10))
     assert first.action.status is ProposedActionStatus.APPROVED
+    assert first.receipt is not None and first.receipt.channel is ApprovalChannel.UI
     # A later VOICE confirmation of the already-approved HIGH action must NOT
     # be allowed to appear as a successful confirmation.
     with pytest.raises(ActionPolicyError) as excinfo:
         engine.confirm(request_for(action, engine=engine), channel=ApprovalChannel.VOICE, now=NOW + timedelta(seconds=20))
     assert excinfo.value.code == "channel_not_allowed"
+    # The durable authorization is untouched: still exactly ONE receipt and it
+    # remains bound to the ORIGINAL UI approval - a replay can never convert an
+    # authorization into a voice approval.
+    stored = repo.get_receipt(action.id, action.revision)
+    assert stored is not None and stored.channel is ApprovalChannel.UI
+    with repo._db.connect() as conn:
+        n = conn.execute(
+            "SELECT COUNT(*) AS n FROM approval_receipts WHERE action_id = ?", (action.id,)
+        ).fetchone()["n"]
+    assert n == 1
 
 
 def test_approved_ui_replay_returns_same_durable_receipt(engine) -> None:
@@ -864,3 +926,147 @@ def test_focus_and_preferences_cannot_downgrade_high(engine) -> None:
     assert action.risk is ActionRisk.HIGH
     assert action.requires_approval is True
     assert action.voice_approval_allowed is False
+
+
+# ---------------------------------------------------------------------------
+# Financial evidence must reach EXISTING-meeting mutations too (A03 remediation)
+# ---------------------------------------------------------------------------
+
+
+def _fin_evidence(amount: int = 100000, intent: bool = True) -> TriageEvidence:
+    return TriageEvidence(
+        financial_decision_intent=intent,
+        money=Money(amount_minor_units=amount, currency="PLN"),
+        source_ids=("gmail:financial-evidence-1",),
+    )
+
+
+def _fin_ctx(evidence: TriageEvidence | None = None) -> ProposalContext:
+    return context(
+        meetings={("primary", "evt-1"): make_meeting(title="Vendor review", reasons=[])},
+        triage_evidence=evidence if evidence is not None else _fin_evidence(),
+    )
+
+
+def _agenda_call() -> ToolCall:
+    return call("calendar.update_agenda", {
+        "ref": {"calendar_id": "primary", "event_id": "evt-1"},
+        "mode": "add",
+        "agenda_markdown": "- Decision item: terminate supplier contract A",
+    })
+
+
+def _reschedule_call() -> ToolCall:
+    return call("calendar.reschedule_event", {
+        "ref": {"calendar_id": "primary", "event_id": "evt-1"},
+        "new_span": span().model_dump(mode="json"),
+        "send_updates": SendUpdates.NONE.value,
+    })
+
+
+def test_financial_evidence_escalates_existing_agenda_update(engine) -> None:
+    decision = engine.evaluate(_agenda_call(), _fin_ctx())
+    assert decision.risk is ActionRisk.HIGH
+    assert decision.requires_approval is True
+    assert decision.voice_approval_allowed is False
+    fin = [r for r in decision.reasons if r.code == "meeting.financial_decision_high"]
+    assert fin and fin[0].source_ids == ["gmail:financial-evidence-1"]
+
+
+def test_financial_evidence_escalates_existing_reschedule(engine) -> None:
+    decision = engine.evaluate(_reschedule_call(), _fin_ctx())
+    assert decision.risk is ActionRisk.HIGH
+    assert decision.requires_approval is True
+    assert decision.voice_approval_allowed is False
+    fin = [r for r in decision.reasons if r.code == "meeting.financial_decision_high"]
+    assert fin and fin[0].source_ids == ["gmail:financial-evidence-1"]
+
+
+def test_financial_boundary_on_existing_mutation(engine) -> None:
+    # 99999 minor units is BELOW the 100000 threshold: no financial HIGH,
+    # but the calendar mutation floor keeps it MEDIUM with approval required.
+    decision = engine.evaluate(_agenda_call(), _fin_ctx(_fin_evidence(amount=99999)))
+    assert decision.risk is not ActionRisk.HIGH
+    codes = [r.code for r in decision.reasons]
+    assert "meeting.financial_below_threshold" in codes
+    assert "meeting.financial_decision_high" not in codes
+    assert decision.requires_approval is True
+
+
+def test_large_amount_without_intent_does_not_escalate_existing_mutation(engine) -> None:
+    decision = engine.evaluate(
+        _agenda_call(), _fin_ctx(_fin_evidence(amount=50_000_000, intent=False))
+    )
+    assert decision.risk is not ActionRisk.HIGH
+    codes = [r.code for r in decision.reasons]
+    assert "meeting.financial_amount_without_intent" in codes
+    assert "meeting.financial_decision_high" not in codes
+
+
+# ---------------------------------------------------------------------------
+# issue_challenge: safe server-side issuance for the A04 challenge endpoint
+# ---------------------------------------------------------------------------
+
+
+def test_issue_challenge_bindings_match_stored_action_and_authorize_once(engine) -> None:
+    action = _propose_medium(engine)
+    issued = engine.issue_challenge(action.id, now=NOW)
+    assert issued.action_id == action.id
+    assert issued.revision == action.revision
+    assert issued.arguments_digest == action.arguments_digest
+    assert issued.expires_at == action.expires_at
+    request = ApprovalRequest(
+        action_id=issued.action_id,
+        revision=issued.revision,
+        arguments_digest=issued.arguments_digest,
+        choice=ApprovalChoice.APPROVE,
+        challenge=issued.challenge,
+    )
+    result = engine.confirm(request, channel=ApprovalChannel.UI, now=NOW + timedelta(seconds=10))
+    assert result.action.status is ProposedActionStatus.APPROVED
+    assert result.receipt is not None
+    # one-time: a replay of the same request only reports the existing approval
+    again = engine.confirm(request, channel=ApprovalChannel.UI, now=NOW + timedelta(seconds=20))
+    assert again.already_approved is True
+    assert again.receipt is not None and again.receipt.id == result.receipt.id
+
+
+def test_issue_challenge_rejects_unknown_action(engine) -> None:
+    with pytest.raises(ActionPolicyError) as excinfo:
+        engine.issue_challenge("act-does-not-exist", now=NOW)
+    assert excinfo.value.code == "unknown_action"
+
+
+def test_issue_challenge_rejects_expired_action(engine) -> None:
+    action = _propose_medium(engine)
+    with pytest.raises(ActionPolicyError) as excinfo:
+        engine.issue_challenge(action.id, now=action.expires_at + timedelta(seconds=1))
+    assert excinfo.value.code == "expired"
+
+
+def test_issue_challenge_rejects_terminal_states(engine) -> None:
+    rejected = _propose_medium(engine)
+    engine.confirm(
+        request_for(rejected, choice=ApprovalChoice.REJECT, engine=engine),
+        channel=ApprovalChannel.UI, now=NOW + timedelta(seconds=5),
+    )
+    with pytest.raises(ActionPolicyError) as excinfo:
+        engine.issue_challenge(rejected.id, now=NOW + timedelta(seconds=6))
+    assert excinfo.value.code == "invalid_status"
+
+    approved = _propose_medium(engine)
+    engine.confirm(
+        request_for(approved, engine=engine),
+        channel=ApprovalChannel.UI, now=NOW + timedelta(seconds=5),
+    )
+    with pytest.raises(ActionPolicyError) as excinfo:
+        engine.issue_challenge(approved.id, now=NOW + timedelta(seconds=6))
+    assert excinfo.value.code == "invalid_status"
+
+
+def test_issue_challenge_cannot_accept_injected_bindings() -> None:
+    import inspect
+
+    params = inspect.signature(ActionApprovalEngine.issue_challenge).parameters
+    assert list(params) == ["self", "action_id", "now"]
+    assert params["now"].kind is inspect.Parameter.KEYWORD_ONLY

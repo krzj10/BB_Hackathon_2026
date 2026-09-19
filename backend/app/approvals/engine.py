@@ -114,6 +114,19 @@ class PolicyDecision:
     target_meeting: Meeting | None = None
 
 
+@dataclass(frozen=True)
+class IssuedChallenge:
+    """Internal transport object for challenge issuance (A04 maps it into the
+    canonical ApprovalChallengeResponse). NOT a second public contract, and
+    the raw token must never be logged or persisted anywhere."""
+
+    action_id: str
+    revision: int
+    arguments_digest: str
+    challenge: str
+    expires_at: datetime
+
+
 # ---------------------------------------------------------------------------
 # One-time approval challenges
 # ---------------------------------------------------------------------------
@@ -323,7 +336,11 @@ class ActionApprovalEngine:
                 "target_meeting_unknown",
                 "mutation targets a meeting absent from the supplied current-state context",
             )
-        triaged = self._triage.evaluate(meeting)
+        # The SAME structured evidence feeds meeting triage regardless of the
+        # mutation kind (create / reschedule / agenda update): trusted current
+        # financial decision evidence must not be dropped just because the
+        # event already exists.
+        triaged = self._triage.evaluate(meeting, context.triage_evidence)
         reasons.extend(triaged.reasons)
         if triaged.priority == MeetingPriority.HIGH:
             risk = ActionRisk.HIGH  # non-overridable, agenda edits included
@@ -470,6 +487,37 @@ class ActionApprovalEngine:
         return "; ".join(parts)
 
     # -- confirmation ------------------------------------------------------------
+
+    def issue_challenge(self, action_id: str, *, now: datetime) -> IssuedChallenge:
+        """Safely issue a one-time confirmation challenge (for A04's future
+        POST /api/actions/{action_id}/challenge route).
+
+        Every binding comes from the DURABLE stored action - the caller may
+        only supply the action id and server time, never revision/digest/
+        expiry. Only a PENDING, unexpired proposal can receive a challenge.
+        The raw token exists exactly once in the returned transport object;
+        ChallengeStore keeps only its SHA-256 hash - it is never logged and
+        never persisted (SQLite/outbox/events stay free of challenge data)."""
+        action = self._repo.get_action(action_id)
+        if action is None:
+            raise ActionPolicyError("unknown_action", "no such proposed action")
+        if action.status != ProposedActionStatus.PENDING:
+            raise ActionPolicyError(
+                "invalid_status",
+                f"proposal is {action.status.value}, not pending; no challenge issued",
+            )
+        if now >= action.expires_at:
+            raise ActionPolicyError("expired", "proposal expired; no challenge issued")
+        token = self.challenges.issue(
+            action.id, action.revision, action.arguments_digest, action.expires_at
+        )
+        return IssuedChallenge(
+            action_id=action.id,
+            revision=action.revision,
+            arguments_digest=action.arguments_digest,
+            challenge=token,
+            expires_at=action.expires_at,
+        )
 
     def confirm(
         self, request: ApprovalRequest, *, channel: ApprovalChannel, now: datetime

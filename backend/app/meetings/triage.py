@@ -166,14 +166,32 @@ class MeetingTriage:
                 )
             )
         elif low_hit is not None:
-            priority = MeetingPriority.LOW
-            reasons.append(
-                self._reason(
-                    "meeting.internal_optional",
-                    f"informal optional internal catch-up marker matched: {low_hit!r}",
-                    extra_source_ids,
+            # LOW means "informal optional INTERNAL catch-up": an informal text
+            # marker alone never proves it. LOW eligibility requires affirmative
+            # internal evidence for every attendee (Participant.internal is
+            # used here as TRIAGE evidence only - the notification-authorization
+            # rule in the approval engine deliberately never trusts it).
+            if _affirmatively_internal(attendees):
+                priority = MeetingPriority.LOW
+                reasons.append(
+                    self._reason(
+                        "meeting.internal_optional",
+                        f"informal optional internal catch-up marker matched: {low_hit!r}; "
+                        "all attendees affirmatively internal",
+                        extra_source_ids,
+                    )
                 )
-            )
+            else:
+                reasons.append(
+                    self._reason(
+                        "meeting.informal_internal_unconfirmed",
+                        f"informal marker matched ({low_hit!r}) but internal-only attendance "
+                        "is not affirmatively established (every attendee must carry an "
+                        "explicit internal classification; unknown, external or missing "
+                        "attendees prove nothing); conservative MEDIUM floor applies",
+                        extra_source_ids,
+                    )
+                )
         else:
             reasons.append(
                 self._reason(
@@ -260,3 +278,11 @@ def _first_marker(haystack: str, markers: list[str]) -> str | None:
         if _fold(marker) in folded_hay:
             return marker
     return None
+
+
+def _affirmatively_internal(attendees: list[Participant]) -> bool:
+    """LOW-eligibility check (triage evidence only): attendees exist AND every
+    one carries an explicit internal=True classification. internal=None is not
+    internal; nothing is ever inferred from email domain, company name,
+    display name, organizer or the absence of attendees."""
+    return bool(attendees) and all(p.internal is True for p in attendees)

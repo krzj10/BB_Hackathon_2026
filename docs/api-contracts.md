@@ -115,6 +115,7 @@ DecisionService.propose_outcome(decision_id, outcome, context) -> ProposedAction
 | GET /api/calendar/today | - | `TodayCalendarResponse` |
 | GET /api/calendar/events/{event_id}?calendar_id= | - | `MeetingResponse` |
 | POST /api/calendar/proposals | `CalendarProposalRequest` (discriminated) | `ProposedActionResponse` |
+| POST /api/actions/{action_id}/challenge | - (no request body) | `ApprovalChallengeResponse` |
 | POST /api/actions/{action_id}/confirm | `ApprovalRequest` | `ActionConfirmResponse` |
 | GET /api/actions/{action_id} | - | `ActionResponse` |
 | POST /api/voice/transcribe | multipart field `audio` (A05) | `TranscribeResponse` |
@@ -134,6 +135,8 @@ DecisionService.propose_outcome(decision_id, outcome, context) -> ProposedAction
 | WS /api/events | - | `EventEnvelope` |
 
 No generic public execute endpoint exists. **`FocusStopResponse.summary` is required:** an explicit stop always returns the completion summary computed from persisted session items (the same summary remains available via `GET /api/focus/{id}/summary` after reconnect/restart). Settings responses serialize secret presence flags only (`api_key_present`), never values; API keys in update requests are write-only. B owns the Settings routes/implementation against these envelopes.
+
+**Approval challenge transport (contract frozen in A03; route implementation is A04-owned):** `POST /api/actions/{action_id}/challenge` has no request body and returns `ApprovalChallengeResponse` — the only sanctioned way for an authenticated client to obtain a raw one-time challenge. The future route must authenticate/session-bind the request, verify the action belongs to the caller's session context, require a PENDING unexpired proposal, and issue the challenge from the STORED action bindings (id/revision/arguments_digest/expires_at — never from request data). The raw challenge is returned exactly once in this direct HTTPS/local API response; it must never be logged and never enter SQLite, the durable outbox, `EventEnvelope` events (`ActionProposedPayload`, `ActionStatusChangedPayload`), `ProposedAction`, `ToolResult` or assistant responses. There is no channel field: the approval channel stays server-derived at confirmation time.
 
 ## 9. Configuration contract (config.py, .env.example)
 
