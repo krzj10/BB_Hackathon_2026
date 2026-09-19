@@ -12,10 +12,11 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from app.contracts import domain
 from app.db.repositories import (
@@ -149,39 +150,72 @@ def test_durable_state_survives_close_and_reopen(tmp_path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_claim_with_expected_status_wins(db) -> None:
+def test_claim_execution_from_approved_wins(db) -> None:
     action = fresh_action()
     repo = ActionRepository(db)
     repo.create_action(action)
-    assert repo.claim_action(action.id, domain.ProposedActionStatus.PENDING,
-                             domain.ProposedActionStatus.APPROVED, now=NOW) is True
-    assert repo.get_action(action.id).status == domain.ProposedActionStatus.APPROVED
+    assert repo.record_approval(action.id, now=NOW) is True
+    assert repo.claim_action(action.id, now=NOW) is True
+    assert repo.get_action(action.id).status == domain.ProposedActionStatus.EXECUTING
 
 
-def test_claim_with_wrong_expected_status_loses(db) -> None:
+def test_claim_rejected_while_not_approved(db) -> None:
     action = fresh_action()
     repo = ActionRepository(db)
     repo.create_action(action)
-    assert repo.claim_action(action.id, domain.ProposedActionStatus.APPROVED,
-                             domain.ProposedActionStatus.EXECUTING, now=NOW) is False
+    # Still PENDING: the APPROVED-conditional execution claim loses.
+    assert repo.claim_action(action.id, now=NOW) is False
     assert repo.get_action(action.id).status == domain.ProposedActionStatus.PENDING
 
 
-def test_illegal_transition_rejected(db) -> None:
+def test_claim_action_refuses_non_execution_transitions(db) -> None:
     action = fresh_action()
     repo = ActionRepository(db)
     repo.create_action(action)
     with pytest.raises(ValueError):
         repo.claim_action(action.id, domain.ProposedActionStatus.PENDING,
+                          domain.ProposedActionStatus.APPROVED, now=NOW)
+    with pytest.raises(ValueError):
+        repo.claim_action(action.id, domain.ProposedActionStatus.PENDING,
                           domain.ProposedActionStatus.SUCCEEDED, now=NOW)
 
 
-def test_concurrent_claims_yield_exactly_one_winner(tmp_path) -> None:
+def test_finish_execution_rejects_non_final_status(db) -> None:
+    action = fresh_action()
+    repo = ActionRepository(db)
+    repo.create_action(action)
+    with pytest.raises(ValueError):
+        repo.finish_execution(action.id, domain.ProposedActionStatus.APPROVED)
+
+
+def test_record_approval_rejects_expired_proposal(db) -> None:
+    action = fresh_action()  # expires 2026-09-21T12:05+02:00
+    repo = ActionRepository(db)
+    repo.create_action(action)
+    later = datetime.fromisoformat("2026-09-21T13:00:00+02:00")
+    assert repo.record_approval(action.id, now=later) is False
+    assert repo.get_action(action.id).status == domain.ProposedActionStatus.PENDING
+
+
+def test_expire_action_uses_expiry_boundary(db) -> None:
+    action = fresh_action()
+    repo = ActionRepository(db)
+    repo.create_action(action)
+    before = datetime.fromisoformat("2026-09-21T12:04:00+02:00")
+    assert repo.expire_action(action.id, now=before) is False  # not expired yet
+    after = datetime.fromisoformat("2026-09-21T13:00:00+02:00")
+    assert repo.expire_action(action.id, now=after) is True
+    assert repo.get_action(action.id).status == domain.ProposedActionStatus.EXPIRED
+
+
+def test_concurrent_execution_claims_yield_exactly_one_winner(tmp_path) -> None:
     path = tmp_path / "claim-race.db"
     database = Database(f"sqlite:///{path}")
     init_schema(database)
     action = fresh_action()
-    ActionRepository(database).create_action(action)
+    repo = ActionRepository(database)
+    repo.create_action(action)
+    assert repo.record_approval(action.id, now=NOW) is True
     del database
 
     barrier = threading.Barrier(2)
@@ -194,8 +228,8 @@ def test_concurrent_claims_yield_exactly_one_winner(tmp_path) -> None:
         barrier.wait()  # deterministic simultaneous start, no sleeps
         won = repo.claim_action(
             action.id,
-            domain.ProposedActionStatus.PENDING,
             domain.ProposedActionStatus.APPROVED,
+            domain.ProposedActionStatus.EXECUTING,
             now=NOW,
         )
         with lock:
@@ -209,7 +243,7 @@ def test_concurrent_claims_yield_exactly_one_winner(tmp_path) -> None:
 
     assert sorted(results) == [False, True], f"expected exactly one winner, got {results}"
     final = ActionRepository(Database(f"sqlite:///{path}")).get_action(action.id)
-    assert final.status == domain.ProposedActionStatus.APPROVED
+    assert final.status == domain.ProposedActionStatus.EXECUTING
 
 
 # ---------------------------------------------------------------------------
@@ -217,23 +251,51 @@ def test_concurrent_claims_yield_exactly_one_winner(tmp_path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_expired_action_cannot_be_claimed(db) -> None:
+def test_expired_action_cannot_begin_execution(db) -> None:
     action = fresh_action()  # fixture expires 2026-09-21T12:05+02:00
     repo = ActionRepository(db)
     repo.create_action(action)
+    assert repo.record_approval(action.id, now=NOW) is True
     later = datetime.fromisoformat("2026-09-21T13:00:00+02:00")
-    assert repo.claim_action(action.id, domain.ProposedActionStatus.PENDING,
-                             domain.ProposedActionStatus.APPROVED, now=later) is False
-    assert repo.get_action(action.id).status == domain.ProposedActionStatus.PENDING
+    assert repo.claim_action(action.id, now=later) is False
+    assert repo.get_action(action.id).status == domain.ProposedActionStatus.APPROVED
 
 
-def test_expiry_boundary_still_claimable_before_expiry(db) -> None:
+def test_claim_allowed_until_expiry(db) -> None:
     action = fresh_action()
     repo = ActionRepository(db)
     repo.create_action(action)
+    assert repo.record_approval(action.id, now=NOW) is True
     just_before = datetime.fromisoformat("2026-09-21T12:04:59+02:00")
-    assert repo.claim_action(action.id, domain.ProposedActionStatus.PENDING,
-                             domain.ProposedActionStatus.APPROVED, now=just_before) is True
+    assert repo.claim_action(action.id, now=just_before) is True
+
+
+def test_outcome_of_started_execution_persists_after_expiry(db) -> None:
+    """Expiry prevents STARTING an execution; it never blocks recording the
+    durable result of one that already began before expiry."""
+    action = fresh_action()  # expires 12:05
+    repo = ActionRepository(db)
+    repo.create_action(action)
+    assert repo.record_approval(action.id, now=NOW) is True
+    claimed_at = datetime.fromisoformat("2026-09-21T12:04:59+02:00")
+    assert repo.claim_action(action.id, now=claimed_at) is True
+
+    # Result arrives at 12:05:01 - one second after the proposal expired.
+    finished = datetime.fromisoformat("2026-09-21T12:05:01+02:00")
+    assert repo.finish_execution(action.id, domain.ProposedActionStatus.SUCCEEDED) is True
+    stored = repo.get_action(action.id)
+    assert stored.status == domain.ProposedActionStatus.SUCCEEDED
+
+    # Only one final transition wins; a second outcome cannot overwrite it.
+    assert repo.finish_execution(action.id, domain.ProposedActionStatus.FAILED) is False
+    assert repo.get_action(action.id).status == domain.ProposedActionStatus.SUCCEEDED
+
+
+def test_finish_execution_requires_executing_state(db) -> None:
+    action = fresh_action()
+    repo = ActionRepository(db)
+    repo.create_action(action)
+    assert repo.finish_execution(action.id, domain.ProposedActionStatus.UNKNOWN) is False
 
 
 # ---------------------------------------------------------------------------
@@ -292,6 +354,19 @@ def test_attention_unique_source_source_id(db) -> None:
     assert repo.add(item) is True
     assert repo.add(item) is False  # deduplicated at the DB boundary
     assert repo.get(item.id) == item
+
+
+def test_attention_unrelated_integrity_conflict_raises(db) -> None:
+    """Only the canonical (source, source_id) dedup conflict maps to False;
+    any other integrity violation must surface, not masquerade as a duplicate."""
+    item = domain.AttentionItem.model_validate(load_fixture("attention_finance_decision.json"))
+    repo = AttentionRepository(db)
+    assert repo.add(item) is True
+    clash = domain.AttentionItem.model_validate(
+        {**item.model_dump(), "source_id": "msg-unrelated-clash"}
+    )  # same primary id, different dedup key -> PK violation
+    with pytest.raises(sqlite3.IntegrityError):
+        repo.add(clash)
 
 
 def test_decision_unique_attention_item_and_fk(db) -> None:
@@ -369,6 +444,18 @@ def test_focus_session_and_summary_persistence(db) -> None:
     assert stopped.stopped_at == stopped_at
     repo.put_summary(summary)
     assert repo.get_summary(session.id) == summary
+
+
+def test_focus_stop_before_start_is_rejected_and_leaves_session_unchanged(db) -> None:
+    session = domain.FocusSession.model_validate(load_fixture("focus_session_active.json"))
+    repo = FocusRepository(db)
+    repo.start(session)
+    invalid = session.starts_at - timedelta(hours=1)  # violates stopped_at >= starts_at
+    with pytest.raises(ValidationError):
+        repo.stop(session.id, stopped_at=invalid)
+    after = repo.get(session.id)
+    assert after == session  # originally stored valid session untouched
+    assert after.stopped_at is None
 
 
 def test_ingestion_cursors_and_seen_sources(db) -> None:

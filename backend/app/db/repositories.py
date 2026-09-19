@@ -22,7 +22,9 @@ from typing import NamedTuple
 from app.contracts import domain
 from app.db.session import Database, from_db, to_db
 
-# Controlled action-status transition table (frozen lifecycle).
+# Controlled action-status transition table (frozen lifecycle). Kept as
+# documentation of the canonical lifecycle; each repository operation encodes
+# its own slice of it explicitly - there is no general status-mutation API.
 _ALLOWED_TRANSITIONS: dict[domain.ProposedActionStatus, frozenset[domain.ProposedActionStatus]] = {
     domain.ProposedActionStatus.PENDING: frozenset(
         {
@@ -48,6 +50,15 @@ _ALLOWED_TRANSITIONS: dict[domain.ProposedActionStatus, frozenset[domain.Propose
         }
     ),
 }
+
+# Final outcomes reachable from EXECUTING via finish_execution().
+_FINAL_OUTCOMES = frozenset(
+    {
+        domain.ProposedActionStatus.SUCCEEDED,
+        domain.ProposedActionStatus.FAILED,
+        domain.ProposedActionStatus.UNKNOWN,
+    }
+)
 
 _ATTEMPT_OUTCOMES = frozenset({"succeeded", "failed", "unknown"})
 
@@ -164,25 +175,53 @@ class ActionRepository:
 
     # -- controlled transitions ---------------------------------------------
 
+    def record_approval(self, action_id: str, *, now: datetime) -> bool:
+        """Approve a still-valid pending proposal (PENDING -> APPROVED).
+
+        Atomic conditional update; approval is part of the authorization
+        boundary, so an already-expired proposal cannot be approved."""
+        with self._db.transaction() as conn:
+            cur = conn.execute(
+                "UPDATE proposed_actions SET status = ?"
+                " WHERE id = ? AND status = ? AND expires_at > ?",
+                (
+                    domain.ProposedActionStatus.APPROVED.value,
+                    action_id,
+                    domain.ProposedActionStatus.PENDING.value,
+                    to_db(now),
+                ),
+            )
+            return cur.rowcount == 1
+
     def claim_action(
         self,
         action_id: str,
-        expected_status: domain.ProposedActionStatus,
-        new_status: domain.ProposedActionStatus,
+        expected_status: domain.ProposedActionStatus = domain.ProposedActionStatus.APPROVED,
+        new_status: domain.ProposedActionStatus = domain.ProposedActionStatus.EXECUTING,
         *,
         now: datetime,
     ) -> bool:
-        """Atomic conditional claim: exactly one concurrent caller can move an
-        unexpired action out of ``expected_status``.
+        """Atomic execution claim: APPROVED -> EXECUTING, exactly one winner.
 
-        Implemented as a single ``UPDATE ... WHERE id = ? AND status = ? AND
-        expires_at > ?`` inside a write transaction; success is decided by the
-        affected-row count, never by a prior SELECT. Expired proposals can
-        never be claimed: expiry participates in the same atomic predicate.
+        This primitive represents the authorization/start-execution boundary
+        only. It is deliberately restricted to that single transition (other
+        lifecycle moves have their own operations) and enforces expiry inside
+        the same atomic predicate:
+
+            UPDATE ... WHERE id = ? AND status = 'approved' AND expires_at > now
+
+        Success is decided by the affected-row count - never a prior SELECT -
+        so two concurrent claims cannot both win. Recording the *outcome* of
+        an execution that already began must use finish_execution(), which is
+        intentionally not expiry-gated.
         """
-        if new_status not in _ALLOWED_TRANSITIONS.get(expected_status, frozenset()):
+        if (
+            expected_status != domain.ProposedActionStatus.APPROVED
+            or new_status != domain.ProposedActionStatus.EXECUTING
+        ):
             raise ValueError(
-                f"illegal action transition {expected_status.value} -> {new_status.value}"
+                "claim_action represents the APPROVED -> EXECUTING execution claim only; "
+                "use record_approval/expire_action/finish_execution for other transitions"
             )
         with self._db.transaction() as conn:
             cur = conn.execute(
@@ -191,7 +230,59 @@ class ActionRepository:
                    SET status = ?
                  WHERE id = ? AND status = ? AND expires_at > ?
                 """,
-                (new_status.value, action_id, expected_status.value, to_db(now)),
+                (
+                    domain.ProposedActionStatus.EXECUTING.value,
+                    action_id,
+                    domain.ProposedActionStatus.APPROVED.value,
+                    to_db(now),
+                ),
+            )
+            return cur.rowcount == 1
+
+    def finish_execution(
+        self, action_id: str, new_status: domain.ProposedActionStatus
+    ) -> bool:
+        """Close an executing action with a canonical final outcome
+        (EXECUTING -> SUCCEEDED | FAILED | UNKNOWN).
+
+        Atomic conditional update on the current status. Deliberately NOT
+        expiry-gated: ``expires_at`` bounds starting new executions, never
+        recording the durable result of one that already began. ``UNKNOWN`` is
+        the storage slot later reconciled by A07 - no reconciliation behavior
+        lives here."""
+        if new_status not in _FINAL_OUTCOMES:
+            raise ValueError(
+                "finish_execution accepts only SUCCEEDED, FAILED or UNKNOWN"
+            )
+        with self._db.transaction() as conn:
+            cur = conn.execute(
+                "UPDATE proposed_actions SET status = ?"
+                " WHERE id = ? AND status = ?",
+                (
+                    new_status.value,
+                    action_id,
+                    domain.ProposedActionStatus.EXECUTING.value,
+                ),
+            )
+            return cur.rowcount == 1
+
+    def expire_action(self, action_id: str, *, now: datetime) -> bool:
+        """Move an unstarted proposal to EXPIRED once ``now >= expires_at``.
+
+        Explicit expiry only - no background expiry worker in A01 (and none is
+        implied for A07 by this method). Uses the expiry boundary consistent
+        with passing, i.e. the negation of the execution-claim predicate."""
+        with self._db.transaction() as conn:
+            cur = conn.execute(
+                "UPDATE proposed_actions SET status = ?"
+                " WHERE id = ? AND status IN (?, ?) AND expires_at <= ?",
+                (
+                    domain.ProposedActionStatus.EXPIRED.value,
+                    action_id,
+                    domain.ProposedActionStatus.PENDING.value,
+                    domain.ProposedActionStatus.APPROVED.value,
+                    to_db(now),
+                ),
             )
             return cur.rowcount == 1
 
@@ -328,17 +419,19 @@ class AttentionRepository:
         self._db = db
 
     def add(self, item: domain.AttentionItem) -> bool:
-        try:
-            with self._db.transaction() as conn:
-                conn.execute(
-                    "INSERT INTO attention_items (id, source, source_id, received_at, payload_json)"
-                    " VALUES (?, ?, ?, ?, ?)",
-                    (item.id, item.source.value, item.source_id, to_db(item.received_at),
-                     item.model_dump_json()),
-                )
-        except sqlite3.IntegrityError:
-            return False
-        return True
+        """True when stored; False only on the canonical (source, source_id)
+        deduplication conflict. Any other integrity violation (e.g. duplicate
+        primary key) surfaces as sqlite3.IntegrityError instead of being
+        misread as a duplicate sighting."""
+        with self._db.transaction() as conn:
+            cur = conn.execute(
+                "INSERT INTO attention_items (id, source, source_id, received_at, payload_json)"
+                " VALUES (?, ?, ?, ?, ?)"
+                " ON CONFLICT(source, source_id) DO NOTHING",
+                (item.id, item.source.value, item.source_id, to_db(item.received_at),
+                 item.model_dump_json()),
+            )
+            return cur.rowcount == 1
 
     def get(self, item_id: str) -> domain.AttentionItem | None:
         with self._db.connect() as conn:
@@ -400,8 +493,12 @@ class FocusRepository:
             ).fetchone()
             if row is None:
                 raise KeyError(f"unknown focus session {session_id!r}")
-            updated = domain.FocusSession.model_validate_json(row["payload_json"]).model_copy(
-                update={"stopped_at": stopped_at}
+            current = domain.FocusSession.model_validate_json(row["payload_json"])
+            # Re-run canonical validation on the updated model (model_copy
+            # would skip validators, e.g. stopped_at >= starts_at). The UPDATE
+            # only happens once the reconstructed session is valid.
+            updated = domain.FocusSession.model_validate(
+                {**current.model_dump(), "stopped_at": stopped_at}
             )
             conn.execute(
                 "UPDATE focus_sessions SET stopped_at = ?, payload_json = ? WHERE id = ?",
