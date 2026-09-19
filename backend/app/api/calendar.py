@@ -32,8 +32,13 @@ def _service(request: Request) -> CalendarService:
             status_code=503,
             detail=f"calendar unavailable: {exc}; start authorization at /api/auth/google/start",
         ) from None
-    except Exception:
-        logger.exception("unexpected failure preparing calendar session")
+    except Exception as exc:
+        # Generic/untrusted exceptions must never have their message, repr or
+        # traceback logged - third-party exception text can carry tokens,
+        # headers or private provider data. Class name only; fixed message.
+        logger.error(
+            "unexpected failure preparing calendar session (%s)", type(exc).__name__
+        )
         raise HTTPException(
             status_code=503, detail="calendar is temporarily unavailable"
         ) from None

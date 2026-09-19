@@ -418,16 +418,39 @@ def test_route_start_returns_authorize_url(tmp_path) -> None:
     assert CLIENT_SECRET not in url
 
 
-def test_route_start_unexpected_failure_is_generic(tmp_path) -> None:
+def test_route_start_unexpected_failure_is_generic(tmp_path, caplog) -> None:
+    import logging
+
     class ExplodingAuth:
         def authorization_url(self):
-            raise RuntimeError("internal detail with sensitive context")
+            raise RuntimeError(f"internal detail {REFRESH_TOKEN} leaked context")
 
     client = make_client(tmp_path, auth=ExplodingAuth())
-    response = client.get("/api/auth/google/start")
+    with caplog.at_level(logging.DEBUG):
+        response = client.get("/api/auth/google/start")
     assert response.status_code == 503
     assert response.json()["detail"] == "authorization start is temporarily unavailable"
-    assert "sensitive" not in response.text
+    # The secret marker appears in neither the response nor the logs.
+    assert REFRESH_TOKEN not in response.text
+    assert REFRESH_TOKEN not in caplog.text
+    assert "unexpected failure issuing oauth start url" in caplog.text
+
+
+def test_route_callback_unexpected_failure_logs_no_secrets(tmp_path, caplog) -> None:
+    import logging
+
+    class ExplodingAuth:
+        def handle_callback(self, query):
+            raise RuntimeError(f"callback blew up near {ACCESS_TOKEN}")
+
+    client = make_client(tmp_path, auth=ExplodingAuth())
+    with caplog.at_level(logging.DEBUG):
+        response = client.get("/api/auth/google/callback?code=x&state=y")
+    assert response.status_code == 500
+    assert response.json()["detail"] == "authorization callback failed unexpectedly"
+    assert ACCESS_TOKEN not in response.text
+    assert ACCESS_TOKEN not in caplog.text
+    assert "unexpected failure handling oauth callback" in caplog.text
 
 
 def test_route_callback_flow_and_replay(tmp_path) -> None:

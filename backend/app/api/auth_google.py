@@ -36,10 +36,13 @@ def start(request: Request) -> dict[str, str]:
     except GoogleAuthError as exc:
         # GoogleAuthError messages are sanitized by construction.
         raise HTTPException(status_code=503, detail=str(exc)) from None
-    except Exception:
-        # Unexpected failures must never leak str(exc) to the client; nothing
-        # secret is logged either (no args rendered).
-        logger.exception("unexpected failure issuing oauth start url")
+    except Exception as exc:
+        # Generic/untrusted exceptions must never have their message, repr or
+        # traceback logged (they can carry token or header material) and are
+        # never echoed to the client. Class name only; fixed message.
+        logger.error(
+            "unexpected failure issuing oauth start url (%s)", type(exc).__name__
+        )
         raise HTTPException(
             status_code=503, detail="authorization start is temporarily unavailable"
         ) from None
@@ -58,8 +61,12 @@ def callback(
         )
     except GoogleAuthError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from None
-    except Exception:
-        logger.exception("unexpected failure handling oauth callback")
+    except Exception as exc:
+        # Same rule as /start: no message, repr or traceback from untrusted
+        # exceptions in logs; fixed generic detail for the client.
+        logger.error(
+            "unexpected failure handling oauth callback (%s)", type(exc).__name__
+        )
         raise HTTPException(
             status_code=500, detail="authorization callback failed unexpectedly"
         ) from None

@@ -305,3 +305,29 @@ def test_route_calendar_requires_connection() -> None:
     response = client.get("/api/calendar/today")
     assert response.status_code == 503
     assert "reauthorization" in response.json()["detail"] or "not connected" in response.json()["detail"]
+
+
+def test_route_calendar_prep_unexpected_failure_logs_no_secrets(caplog) -> None:
+    import logging
+
+    from fastapi.testclient import TestClient
+
+    from app.config import Settings
+    from app.main import create_app
+
+    marker = "SECRET-REFRESH-TOKEN-4242"
+
+    class ExplodingAuth:
+        def authorized_session(self):
+            raise RuntimeError(f"session prep failed with {marker} in headers")
+
+    app = create_app(Settings())
+    app.state.google_auth = ExplodingAuth()
+    client = TestClient(app)
+    with caplog.at_level(logging.DEBUG):
+        response = client.get("/api/calendar/today")
+    assert response.status_code == 503
+    assert response.json()["detail"] == "calendar is temporarily unavailable"
+    assert marker not in response.text
+    assert marker not in caplog.text
+    assert "unexpected failure preparing calendar session" in caplog.text
