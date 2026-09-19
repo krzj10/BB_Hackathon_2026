@@ -1,0 +1,7 @@
+{
+  "action_id": "act-demo-agenda-acme-001",
+  "revision": 1,
+  "arguments_digest": "sha256:demo-digest-agenda-0001",
+  "choice": "approve",
+  "challenge": "demo-one-time-challenge-0001"
+}

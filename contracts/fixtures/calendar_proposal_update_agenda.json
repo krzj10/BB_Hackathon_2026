@@ -1,0 +1,8 @@
+{
+  "tool": "calendar.update_agenda",
+  "ref": { "calendar_id": "primary", "event_id": "evt-demo-acme-contract-review-001" },
+  "mode": "update",
+  "agenda_markdown": "## EVA Agenda\n- Ustalic ostateczny harmonogram migracji",
+  "expected_etag": "demo-etag-acme-001",
+  "send_updates": "none"
+}

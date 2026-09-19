@@ -1,0 +1,57 @@
+{
+  "ref": { "calendar_id": "primary", "event_id": "evt-demo-acme-contract-review-001" },
+  "etag": "demo-etag-acme-001",
+  "title": "ACME Contract Review",
+  "span": {
+    "kind": "timed",
+    "start": "2026-09-21T14:00:00+02:00",
+    "end": "2026-09-21T15:00:00+02:00",
+    "timezone": "Europe/Warsaw"
+  },
+  "attendees": [
+    {
+      "email": "user.demo@example.com",
+      "name": "Demo Executive",
+      "internal": true,
+      "previous_meeting_count": null,
+      "previous_email_count": null,
+      "previous_chat_count": null
+    },
+    {
+      "email": "legal.acme@example.com",
+      "name": "A. Lawyer",
+      "company": "ACME",
+      "role": "Legal Counsel",
+      "internal": false,
+      "previous_meeting_count": 2,
+      "previous_email_count": null,
+      "previous_chat_count": null
+    }
+  ],
+  "organizer_email": "user.demo@example.com",
+  "editable": true,
+  "recurring_event_id": null,
+  "description": "Contract negotiation follow-up. Agenda placeholders preserved verbatim.",
+  "location": "Meet demo room",
+  "agenda": null,
+  "priority": "high",
+  "priority_reasons": [
+    {
+      "code": "meeting.high.contract_negotiation",
+      "origin": "rule",
+      "text": "Contract negotiation meeting with external counterparty.",
+      "source_ids": ["src-cal-001"],
+      "policy_version": "policy-v1"
+    }
+  ],
+  "sources": [
+    {
+      "id": "src-cal-001",
+      "kind": "calendar_event",
+      "resource_id": "primary:evt-demo-acme-contract-review-001",
+      "title": "ACME Contract Review (Google Calendar)",
+      "url": null,
+      "retrieved_at": "2026-09-21T08:00:00+02:00"
+    }
+  ]
+}

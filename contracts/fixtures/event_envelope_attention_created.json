@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "event_id": "evtw-demo-attention-001",
+  "sequence": 42,
+  "session_id": "sess-demo-001",
+  "request_id": null,
+  "occurred_at": "2026-09-21T11:30:06+02:00",
+  "type": "attention_item_created",
+  "payload": {
+    "type": "attention_item_created",
+    "item": {
+      "id": "attn-demo-finance-001",
+      "source": "gmail",
+      "source_id": "demo-thread-cfo-request/msg-001",
+      "sender_email": "cfo.demo@example.com",
+      "title": "Decyzja: wydatki na migracje - 12 400 PLN",
+      "content_preview": "Prosze o decyzje w sprawie faktury za migracje: 12 400 PLN.",
+      "received_at": "2026-09-21T11:30:00+02:00",
+      "attention_type": "decision_required",
+      "urgent": true,
+      "priority": "high",
+      "confidence": 0.93,
+      "reasons": [],
+      "sources": [],
+      "deadline": "2026-09-25T17:00:00+02:00",
+      "related_meeting": null,
+      "decision_id": "dec-demo-finance-001",
+      "delivery": "deferred",
+      "delivery_reasons": []
+    }
+  }
+}

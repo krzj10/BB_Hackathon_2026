@@ -1,0 +1,23 @@
+{
+  "call_id": "call-demo-agenda-001",
+  "tool": "calendar.update_agenda",
+  "status": "ok",
+  "data": {
+    "meeting_ref": { "calendar_id": "primary", "event_id": "evt-demo-acme-contract-review-001" },
+    "verified_by_read_back": true,
+    "new_etag": "demo-etag-acme-002"
+  },
+  "error": null,
+  "sources": [
+    {
+      "id": "src-cal-003",
+      "kind": "calendar_event",
+      "resource_id": "primary:evt-demo-acme-contract-review-001",
+      "title": "Read-back after agenda write (syntetyczny)",
+      "url": null,
+      "retrieved_at": "2026-09-21T12:02:10+02:00"
+    }
+  ],
+  "action_id": "act-demo-agenda-acme-001",
+  "duration_ms": 842
+}

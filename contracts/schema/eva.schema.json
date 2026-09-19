@@ -1,0 +1,3590 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "EVA canonical contracts v2.0 (A00)",
+  "description": "Self-contained contract bundle. Every internal '#/$defs/...' ref resolves inside this document. Validate a named contract with {\"$ref\": \"#/$defs/<Name>\", ...this document}.",
+  "x-eva-serialization": {
+    "field_names": "snake_case",
+    "enums": "lowercase",
+    "extra_fields": "forbid",
+    "datetimes": "ISO 8601, timezone-aware",
+    "money": "integer minor units + ISO 4217 currency"
+  },
+  "$defs": {
+    "MeetingPriority": {
+      "enum": [
+        "low",
+        "medium",
+        "high"
+      ],
+      "title": "MeetingPriority",
+      "type": "string"
+    },
+    "ActionRisk": {
+      "enum": [
+        "low",
+        "medium",
+        "high"
+      ],
+      "title": "ActionRisk",
+      "type": "string"
+    },
+    "AttentionPriority": {
+      "enum": [
+        "low",
+        "medium",
+        "high"
+      ],
+      "title": "AttentionPriority",
+      "type": "string"
+    },
+    "AttentionType": {
+      "enum": [
+        "fyi",
+        "action_required",
+        "decision_required",
+        "urgent"
+      ],
+      "title": "AttentionType",
+      "type": "string"
+    },
+    "ClaimKind": {
+      "enum": [
+        "fact",
+        "inference",
+        "suggestion"
+      ],
+      "title": "ClaimKind",
+      "type": "string"
+    },
+    "ReasonOrigin": {
+      "enum": [
+        "rule",
+        "preference",
+        "llm"
+      ],
+      "title": "ReasonOrigin",
+      "type": "string"
+    },
+    "Language": {
+      "enum": [
+        "en",
+        "pl"
+      ],
+      "title": "Language",
+      "type": "string"
+    },
+    "VoiceState": {
+      "enum": [
+        "idle",
+        "wake_listening",
+        "listening",
+        "transcribing",
+        "thinking",
+        "speaking",
+        "awaiting_approval",
+        "interrupted",
+        "error"
+      ],
+      "title": "VoiceState",
+      "type": "string"
+    },
+    "ProposedActionStatus": {
+      "description": "Lifecycle: pending -> approved -> executing -> succeeded/failed/unknown.\n\nOther terminal/non-executable states: rejected, expired, superseded.",
+      "enum": [
+        "pending",
+        "approved",
+        "executing",
+        "succeeded",
+        "failed",
+        "unknown",
+        "rejected",
+        "expired",
+        "superseded"
+      ],
+      "title": "ProposedActionStatus",
+      "type": "string"
+    },
+    "DecisionStatus": {
+      "enum": [
+        "needs_review",
+        "deferred",
+        "resolved",
+        "dismissed"
+      ],
+      "title": "DecisionStatus",
+      "type": "string"
+    },
+    "DecisionOutcome": {
+      "description": "Internal outcome only. Recording it executes no payment, purchase,\nsupplier or contract commitment.",
+      "enum": [
+        "accept",
+        "reject"
+      ],
+      "title": "DecisionOutcome",
+      "type": "string"
+    },
+    "ToolEffect": {
+      "enum": [
+        "read",
+        "local_write",
+        "external_write"
+      ],
+      "title": "ToolEffect",
+      "type": "string"
+    },
+    "ToolResultStatus": {
+      "enum": [
+        "ok",
+        "partial",
+        "error",
+        "unknown"
+      ],
+      "title": "ToolResultStatus",
+      "type": "string"
+    },
+    "HealthStatus": {
+      "enum": [
+        "ready",
+        "degraded",
+        "unavailable"
+      ],
+      "title": "HealthStatus",
+      "type": "string"
+    },
+    "SourceKind": {
+      "enum": [
+        "calendar_event",
+        "gmail_message",
+        "gmail_thread",
+        "contact",
+        "drive_file",
+        "policy_rule",
+        "attention_item",
+        "decision",
+        "other"
+      ],
+      "title": "SourceKind",
+      "type": "string"
+    },
+    "SourceSystem": {
+      "enum": [
+        "gmail",
+        "calendar",
+        "chat",
+        "manual",
+        "other"
+      ],
+      "title": "SourceSystem",
+      "type": "string"
+    },
+    "DeliveryDecision": {
+      "description": "Notification delivery state of an AttentionItem (delivery only; never\naffects action authorization).",
+      "enum": [
+        "delivered",
+        "deferred",
+        "suppressed"
+      ],
+      "title": "DeliveryDecision",
+      "type": "string"
+    },
+    "ApprovalChannel": {
+      "enum": [
+        "ui",
+        "voice"
+      ],
+      "title": "ApprovalChannel",
+      "type": "string"
+    },
+    "ApprovalChoice": {
+      "enum": [
+        "approve",
+        "reject"
+      ],
+      "title": "ApprovalChoice",
+      "type": "string"
+    },
+    "SendUpdates": {
+      "description": "Google notification choice; part of the approved impact of a mutation.",
+      "enum": [
+        "all",
+        "external_only",
+        "none"
+      ],
+      "title": "SendUpdates",
+      "type": "string"
+    },
+    "RetrievalStatus": {
+      "enum": [
+        "complete",
+        "partial",
+        "unavailable"
+      ],
+      "title": "RetrievalStatus",
+      "type": "string"
+    },
+    "AgendaSectionMode": {
+      "enum": [
+        "add",
+        "update"
+      ],
+      "title": "AgendaSectionMode",
+      "type": "string"
+    },
+    "ActiveContextMode": {
+      "enum": [
+        "general",
+        "meeting",
+        "attention_item",
+        "decision",
+        "focus"
+      ],
+      "title": "ActiveContextMode",
+      "type": "string"
+    },
+    "EventType": {
+      "enum": [
+        "voice_state_changed",
+        "transcript_ready",
+        "briefing_ready",
+        "attention_item_created",
+        "decision_created",
+        "decision_updated",
+        "focus_started",
+        "focus_ended",
+        "action_proposed",
+        "action_status_changed",
+        "inference_unavailable",
+        "heartbeat"
+      ],
+      "title": "EventType",
+      "type": "string"
+    },
+    "Money": {
+      "additionalProperties": false,
+      "properties": {
+        "amount_minor_units": {
+          "minimum": 0,
+          "title": "Amount Minor Units",
+          "type": "integer"
+        },
+        "currency": {
+          "pattern": "^[A-Z]{3}$",
+          "title": "Currency",
+          "type": "string"
+        }
+      },
+      "required": [
+        "amount_minor_units",
+        "currency"
+      ],
+      "title": "Money",
+      "type": "object"
+    },
+    "SourceRef": {
+      "additionalProperties": false,
+      "description": "Opaque, resolvable evidence pointer.",
+      "properties": {
+        "id": {
+          "minLength": 1,
+          "title": "Id",
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/SourceKind"
+        },
+        "resource_id": {
+          "minLength": 1,
+          "title": "Resource Id",
+          "type": "string"
+        },
+        "title": {
+          "title": "Title",
+          "type": "string"
+        },
+        "url": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Url"
+        },
+        "retrieved_at": {
+          "format": "date-time",
+          "title": "Retrieved At",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "resource_id",
+        "title",
+        "retrieved_at"
+      ],
+      "title": "SourceRef",
+      "type": "object"
+    },
+    "Claim": {
+      "additionalProperties": false,
+      "description": "A single briefing/attention statement with provenance.\n\nInvariant: historical facts require sources; inference and suggestion may\ncarry none but must never be presented as sourced fact.",
+      "properties": {
+        "text": {
+          "minLength": 1,
+          "title": "Text",
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/ClaimKind"
+        },
+        "source_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Source Ids",
+          "type": "array"
+        }
+      },
+      "required": [
+        "text",
+        "kind"
+      ],
+      "title": "Claim",
+      "type": "object"
+    },
+    "Reason": {
+      "additionalProperties": false,
+      "description": "Deterministic or preference/LLM-origin explanation bound to evidence.",
+      "properties": {
+        "code": {
+          "minLength": 1,
+          "title": "Code",
+          "type": "string"
+        },
+        "origin": {
+          "$ref": "#/$defs/ReasonOrigin"
+        },
+        "text": {
+          "minLength": 1,
+          "title": "Text",
+          "type": "string"
+        },
+        "source_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Source Ids",
+          "type": "array"
+        },
+        "policy_version": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Policy Version"
+        }
+      },
+      "required": [
+        "code",
+        "origin",
+        "text"
+      ],
+      "title": "Reason",
+      "type": "object"
+    },
+    "Participant": {
+      "additionalProperties": false,
+      "properties": {
+        "email": {
+          "format": "email",
+          "title": "Email",
+          "type": "string"
+        },
+        "name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Name"
+        },
+        "company": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Company"
+        },
+        "role": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Role"
+        },
+        "internal": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Internal"
+        },
+        "previous_meeting_count": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Previous Meeting Count"
+        },
+        "previous_email_count": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Previous Email Count"
+        },
+        "previous_chat_count": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Previous Chat Count"
+        }
+      },
+      "required": [
+        "email"
+      ],
+      "title": "Participant",
+      "type": "object"
+    },
+    "MeetingRef": {
+      "additionalProperties": false,
+      "properties": {
+        "calendar_id": {
+          "minLength": 1,
+          "title": "Calendar Id",
+          "type": "string"
+        },
+        "event_id": {
+          "minLength": 1,
+          "title": "Event Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "calendar_id",
+        "event_id"
+      ],
+      "title": "MeetingRef",
+      "type": "object"
+    },
+    "TimedSpan": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "timed",
+          "default": "timed",
+          "title": "Kind",
+          "type": "string"
+        },
+        "start": {
+          "format": "date-time",
+          "title": "Start",
+          "type": "string"
+        },
+        "end": {
+          "format": "date-time",
+          "title": "End",
+          "type": "string"
+        },
+        "timezone": {
+          "description": "IANA timezone identifier",
+          "minLength": 1,
+          "title": "Timezone",
+          "type": "string"
+        }
+      },
+      "required": [
+        "start",
+        "end",
+        "timezone"
+      ],
+      "title": "TimedSpan",
+      "type": "object"
+    },
+    "AllDaySpan": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "all_day",
+          "default": "all_day",
+          "title": "Kind",
+          "type": "string"
+        },
+        "start_date": {
+          "format": "date",
+          "title": "Start Date",
+          "type": "string"
+        },
+        "end_exclusive": {
+          "format": "date",
+          "title": "End Exclusive",
+          "type": "string"
+        }
+      },
+      "required": [
+        "start_date",
+        "end_exclusive"
+      ],
+      "title": "AllDaySpan",
+      "type": "object"
+    },
+    "Meeting": {
+      "additionalProperties": false,
+      "properties": {
+        "ref": {
+          "$ref": "#/$defs/MeetingRef"
+        },
+        "etag": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Etag"
+        },
+        "title": {
+          "minLength": 1,
+          "title": "Title",
+          "type": "string"
+        },
+        "span": {
+          "$ref": "#/$defs/MeetingSpan"
+        },
+        "attendees": {
+          "items": {
+            "$ref": "#/$defs/Participant"
+          },
+          "title": "Attendees",
+          "type": "array"
+        },
+        "organizer_email": {
+          "anyOf": [
+            {
+              "format": "email",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Organizer Email"
+        },
+        "editable": {
+          "default": false,
+          "title": "Editable",
+          "type": "boolean"
+        },
+        "recurring_event_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Recurring Event Id"
+        },
+        "description": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Description"
+        },
+        "location": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Location"
+        },
+        "agenda": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Agenda"
+        },
+        "priority": {
+          "$ref": "#/$defs/MeetingPriority"
+        },
+        "priority_reasons": {
+          "items": {
+            "$ref": "#/$defs/Reason"
+          },
+          "title": "Priority Reasons",
+          "type": "array"
+        },
+        "sources": {
+          "items": {
+            "$ref": "#/$defs/SourceRef"
+          },
+          "title": "Sources",
+          "type": "array"
+        }
+      },
+      "required": [
+        "ref",
+        "title",
+        "span",
+        "priority"
+      ],
+      "title": "Meeting",
+      "type": "object"
+    },
+    "ExecutiveBriefing": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "minLength": 1,
+          "title": "Id",
+          "type": "string"
+        },
+        "meeting": {
+          "$ref": "#/$defs/Meeting"
+        },
+        "language": {
+          "$ref": "#/$defs/Language"
+        },
+        "generated_at": {
+          "format": "date-time",
+          "title": "Generated At",
+          "type": "string"
+        },
+        "previous_interactions": {
+          "items": {
+            "$ref": "#/$defs/Claim"
+          },
+          "title": "Previous Interactions",
+          "type": "array"
+        },
+        "open_topics": {
+          "items": {
+            "$ref": "#/$defs/Claim"
+          },
+          "title": "Open Topics",
+          "type": "array"
+        },
+        "previous_decisions": {
+          "items": {
+            "$ref": "#/$defs/Claim"
+          },
+          "title": "Previous Decisions",
+          "type": "array"
+        },
+        "risks": {
+          "items": {
+            "$ref": "#/$defs/Claim"
+          },
+          "title": "Risks",
+          "type": "array"
+        },
+        "suggestions": {
+          "items": {
+            "$ref": "#/$defs/Claim"
+          },
+          "title": "Suggestions",
+          "type": "array"
+        },
+        "spoken_summary": {
+          "minLength": 1,
+          "title": "Spoken Summary",
+          "type": "string"
+        },
+        "sources": {
+          "items": {
+            "$ref": "#/$defs/SourceRef"
+          },
+          "title": "Sources",
+          "type": "array"
+        },
+        "retrieval_status": {
+          "$ref": "#/$defs/RetrievalStatus"
+        },
+        "retrieval_notes": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Retrieval Notes",
+          "type": "array"
+        }
+      },
+      "required": [
+        "id",
+        "meeting",
+        "language",
+        "generated_at",
+        "spoken_summary",
+        "retrieval_status"
+      ],
+      "title": "ExecutiveBriefing",
+      "type": "object"
+    },
+    "AttentionItem": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "minLength": 1,
+          "title": "Id",
+          "type": "string"
+        },
+        "source": {
+          "$ref": "#/$defs/SourceSystem"
+        },
+        "source_id": {
+          "minLength": 1,
+          "title": "Source Id",
+          "type": "string"
+        },
+        "sender_email": {
+          "format": "email",
+          "title": "Sender Email",
+          "type": "string"
+        },
+        "title": {
+          "title": "Title",
+          "type": "string"
+        },
+        "content_preview": {
+          "title": "Content Preview",
+          "type": "string"
+        },
+        "received_at": {
+          "format": "date-time",
+          "title": "Received At",
+          "type": "string"
+        },
+        "attention_type": {
+          "$ref": "#/$defs/AttentionType"
+        },
+        "urgent": {
+          "default": false,
+          "title": "Urgent",
+          "type": "boolean"
+        },
+        "priority": {
+          "$ref": "#/$defs/AttentionPriority"
+        },
+        "confidence": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Confidence",
+          "type": "number"
+        },
+        "reasons": {
+          "items": {
+            "$ref": "#/$defs/Reason"
+          },
+          "title": "Reasons",
+          "type": "array"
+        },
+        "sources": {
+          "items": {
+            "$ref": "#/$defs/SourceRef"
+          },
+          "title": "Sources",
+          "type": "array"
+        },
+        "deadline": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Deadline"
+        },
+        "related_meeting": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MeetingRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "decision_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Decision Id"
+        },
+        "delivery": {
+          "$ref": "#/$defs/DeliveryDecision"
+        },
+        "delivery_reasons": {
+          "items": {
+            "$ref": "#/$defs/Reason"
+          },
+          "title": "Delivery Reasons",
+          "type": "array"
+        }
+      },
+      "required": [
+        "id",
+        "source",
+        "source_id",
+        "sender_email",
+        "title",
+        "content_preview",
+        "received_at",
+        "attention_type",
+        "priority",
+        "confidence",
+        "delivery"
+      ],
+      "title": "AttentionItem",
+      "type": "object"
+    },
+    "Decision": {
+      "additionalProperties": false,
+      "description": "Fed exclusively by decision_required Attention items.\n\nA recorded accept/reject is a local, audited outcome: it executes no\npayment, purchase, supplier or contract commitment.",
+      "properties": {
+        "id": {
+          "minLength": 1,
+          "title": "Id",
+          "type": "string"
+        },
+        "attention_item_id": {
+          "minLength": 1,
+          "title": "Attention Item Id",
+          "type": "string"
+        },
+        "title": {
+          "minLength": 1,
+          "title": "Title",
+          "type": "string"
+        },
+        "money": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Money"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "deadline": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Deadline"
+        },
+        "context": {
+          "items": {
+            "$ref": "#/$defs/Claim"
+          },
+          "title": "Context",
+          "type": "array"
+        },
+        "alternatives": {
+          "items": {
+            "$ref": "#/$defs/Claim"
+          },
+          "title": "Alternatives",
+          "type": "array"
+        },
+        "risks": {
+          "items": {
+            "$ref": "#/$defs/Claim"
+          },
+          "title": "Risks",
+          "type": "array"
+        },
+        "preference_conflicts": {
+          "items": {
+            "$ref": "#/$defs/Reason"
+          },
+          "title": "Preference Conflicts",
+          "type": "array"
+        },
+        "suggested_next_step": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Suggested Next Step"
+        },
+        "risk": {
+          "$ref": "#/$defs/ActionRisk"
+        },
+        "status": {
+          "$ref": "#/$defs/DecisionStatus"
+        },
+        "outcome": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DecisionOutcome"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "outcome_recorded_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Outcome Recorded At"
+        },
+        "proposed_action_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Proposed Action Id"
+        },
+        "sources": {
+          "items": {
+            "$ref": "#/$defs/SourceRef"
+          },
+          "title": "Sources",
+          "type": "array"
+        }
+      },
+      "required": [
+        "id",
+        "attention_item_id",
+        "title",
+        "risk",
+        "status"
+      ],
+      "title": "Decision",
+      "type": "object"
+    },
+    "ProposedAction": {
+      "additionalProperties": false,
+      "description": "Immutable-by-revision mutation proposal bound to digest, policy version\nand expiry. The LLM cannot choose authoritative risk or issue receipts.",
+      "properties": {
+        "id": {
+          "minLength": 1,
+          "title": "Id",
+          "type": "string"
+        },
+        "session_id": {
+          "minLength": 1,
+          "title": "Session Id",
+          "type": "string"
+        },
+        "request_id": {
+          "minLength": 1,
+          "title": "Request Id",
+          "type": "string"
+        },
+        "revision": {
+          "minimum": 1,
+          "title": "Revision",
+          "type": "integer"
+        },
+        "tool": {
+          "description": "internal dotted tool name",
+          "minLength": 1,
+          "title": "Tool",
+          "type": "string"
+        },
+        "arguments": {
+          "additionalProperties": true,
+          "title": "Arguments",
+          "type": "object"
+        },
+        "arguments_digest": {
+          "minLength": 1,
+          "title": "Arguments Digest",
+          "type": "string"
+        },
+        "summary": {
+          "minLength": 1,
+          "title": "Summary",
+          "type": "string"
+        },
+        "reason": {
+          "minLength": 1,
+          "title": "Reason",
+          "type": "string"
+        },
+        "impact": {
+          "minLength": 1,
+          "title": "Impact",
+          "type": "string"
+        },
+        "before": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Before"
+        },
+        "after": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "After"
+        },
+        "resource_version": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Resource Version"
+        },
+        "policy_version": {
+          "minLength": 1,
+          "title": "Policy Version",
+          "type": "string"
+        },
+        "risk": {
+          "$ref": "#/$defs/ActionRisk"
+        },
+        "requires_approval": {
+          "title": "Requires Approval",
+          "type": "boolean"
+        },
+        "voice_approval_allowed": {
+          "title": "Voice Approval Allowed",
+          "type": "boolean"
+        },
+        "created_at": {
+          "format": "date-time",
+          "title": "Created At",
+          "type": "string"
+        },
+        "expires_at": {
+          "format": "date-time",
+          "title": "Expires At",
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/ProposedActionStatus"
+        }
+      },
+      "required": [
+        "id",
+        "session_id",
+        "request_id",
+        "revision",
+        "tool",
+        "arguments",
+        "arguments_digest",
+        "summary",
+        "reason",
+        "impact",
+        "policy_version",
+        "risk",
+        "requires_approval",
+        "voice_approval_allowed",
+        "created_at",
+        "expires_at",
+        "status"
+      ],
+      "title": "ProposedAction",
+      "type": "object"
+    },
+    "ApprovalRequest": {
+      "additionalProperties": false,
+      "description": "Approval bound to action id, revision and arguments digest with a\none-time challenge. Channel is derived server-side, never client-supplied.",
+      "properties": {
+        "action_id": {
+          "minLength": 1,
+          "title": "Action Id",
+          "type": "string"
+        },
+        "revision": {
+          "minimum": 1,
+          "title": "Revision",
+          "type": "integer"
+        },
+        "arguments_digest": {
+          "minLength": 1,
+          "title": "Arguments Digest",
+          "type": "string"
+        },
+        "choice": {
+          "$ref": "#/$defs/ApprovalChoice"
+        },
+        "challenge": {
+          "description": "single-use challenge token",
+          "minLength": 1,
+          "title": "Challenge",
+          "type": "string"
+        }
+      },
+      "required": [
+        "action_id",
+        "revision",
+        "arguments_digest",
+        "choice",
+        "challenge"
+      ],
+      "title": "ApprovalRequest",
+      "type": "object"
+    },
+    "ApprovalReceipt": {
+      "additionalProperties": false,
+      "description": "Server-issued receipt; never model-generated.",
+      "properties": {
+        "id": {
+          "minLength": 1,
+          "title": "Id",
+          "type": "string"
+        },
+        "action_id": {
+          "minLength": 1,
+          "title": "Action Id",
+          "type": "string"
+        },
+        "revision": {
+          "minimum": 1,
+          "title": "Revision",
+          "type": "integer"
+        },
+        "arguments_digest": {
+          "minLength": 1,
+          "title": "Arguments Digest",
+          "type": "string"
+        },
+        "channel": {
+          "$ref": "#/$defs/ApprovalChannel"
+        },
+        "approved_at": {
+          "format": "date-time",
+          "title": "Approved At",
+          "type": "string"
+        },
+        "policy_version": {
+          "minLength": 1,
+          "title": "Policy Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "action_id",
+        "revision",
+        "arguments_digest",
+        "channel",
+        "approved_at",
+        "policy_version"
+      ],
+      "title": "ApprovalReceipt",
+      "type": "object"
+    },
+    "FocusSession": {
+      "additionalProperties": false,
+      "description": "One active session; 'active' is derived from timestamps only.",
+      "properties": {
+        "id": {
+          "minLength": 1,
+          "title": "Id",
+          "type": "string"
+        },
+        "starts_at": {
+          "format": "date-time",
+          "title": "Starts At",
+          "type": "string"
+        },
+        "ends_at": {
+          "format": "date-time",
+          "title": "Ends At",
+          "type": "string"
+        },
+        "threshold": {
+          "$ref": "#/$defs/AttentionPriority"
+        },
+        "sender_overrides": {
+          "description": "exact-address allow_interrupt exceptions only",
+          "items": {
+            "format": "email",
+            "type": "string"
+          },
+          "title": "Sender Overrides",
+          "type": "array"
+        },
+        "policy_version": {
+          "minLength": 1,
+          "title": "Policy Version",
+          "type": "string"
+        },
+        "stopped_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Stopped At"
+        }
+      },
+      "required": [
+        "id",
+        "starts_at",
+        "ends_at",
+        "threshold",
+        "policy_version"
+      ],
+      "title": "FocusSession",
+      "type": "object"
+    },
+    "FocusCompletionSummary": {
+      "additionalProperties": false,
+      "description": "Counts computed from stored, deduplicated Attention items received\nduring the session; no new LLM-generated counts.",
+      "properties": {
+        "focus_session_id": {
+          "minLength": 1,
+          "title": "Focus Session Id",
+          "type": "string"
+        },
+        "ended_at": {
+          "format": "date-time",
+          "title": "Ended At",
+          "type": "string"
+        },
+        "total_received": {
+          "minimum": 0,
+          "title": "Total Received",
+          "type": "integer"
+        },
+        "deferred_count": {
+          "minimum": 0,
+          "title": "Deferred Count",
+          "type": "integer"
+        },
+        "decision_count": {
+          "minimum": 0,
+          "title": "Decision Count",
+          "type": "integer"
+        },
+        "action_count": {
+          "minimum": 0,
+          "title": "Action Count",
+          "type": "integer"
+        },
+        "fyi_count": {
+          "minimum": 0,
+          "title": "Fyi Count",
+          "type": "integer"
+        },
+        "attention_item_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Attention Item Ids",
+          "type": "array"
+        }
+      },
+      "required": [
+        "focus_session_id",
+        "ended_at",
+        "total_received",
+        "deferred_count",
+        "decision_count",
+        "action_count",
+        "fyi_count"
+      ],
+      "title": "FocusCompletionSummary",
+      "type": "object"
+    },
+    "ToolDefinition": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "description": "internal dotted tool name",
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        },
+        "description": {
+          "minLength": 1,
+          "title": "Description",
+          "type": "string"
+        },
+        "effect": {
+          "$ref": "#/$defs/ToolEffect"
+        },
+        "input_schema": {
+          "additionalProperties": true,
+          "title": "Input Schema",
+          "type": "object"
+        },
+        "output_schema": {
+          "additionalProperties": true,
+          "title": "Output Schema",
+          "type": "object"
+        },
+        "required_scopes": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Required Scopes",
+          "type": "array"
+        },
+        "risk_floor": {
+          "$ref": "#/$defs/ActionRisk"
+        },
+        "timeout_seconds": {
+          "exclusiveMinimum": 0,
+          "title": "Timeout Seconds",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "name",
+        "description",
+        "effect",
+        "input_schema",
+        "output_schema",
+        "risk_floor",
+        "timeout_seconds"
+      ],
+      "title": "ToolDefinition",
+      "type": "object"
+    },
+    "ToolCall": {
+      "additionalProperties": false,
+      "description": "Model-produced call. Carries no authoritative risk or approval fields -\nextra-field rejection enforces that boundary.",
+      "properties": {
+        "id": {
+          "minLength": 1,
+          "title": "Id",
+          "type": "string"
+        },
+        "name": {
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        },
+        "arguments": {
+          "additionalProperties": true,
+          "title": "Arguments",
+          "type": "object"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "arguments"
+      ],
+      "title": "ToolCall",
+      "type": "object"
+    },
+    "ToolError": {
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "minLength": 1,
+          "title": "Code",
+          "type": "string"
+        },
+        "message": {
+          "minLength": 1,
+          "title": "Message",
+          "type": "string"
+        },
+        "retryable": {
+          "default": false,
+          "title": "Retryable",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "code",
+        "message"
+      ],
+      "title": "ToolError",
+      "type": "object"
+    },
+    "ToolResult": {
+      "additionalProperties": false,
+      "properties": {
+        "call_id": {
+          "minLength": 1,
+          "title": "Call Id",
+          "type": "string"
+        },
+        "tool": {
+          "minLength": 1,
+          "title": "Tool",
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/ToolResultStatus"
+        },
+        "data": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Data"
+        },
+        "error": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ToolError"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "sources": {
+          "items": {
+            "$ref": "#/$defs/SourceRef"
+          },
+          "title": "Sources",
+          "type": "array"
+        },
+        "action_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Action Id"
+        },
+        "duration_ms": {
+          "minimum": 0,
+          "title": "Duration Ms",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "call_id",
+        "tool",
+        "status",
+        "duration_ms"
+      ],
+      "title": "ToolResult",
+      "type": "object"
+    },
+    "CalendarCreateEventArguments": {
+      "additionalProperties": false,
+      "properties": {
+        "tool": {
+          "const": "calendar.create_event",
+          "default": "calendar.create_event",
+          "title": "Tool",
+          "type": "string"
+        },
+        "title": {
+          "minLength": 1,
+          "title": "Title",
+          "type": "string"
+        },
+        "span": {
+          "$ref": "#/$defs/MeetingSpan"
+        },
+        "attendees": {
+          "items": {
+            "$ref": "#/$defs/Participant"
+          },
+          "title": "Attendees",
+          "type": "array"
+        },
+        "description": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Description"
+        },
+        "location": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Location"
+        },
+        "send_updates": {
+          "$ref": "#/$defs/SendUpdates",
+          "default": "none"
+        }
+      },
+      "required": [
+        "title",
+        "span"
+      ],
+      "title": "CalendarCreateEventArguments",
+      "type": "object"
+    },
+    "CalendarRescheduleEventArguments": {
+      "additionalProperties": false,
+      "properties": {
+        "tool": {
+          "const": "calendar.reschedule_event",
+          "default": "calendar.reschedule_event",
+          "title": "Tool",
+          "type": "string"
+        },
+        "ref": {
+          "$ref": "#/$defs/MeetingRef"
+        },
+        "new_span": {
+          "$ref": "#/$defs/MeetingSpan"
+        },
+        "expected_etag": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Expected Etag"
+        },
+        "send_updates": {
+          "$ref": "#/$defs/SendUpdates",
+          "default": "all"
+        }
+      },
+      "required": [
+        "ref",
+        "new_span"
+      ],
+      "title": "CalendarRescheduleEventArguments",
+      "type": "object"
+    },
+    "CalendarUpdateAgendaArguments": {
+      "additionalProperties": false,
+      "description": "Adds/updates an EVA-delimited section within the event description,\npreserving all other text.",
+      "properties": {
+        "tool": {
+          "const": "calendar.update_agenda",
+          "default": "calendar.update_agenda",
+          "title": "Tool",
+          "type": "string"
+        },
+        "ref": {
+          "$ref": "#/$defs/MeetingRef"
+        },
+        "mode": {
+          "$ref": "#/$defs/AgendaSectionMode"
+        },
+        "agenda_markdown": {
+          "minLength": 1,
+          "title": "Agenda Markdown",
+          "type": "string"
+        },
+        "expected_etag": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Expected Etag"
+        },
+        "send_updates": {
+          "$ref": "#/$defs/SendUpdates",
+          "default": "none"
+        }
+      },
+      "required": [
+        "ref",
+        "mode",
+        "agenda_markdown"
+      ],
+      "title": "CalendarUpdateAgendaArguments",
+      "type": "object"
+    },
+    "DecisionRecordOutcomeArguments": {
+      "additionalProperties": false,
+      "description": "Local outcome proposal for the Decision Inbox. Registered as\nlocal_write; it never invokes an external financial API and sends no\nmessage.",
+      "properties": {
+        "tool": {
+          "const": "decision.record_outcome",
+          "default": "decision.record_outcome",
+          "title": "Tool",
+          "type": "string"
+        },
+        "decision_id": {
+          "minLength": 1,
+          "title": "Decision Id",
+          "type": "string"
+        },
+        "outcome": {
+          "$ref": "#/$defs/DecisionOutcome"
+        }
+      },
+      "required": [
+        "decision_id",
+        "outcome"
+      ],
+      "title": "DecisionRecordOutcomeArguments",
+      "type": "object"
+    },
+    "FocusStartArguments": {
+      "additionalProperties": false,
+      "properties": {
+        "tool": {
+          "const": "focus.start",
+          "default": "focus.start",
+          "title": "Tool",
+          "type": "string"
+        },
+        "duration_minutes": {
+          "maximum": 720,
+          "minimum": 1,
+          "title": "Duration Minutes",
+          "type": "integer"
+        },
+        "threshold": {
+          "$ref": "#/$defs/AttentionPriority"
+        },
+        "sender_overrides": {
+          "items": {
+            "format": "email",
+            "type": "string"
+          },
+          "title": "Sender Overrides",
+          "type": "array"
+        }
+      },
+      "required": [
+        "duration_minutes",
+        "threshold"
+      ],
+      "title": "FocusStartArguments",
+      "type": "object"
+    },
+    "FocusStopArguments": {
+      "additionalProperties": false,
+      "properties": {
+        "tool": {
+          "const": "focus.stop",
+          "default": "focus.stop",
+          "title": "Tool",
+          "type": "string"
+        }
+      },
+      "title": "FocusStopArguments",
+      "type": "object"
+    },
+    "ActiveContext": {
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "$ref": "#/$defs/ActiveContextMode"
+        },
+        "meeting": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MeetingRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "decision_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Decision Id"
+        },
+        "section": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Section"
+        }
+      },
+      "required": [
+        "mode"
+      ],
+      "title": "ActiveContext",
+      "type": "object"
+    },
+    "AssistantRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "request_id": {
+          "minLength": 1,
+          "title": "Request Id",
+          "type": "string"
+        },
+        "session_id": {
+          "minLength": 1,
+          "title": "Session Id",
+          "type": "string"
+        },
+        "text": {
+          "minLength": 1,
+          "title": "Text",
+          "type": "string"
+        },
+        "language": {
+          "$ref": "#/$defs/Language"
+        },
+        "active_context": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ActiveContext"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "request_id",
+        "session_id",
+        "text",
+        "language"
+      ],
+      "title": "AssistantRequest",
+      "type": "object"
+    },
+    "NormalizedSourceEvent": {
+      "additionalProperties": false,
+      "properties": {
+        "source": {
+          "$ref": "#/$defs/SourceSystem"
+        },
+        "source_id": {
+          "minLength": 1,
+          "title": "Source Id",
+          "type": "string"
+        },
+        "sender_email": {
+          "format": "email",
+          "title": "Sender Email",
+          "type": "string"
+        },
+        "subject": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Subject"
+        },
+        "body": {
+          "anyOf": [
+            {
+              "maxLength": 20000,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Body"
+        },
+        "received_at": {
+          "format": "date-time",
+          "title": "Received At",
+          "type": "string"
+        },
+        "sources": {
+          "items": {
+            "$ref": "#/$defs/SourceRef"
+          },
+          "title": "Sources",
+          "type": "array"
+        }
+      },
+      "required": [
+        "source",
+        "source_id",
+        "sender_email",
+        "received_at"
+      ],
+      "title": "NormalizedSourceEvent",
+      "type": "object"
+    },
+    "Transcript": {
+      "additionalProperties": false,
+      "properties": {
+        "text": {
+          "title": "Text",
+          "type": "string"
+        },
+        "language": {
+          "description": "BCP-47 tag",
+          "minLength": 2,
+          "title": "Language",
+          "type": "string"
+        },
+        "language_confidence": {
+          "anyOf": [
+            {
+              "maximum": 1.0,
+              "minimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Language Confidence"
+        },
+        "duration_ms": {
+          "minimum": 0,
+          "title": "Duration Ms",
+          "type": "integer"
+        },
+        "provider": {
+          "minLength": 1,
+          "title": "Provider",
+          "type": "string"
+        }
+      },
+      "required": [
+        "text",
+        "language",
+        "duration_ms",
+        "provider"
+      ],
+      "title": "Transcript",
+      "type": "object"
+    },
+    "VoiceStateChangedPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "voice_state_changed",
+          "default": "voice_state_changed",
+          "title": "Type",
+          "type": "string"
+        },
+        "voice_state": {
+          "$ref": "#/$defs/VoiceState"
+        }
+      },
+      "required": [
+        "voice_state"
+      ],
+      "title": "VoiceStateChangedPayload",
+      "type": "object"
+    },
+    "TranscriptReadyPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "transcript_ready",
+          "default": "transcript_ready",
+          "title": "Type",
+          "type": "string"
+        },
+        "request_id": {
+          "minLength": 1,
+          "title": "Request Id",
+          "type": "string"
+        },
+        "transcript": {
+          "$ref": "#/$defs/Transcript"
+        }
+      },
+      "required": [
+        "request_id",
+        "transcript"
+      ],
+      "title": "TranscriptReadyPayload",
+      "type": "object"
+    },
+    "BriefingReadyPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "briefing_ready",
+          "default": "briefing_ready",
+          "title": "Type",
+          "type": "string"
+        },
+        "briefing": {
+          "$ref": "#/$defs/ExecutiveBriefing"
+        }
+      },
+      "required": [
+        "briefing"
+      ],
+      "title": "BriefingReadyPayload",
+      "type": "object"
+    },
+    "AttentionItemCreatedPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "attention_item_created",
+          "default": "attention_item_created",
+          "title": "Type",
+          "type": "string"
+        },
+        "item": {
+          "$ref": "#/$defs/AttentionItem"
+        }
+      },
+      "required": [
+        "item"
+      ],
+      "title": "AttentionItemCreatedPayload",
+      "type": "object"
+    },
+    "DecisionCreatedPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "decision_created",
+          "default": "decision_created",
+          "title": "Type",
+          "type": "string"
+        },
+        "decision": {
+          "$ref": "#/$defs/Decision"
+        }
+      },
+      "required": [
+        "decision"
+      ],
+      "title": "DecisionCreatedPayload",
+      "type": "object"
+    },
+    "DecisionUpdatedPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "decision_updated",
+          "default": "decision_updated",
+          "title": "Type",
+          "type": "string"
+        },
+        "decision": {
+          "$ref": "#/$defs/Decision"
+        }
+      },
+      "required": [
+        "decision"
+      ],
+      "title": "DecisionUpdatedPayload",
+      "type": "object"
+    },
+    "FocusStartedPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "focus_started",
+          "default": "focus_started",
+          "title": "Type",
+          "type": "string"
+        },
+        "session": {
+          "$ref": "#/$defs/FocusSession"
+        }
+      },
+      "required": [
+        "session"
+      ],
+      "title": "FocusStartedPayload",
+      "type": "object"
+    },
+    "FocusEndedPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "focus_ended",
+          "default": "focus_ended",
+          "title": "Type",
+          "type": "string"
+        },
+        "session": {
+          "$ref": "#/$defs/FocusSession"
+        },
+        "summary": {
+          "$ref": "#/$defs/FocusCompletionSummary"
+        }
+      },
+      "required": [
+        "session",
+        "summary"
+      ],
+      "title": "FocusEndedPayload",
+      "type": "object"
+    },
+    "ActionProposedPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "action_proposed",
+          "default": "action_proposed",
+          "title": "Type",
+          "type": "string"
+        },
+        "action": {
+          "$ref": "#/$defs/ProposedAction"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "title": "ActionProposedPayload",
+      "type": "object"
+    },
+    "ActionStatusChangedPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "action_status_changed",
+          "default": "action_status_changed",
+          "title": "Type",
+          "type": "string"
+        },
+        "action_id": {
+          "minLength": 1,
+          "title": "Action Id",
+          "type": "string"
+        },
+        "revision": {
+          "minimum": 1,
+          "title": "Revision",
+          "type": "integer"
+        },
+        "status": {
+          "$ref": "#/$defs/ProposedActionStatus"
+        },
+        "action": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProposedAction"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "action_id",
+        "revision",
+        "status"
+      ],
+      "title": "ActionStatusChangedPayload",
+      "type": "object"
+    },
+    "InferenceUnavailablePayload": {
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "inference_unavailable",
+          "default": "inference_unavailable",
+          "title": "Type",
+          "type": "string"
+        },
+        "provider": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Provider"
+        },
+        "detail": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Detail"
+        }
+      },
+      "title": "InferenceUnavailablePayload",
+      "type": "object"
+    },
+    "HeartbeatPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "heartbeat",
+          "default": "heartbeat",
+          "title": "Type",
+          "type": "string"
+        },
+        "server_time": {
+          "format": "date-time",
+          "title": "Server Time",
+          "type": "string"
+        }
+      },
+      "required": [
+        "server_time"
+      ],
+      "title": "HeartbeatPayload",
+      "type": "object"
+    },
+    "EventEnvelope": {
+      "additionalProperties": false,
+      "description": "Persisted with monotonic per-session sequence; consumers deduplicate by\nevent_id and reject stale request ids.",
+      "properties": {
+        "schema_version": {
+          "const": 1,
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "event_id": {
+          "minLength": 1,
+          "title": "Event Id",
+          "type": "string"
+        },
+        "sequence": {
+          "minimum": 0,
+          "title": "Sequence",
+          "type": "integer"
+        },
+        "session_id": {
+          "minLength": 1,
+          "title": "Session Id",
+          "type": "string"
+        },
+        "request_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Request Id"
+        },
+        "occurred_at": {
+          "format": "date-time",
+          "title": "Occurred At",
+          "type": "string"
+        },
+        "type": {
+          "$ref": "#/$defs/EventType"
+        },
+        "payload": {
+          "$ref": "#/$defs/EventPayload"
+        }
+      },
+      "required": [
+        "event_id",
+        "sequence",
+        "session_id",
+        "occurred_at",
+        "type",
+        "payload"
+      ],
+      "title": "EventEnvelope",
+      "type": "object"
+    },
+    "ProviderHealth": {
+      "additionalProperties": false,
+      "description": "Component readiness with structured identity where known.\n\n``provider``/``model`` carry the actual configured provider and serving\nmodel id (never guessed). Secrets, API keys, tokens and base-URL\ncredentials must never appear here - only presence flags belong in\nsanitized responses elsewhere.",
+      "properties": {
+        "status": {
+          "$ref": "#/$defs/HealthStatus"
+        },
+        "detail": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Detail"
+        },
+        "provider": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Provider"
+        },
+        "model": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Model"
+        }
+      },
+      "required": [
+        "status"
+      ],
+      "title": "ProviderHealth",
+      "type": "object"
+    },
+    "HealthResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "$ref": "#/$defs/HealthStatus"
+        },
+        "server_time": {
+          "format": "date-time",
+          "title": "Server Time",
+          "type": "string"
+        },
+        "version": {
+          "minLength": 1,
+          "title": "Version",
+          "type": "string"
+        },
+        "components": {
+          "additionalProperties": {
+            "$ref": "#/$defs/ProviderHealth"
+          },
+          "title": "Components",
+          "type": "object"
+        }
+      },
+      "required": [
+        "status",
+        "server_time",
+        "version",
+        "components"
+      ],
+      "title": "HealthResponse",
+      "type": "object"
+    },
+    "IntegrationStatus": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        },
+        "connected": {
+          "title": "Connected",
+          "type": "boolean"
+        },
+        "detail": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Detail"
+        },
+        "granted_scopes": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Granted Scopes",
+          "type": "array"
+        }
+      },
+      "required": [
+        "name",
+        "connected"
+      ],
+      "title": "IntegrationStatus",
+      "type": "object"
+    },
+    "IntegrationsResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "integrations": {
+          "items": {
+            "$ref": "#/$defs/IntegrationStatus"
+          },
+          "title": "Integrations",
+          "type": "array"
+        }
+      },
+      "required": [
+        "integrations"
+      ],
+      "title": "IntegrationsResponse",
+      "type": "object"
+    },
+    "TodayCalendarResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "day": {
+          "format": "date",
+          "title": "Day",
+          "type": "string"
+        },
+        "timezone": {
+          "minLength": 1,
+          "title": "Timezone",
+          "type": "string"
+        },
+        "meetings": {
+          "items": {
+            "$ref": "#/$defs/Meeting"
+          },
+          "title": "Meetings",
+          "type": "array"
+        },
+        "retrieval_status": {
+          "$ref": "#/$defs/RetrievalStatus"
+        },
+        "retrieval_notes": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Retrieval Notes",
+          "type": "array"
+        }
+      },
+      "required": [
+        "day",
+        "timezone",
+        "meetings",
+        "retrieval_status"
+      ],
+      "title": "TodayCalendarResponse",
+      "type": "object"
+    },
+    "MeetingResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "meeting": {
+          "$ref": "#/$defs/Meeting"
+        }
+      },
+      "required": [
+        "meeting"
+      ],
+      "title": "MeetingResponse",
+      "type": "object"
+    },
+    "ProposedActionResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/ProposedAction"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "title": "ProposedActionResponse",
+      "type": "object"
+    },
+    "ActionConfirmResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/ProposedAction"
+        },
+        "receipt": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ApprovalReceipt"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "result": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ToolResult"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "title": "ActionConfirmResponse",
+      "type": "object"
+    },
+    "ActionResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/ProposedAction"
+        },
+        "last_result": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ToolResult"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "title": "ActionResponse",
+      "type": "object"
+    },
+    "TranscribeResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "request_id": {
+          "minLength": 1,
+          "title": "Request Id",
+          "type": "string"
+        },
+        "transcript": {
+          "$ref": "#/$defs/Transcript"
+        }
+      },
+      "required": [
+        "request_id",
+        "transcript"
+      ],
+      "title": "TranscribeResponse",
+      "type": "object"
+    },
+    "AssistantMessageResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "request_id": {
+          "minLength": 1,
+          "title": "Request Id",
+          "type": "string"
+        },
+        "session_id": {
+          "minLength": 1,
+          "title": "Session Id",
+          "type": "string"
+        },
+        "reply_text": {
+          "title": "Reply Text",
+          "type": "string"
+        },
+        "language": {
+          "$ref": "#/$defs/Language"
+        },
+        "active_context": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ActiveContext"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "proposed_action": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProposedAction"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "tool_results": {
+          "items": {
+            "$ref": "#/$defs/ToolResult"
+          },
+          "title": "Tool Results",
+          "type": "array"
+        }
+      },
+      "required": [
+        "request_id",
+        "session_id",
+        "reply_text",
+        "language"
+      ],
+      "title": "AssistantMessageResponse",
+      "type": "object"
+    },
+    "BriefingRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "meeting_ref": {
+          "$ref": "#/$defs/MeetingRef"
+        },
+        "language": {
+          "$ref": "#/$defs/Language"
+        }
+      },
+      "required": [
+        "meeting_ref",
+        "language"
+      ],
+      "title": "BriefingRequest",
+      "type": "object"
+    },
+    "BriefingResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "briefing": {
+          "$ref": "#/$defs/ExecutiveBriefing"
+        }
+      },
+      "required": [
+        "briefing"
+      ],
+      "title": "BriefingResponse",
+      "type": "object"
+    },
+    "AttentionListResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "items": {
+          "items": {
+            "$ref": "#/$defs/AttentionItem"
+          },
+          "title": "Items",
+          "type": "array"
+        }
+      },
+      "required": [
+        "items"
+      ],
+      "title": "AttentionListResponse",
+      "type": "object"
+    },
+    "AttentionExplanationResponse": {
+      "additionalProperties": false,
+      "description": "Reads stored rule codes/evidence/policy version. Never newly invented\nLLM justification.",
+      "properties": {
+        "item_id": {
+          "minLength": 1,
+          "title": "Item Id",
+          "type": "string"
+        },
+        "priority_reasons": {
+          "items": {
+            "$ref": "#/$defs/Reason"
+          },
+          "title": "Priority Reasons",
+          "type": "array"
+        },
+        "delivery_reasons": {
+          "items": {
+            "$ref": "#/$defs/Reason"
+          },
+          "title": "Delivery Reasons",
+          "type": "array"
+        },
+        "policy_version": {
+          "minLength": 1,
+          "title": "Policy Version",
+          "type": "string"
+        },
+        "sources": {
+          "items": {
+            "$ref": "#/$defs/SourceRef"
+          },
+          "title": "Sources",
+          "type": "array"
+        }
+      },
+      "required": [
+        "item_id",
+        "policy_version"
+      ],
+      "title": "AttentionExplanationResponse",
+      "type": "object"
+    },
+    "CheckNowResponse": {
+      "additionalProperties": false,
+      "description": "Invokes the same real ingestion path as polling.",
+      "properties": {
+        "checked_count": {
+          "minimum": 0,
+          "title": "Checked Count",
+          "type": "integer"
+        },
+        "duplicate_count": {
+          "minimum": 0,
+          "title": "Duplicate Count",
+          "type": "integer"
+        },
+        "new_items": {
+          "items": {
+            "$ref": "#/$defs/AttentionItem"
+          },
+          "title": "New Items",
+          "type": "array"
+        }
+      },
+      "required": [
+        "checked_count",
+        "duplicate_count"
+      ],
+      "title": "CheckNowResponse",
+      "type": "object"
+    },
+    "DecisionListResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "items": {
+          "items": {
+            "$ref": "#/$defs/Decision"
+          },
+          "title": "Items",
+          "type": "array"
+        }
+      },
+      "required": [
+        "items"
+      ],
+      "title": "DecisionListResponse",
+      "type": "object"
+    },
+    "DecisionResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "decision": {
+          "$ref": "#/$defs/Decision"
+        }
+      },
+      "required": [
+        "decision"
+      ],
+      "title": "DecisionResponse",
+      "type": "object"
+    },
+    "DecisionOutcomeProposalRequest": {
+      "additionalProperties": false,
+      "description": "User-initiated local outcome proposal. Executes no payment, purchase,\nsupplier or contract commitment; for HIGH risk it requires explicit UI\nconfirmation through the standard approval flow.",
+      "properties": {
+        "outcome": {
+          "$ref": "#/$defs/DecisionOutcome"
+        },
+        "session_id": {
+          "minLength": 1,
+          "title": "Session Id",
+          "type": "string"
+        },
+        "request_id": {
+          "minLength": 1,
+          "title": "Request Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "outcome",
+        "session_id",
+        "request_id"
+      ],
+      "title": "DecisionOutcomeProposalRequest",
+      "type": "object"
+    },
+    "DeferDecisionRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reason"
+        }
+      },
+      "title": "DeferDecisionRequest",
+      "type": "object"
+    },
+    "FocusStartRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "duration_minutes": {
+          "maximum": 720,
+          "minimum": 1,
+          "title": "Duration Minutes",
+          "type": "integer"
+        },
+        "threshold": {
+          "$ref": "#/$defs/AttentionPriority"
+        },
+        "sender_overrides": {
+          "items": {
+            "format": "email",
+            "type": "string"
+          },
+          "title": "Sender Overrides",
+          "type": "array"
+        }
+      },
+      "required": [
+        "duration_minutes",
+        "threshold"
+      ],
+      "title": "FocusStartRequest",
+      "type": "object"
+    },
+    "FocusStopRequest": {
+      "additionalProperties": false,
+      "properties": {},
+      "title": "FocusStopRequest",
+      "type": "object"
+    },
+    "FocusSessionResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "session": {
+          "$ref": "#/$defs/FocusSession"
+        }
+      },
+      "required": [
+        "session"
+      ],
+      "title": "FocusSessionResponse",
+      "type": "object"
+    },
+    "FocusStopResponse": {
+      "additionalProperties": false,
+      "description": "An explicit stop always returns the completion summary computed from\npersisted session items (same summary served after reconnect/restart via\nGET /api/focus/{id}/summary).",
+      "properties": {
+        "session": {
+          "$ref": "#/$defs/FocusSession"
+        },
+        "summary": {
+          "$ref": "#/$defs/FocusCompletionSummary"
+        }
+      },
+      "required": [
+        "session",
+        "summary"
+      ],
+      "title": "FocusStopResponse",
+      "type": "object"
+    },
+    "FocusCurrentResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "session": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FocusSession"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "title": "FocusCurrentResponse",
+      "type": "object"
+    },
+    "FocusSummaryResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "summary": {
+          "$ref": "#/$defs/FocusCompletionSummary"
+        }
+      },
+      "required": [
+        "summary"
+      ],
+      "title": "FocusSummaryResponse",
+      "type": "object"
+    },
+    "LlmSettingsResponse": {
+      "additionalProperties": false,
+      "description": "Sanitized settings view. Secret values are never serialized - only\npresence flags. Optional cloud permissions default to false and remain\nfalse while no cloud adapter exists.",
+      "properties": {
+        "provider": {
+          "minLength": 1,
+          "title": "Provider",
+          "type": "string"
+        },
+        "base_url": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Base Url"
+        },
+        "model": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Model"
+        },
+        "api_key_present": {
+          "default": false,
+          "title": "Api Key Present",
+          "type": "boolean"
+        },
+        "fallback_base_url": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Fallback Base Url"
+        },
+        "fallback_model": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Fallback Model"
+        },
+        "fallback_api_key_present": {
+          "default": false,
+          "title": "Fallback Api Key Present",
+          "type": "boolean"
+        },
+        "configured": {
+          "title": "Configured",
+          "type": "boolean"
+        },
+        "allow_cloud_inference": {
+          "default": false,
+          "title": "Allow Cloud Inference",
+          "type": "boolean"
+        },
+        "allow_workspace_cloud_inference": {
+          "default": false,
+          "title": "Allow Workspace Cloud Inference",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "provider",
+        "configured"
+      ],
+      "title": "LlmSettingsResponse",
+      "type": "object"
+    },
+    "LlmSettingsUpdateRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "base_url": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Base Url"
+        },
+        "model": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Model"
+        },
+        "api_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "write-only; never echoed",
+          "title": "Api Key"
+        },
+        "fallback_base_url": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Fallback Base Url"
+        },
+        "fallback_model": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Fallback Model"
+        },
+        "fallback_api_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "write-only; never echoed",
+          "title": "Fallback Api Key"
+        }
+      },
+      "title": "LlmSettingsUpdateRequest",
+      "type": "object"
+    },
+    "LlmTestConnectionResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "health": {
+          "$ref": "#/$defs/ProviderHealth"
+        },
+        "latency_ms": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Latency Ms"
+        },
+        "model": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Model"
+        }
+      },
+      "required": [
+        "health"
+      ],
+      "title": "LlmTestConnectionResponse",
+      "type": "object"
+    },
+    "LLMModelInfo": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "description": "actual id exposed by the running server",
+          "minLength": 1,
+          "title": "Id",
+          "type": "string"
+        },
+        "display_name": {
+          "minLength": 1,
+          "title": "Display Name",
+          "type": "string"
+        },
+        "supports_tools": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Supports Tools"
+        },
+        "supports_structured_output": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Supports Structured Output"
+        },
+        "context_window": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Context Window"
+        }
+      },
+      "required": [
+        "id",
+        "display_name"
+      ],
+      "title": "LLMModelInfo",
+      "type": "object"
+    },
+    "DetectModelsResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "models": {
+          "items": {
+            "$ref": "#/$defs/LLMModelInfo"
+          },
+          "title": "Models",
+          "type": "array"
+        }
+      },
+      "required": [
+        "models"
+      ],
+      "title": "DetectModelsResponse",
+      "type": "object"
+    },
+    "ChatRole": {
+      "enum": [
+        "system",
+        "user",
+        "assistant",
+        "tool"
+      ],
+      "title": "ChatRole",
+      "type": "string"
+    },
+    "ChatMessage": {
+      "additionalProperties": false,
+      "properties": {
+        "role": {
+          "$ref": "#/$defs/ChatRole"
+        },
+        "content": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Content"
+        },
+        "tool_calls": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/ToolCall"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Tool Calls"
+        },
+        "tool_call_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Tool Call Id"
+        }
+      },
+      "required": [
+        "role"
+      ],
+      "title": "ChatMessage",
+      "type": "object"
+    },
+    "LLMResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "provider": {
+          "minLength": 1,
+          "title": "Provider",
+          "type": "string"
+        },
+        "model": {
+          "description": "actual serving model id",
+          "minLength": 1,
+          "title": "Model",
+          "type": "string"
+        },
+        "text": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Text"
+        },
+        "tool_calls": {
+          "items": {
+            "$ref": "#/$defs/ToolCall"
+          },
+          "title": "Tool Calls",
+          "type": "array"
+        },
+        "structured": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Structured"
+        },
+        "finish_reason": {
+          "minLength": 1,
+          "title": "Finish Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "provider",
+        "model",
+        "finish_reason"
+      ],
+      "title": "LLMResponse",
+      "type": "object"
+    },
+    "SearchResult": {
+      "additionalProperties": false,
+      "properties": {
+        "title": {
+          "title": "Title",
+          "type": "string"
+        },
+        "url": {
+          "title": "Url",
+          "type": "string"
+        },
+        "snippet": {
+          "title": "Snippet",
+          "type": "string"
+        },
+        "retrieved_at": {
+          "format": "date-time",
+          "title": "Retrieved At",
+          "type": "string"
+        }
+      },
+      "required": [
+        "title",
+        "url",
+        "snippet",
+        "retrieved_at"
+      ],
+      "title": "SearchResult",
+      "type": "object"
+    },
+    "AudioInput": {
+      "additionalProperties": false,
+      "description": "Backend-only: normalized 16 kHz mono PCM WAV bytes.",
+      "properties": {
+        "wav_bytes": {
+          "format": "binary",
+          "title": "Wav Bytes",
+          "type": "string"
+        },
+        "sample_rate_hz": {
+          "const": 16000,
+          "default": 16000,
+          "title": "Sample Rate Hz",
+          "type": "integer"
+        },
+        "channels": {
+          "const": 1,
+          "default": 1,
+          "title": "Channels",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "wav_bytes"
+      ],
+      "title": "AudioInput",
+      "type": "object"
+    },
+    "MeetingSpan": {
+      "allOf": [
+        {
+          "discriminator": {
+            "mapping": {
+              "all_day": "#/$defs/AllDaySpan",
+              "timed": "#/$defs/TimedSpan"
+            },
+            "propertyName": "kind"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/$defs/TimedSpan"
+            },
+            {
+              "$ref": "#/$defs/AllDaySpan"
+            }
+          ]
+        },
+        {
+          "required": [
+            "kind"
+          ]
+        }
+      ]
+    },
+    "CalendarProposalArguments": {
+      "allOf": [
+        {
+          "discriminator": {
+            "mapping": {
+              "calendar.create_event": "#/$defs/CalendarCreateEventArguments",
+              "calendar.reschedule_event": "#/$defs/CalendarRescheduleEventArguments",
+              "calendar.update_agenda": "#/$defs/CalendarUpdateAgendaArguments"
+            },
+            "propertyName": "tool"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/$defs/CalendarCreateEventArguments"
+            },
+            {
+              "$ref": "#/$defs/CalendarRescheduleEventArguments"
+            },
+            {
+              "$ref": "#/$defs/CalendarUpdateAgendaArguments"
+            }
+          ]
+        },
+        {
+          "required": [
+            "tool"
+          ]
+        }
+      ]
+    },
+    "EventPayload": {
+      "allOf": [
+        {
+          "discriminator": {
+            "mapping": {
+              "action_proposed": "#/$defs/ActionProposedPayload",
+              "action_status_changed": "#/$defs/ActionStatusChangedPayload",
+              "attention_item_created": "#/$defs/AttentionItemCreatedPayload",
+              "briefing_ready": "#/$defs/BriefingReadyPayload",
+              "decision_created": "#/$defs/DecisionCreatedPayload",
+              "decision_updated": "#/$defs/DecisionUpdatedPayload",
+              "focus_ended": "#/$defs/FocusEndedPayload",
+              "focus_started": "#/$defs/FocusStartedPayload",
+              "heartbeat": "#/$defs/HeartbeatPayload",
+              "inference_unavailable": "#/$defs/InferenceUnavailablePayload",
+              "transcript_ready": "#/$defs/TranscriptReadyPayload",
+              "voice_state_changed": "#/$defs/VoiceStateChangedPayload"
+            },
+            "propertyName": "type"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/$defs/VoiceStateChangedPayload"
+            },
+            {
+              "$ref": "#/$defs/TranscriptReadyPayload"
+            },
+            {
+              "$ref": "#/$defs/BriefingReadyPayload"
+            },
+            {
+              "$ref": "#/$defs/AttentionItemCreatedPayload"
+            },
+            {
+              "$ref": "#/$defs/DecisionCreatedPayload"
+            },
+            {
+              "$ref": "#/$defs/DecisionUpdatedPayload"
+            },
+            {
+              "$ref": "#/$defs/FocusStartedPayload"
+            },
+            {
+              "$ref": "#/$defs/FocusEndedPayload"
+            },
+            {
+              "$ref": "#/$defs/ActionProposedPayload"
+            },
+            {
+              "$ref": "#/$defs/ActionStatusChangedPayload"
+            },
+            {
+              "$ref": "#/$defs/InferenceUnavailablePayload"
+            },
+            {
+              "$ref": "#/$defs/HeartbeatPayload"
+            }
+          ]
+        },
+        {
+          "required": [
+            "type"
+          ]
+        }
+      ]
+    },
+    "CalendarProposalRequest": {
+      "$ref": "#/$defs/CalendarProposalArguments"
+    }
+  }
+}
