@@ -216,3 +216,32 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# EVA: local uv cache used by the sandboxed backend toolchain
+.uv-cache/
+.npm-cache-tmp/
+pytest-cache-files-*/
+*.tsbuildinfo
+
+# EVA: secrets, databases and demo data must never enter Git
+# (per docs/EVA_DEVELOPMENT_WORKFLOW.md section 4)
+.env.*
+!.env.example
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+credentials*.json
+client_secret*.json
+token*.json
+secrets/
+private-data/
+recordings/
+models/
+node_modules/
+dist/
+.next/
+playwright-report/
+test-results/

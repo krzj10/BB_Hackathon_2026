@@ -1,0 +1,29 @@
+{
+  "id": "act-demo-agenda-acme-001",
+  "session_id": "sess-demo-001",
+  "request_id": "req-demo-001",
+  "revision": 1,
+  "tool": "calendar.update_agenda",
+  "arguments": {
+    "tool": "calendar.update_agenda",
+    "ref": { "calendar_id": "primary", "event_id": "evt-demo-acme-contract-review-001" },
+    "mode": "add",
+    "agenda_markdown": "## EVA Agenda\n- Potwierdzyc termin migracji\n- Domagac sie pisemnego harmonogramu",
+    "expected_etag": "demo-etag-acme-001",
+    "send_updates": "none"
+  },
+  "arguments_digest": "sha256:demo-digest-agenda-0001",
+  "summary": "Dodac sekcje agendy EVA do spotkania ACME Contract Review.",
+  "reason": "Uzytkownik prosil o przygotowanie agendy do rozmowy kontraktowej.",
+  "impact": "Zmiana opisu wydarzenia; bez powiadomien uczestnikow (send_updates=none).",
+  "before": { "agenda": null },
+  "after": { "agenda": "## EVA Agenda\n- Potwierdzyc termin migracji\n- Domagac sie pisemnego harmonogramu" },
+  "resource_version": "demo-etag-acme-001",
+  "policy_version": "policy-v1",
+  "risk": "high",
+  "requires_approval": true,
+  "voice_approval_allowed": false,
+  "created_at": "2026-09-21T12:00:00+02:00",
+  "expires_at": "2026-09-21T12:05:00+02:00",
+  "status": "pending"
+}

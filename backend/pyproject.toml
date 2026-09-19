@@ -1,0 +1,33 @@
+[project]
+name = "eva-backend"
+version = "0.1.0"
+description = "EVA Core Platform backend (Stream A): canonical contracts, FastAPI skeleton, persistence and guarded execution."
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "pydantic>=2.8",
+    "pydantic-settings>=2.4",
+    "email-validator>=2.2",
+    "uvicorn[standard]>=0.30",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2",
+    "httpx>=0.27",
+    "jsonschema>=4.23",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-m 'not network'"
+markers = [
+    "network: opt-in tests that contact real external services; run manually by HUMAN with isolated credentials",
+]

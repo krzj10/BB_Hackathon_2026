@@ -1,0 +1,12 @@
+{
+  "request_id": "req-demo-001",
+  "session_id": "sess-demo-001",
+  "text": "Przygotuj briefing do spotkania z ACME.",
+  "language": "pl",
+  "active_context": {
+    "mode": "meeting",
+    "meeting": { "calendar_id": "primary", "event_id": "evt-demo-acme-contract-review-001" },
+    "decision_id": null,
+    "section": null
+  }
+}

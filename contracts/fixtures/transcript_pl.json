@@ -1,0 +1,7 @@
+{
+  "text": "Przygotuj briefing do spotkania z ACME",
+  "language": "pl",
+  "language_confidence": 0.97,
+  "duration_ms": 2640,
+  "provider": "faster-whisper"
+}
