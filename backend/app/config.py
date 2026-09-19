@@ -19,16 +19,86 @@ Startup policy (A00 decision, documented in docs/api-contracts.md):
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Annotated, Any
+from urllib.parse import urlsplit
 
 from pydantic import Field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
-def _parse_origins(value: Any) -> Any:
+class UnsafeEndpointConfigurationError(RuntimeError):
+    """Credential-bearing or structurally invalid endpoint/origin configuration.
+
+    Deliberately NOT a ValueError: it propagates from validators without being
+    wrapped into a pydantic ValidationError, so the error text stays exactly
+    the fixed generic message below and can never echo a credential-bearing
+    input value."""
+
+
+_CREDENTIAL_REJECT = (
+    "invalid self-hosted endpoint configuration: URL userinfo/credentials are not allowed"
+)
+_ORIGIN_REJECT = (
+    "invalid self-hosted origin: absolute http(s) scheme+host[:port] required, "
+    "without path, query or fragment"
+)
+_ENDPOINT_REJECT = "invalid self-hosted endpoint URL: safe http(s) URL with host required"
+
+
+def _split_origins(value: Any) -> Any:
     if isinstance(value, str):
         return [item.strip().rstrip("/") for item in value.split(",") if item.strip()]
     return value
+
+
+def _validated_origin(raw: str) -> str:
+    """Structurally validate one allowlist entry and return the normalized
+    origin. Credential-bearing entries are rejected outright (never sanitized
+    and kept); error text never echoes the input value."""
+    try:
+        parts = urlsplit(raw)
+    except ValueError:
+        raise UnsafeEndpointConfigurationError(_ORIGIN_REJECT) from None
+    if parts.username is not None or parts.password is not None:
+        raise UnsafeEndpointConfigurationError(_CREDENTIAL_REJECT)
+    _require_valid_port(parts)
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise UnsafeEndpointConfigurationError(_ORIGIN_REJECT)
+    if parts.path not in ("", "/") or parts.query or parts.fragment:
+        raise UnsafeEndpointConfigurationError(_ORIGIN_REJECT)
+    # netloc is safe here: userinfo was rejected above.
+    return f"{parts.scheme}://{parts.netloc}"
+
+
+def _validated_endpoint(raw: str) -> str:
+    """Validate an endpoint base URL (a path such as /v1 IS allowed). Blank is
+    allowed (reported unconfigured); anything unsafe is rejected without
+    echoing the value."""
+    if not raw.strip():
+        return raw
+    try:
+        parts = urlsplit(raw.strip())
+    except ValueError:
+        raise UnsafeEndpointConfigurationError(_ENDPOINT_REJECT) from None
+    if parts.username is not None or parts.password is not None:
+        raise UnsafeEndpointConfigurationError(_CREDENTIAL_REJECT)
+    _require_valid_port(parts)
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise UnsafeEndpointConfigurationError(_ENDPOINT_REJECT)
+    if parts.query or parts.fragment:
+        raise UnsafeEndpointConfigurationError(_ENDPOINT_REJECT)
+    return raw.strip()
+
+
+def _require_valid_port(parts: Any) -> None:
+    """Reject malformed/out-of-range ports (urlsplit keeps them but .port
+    raises ValueError). Fixed generic error; the URL is never echoed."""
+    try:
+        parts.port  # noqa: B018 - access validates
+    except ValueError:
+        raise UnsafeEndpointConfigurationError(
+            "invalid self-hosted endpoint configuration: malformed or out-of-range port"
+        ) from None
 
 
 class Settings(BaseSettings):
@@ -52,7 +122,10 @@ class Settings(BaseSettings):
     eva_llm_fallback_base_url: str = ""
     eva_llm_fallback_model: str = ""
     eva_llm_fallback_api_key: str = Field(default="", repr=False)
-    eva_llm_allowed_origins: list[str] = Field(default_factory=list)
+    #: NoDecode keeps the raw environment/.env string out of pydantic-settings'
+    #: JSON pre-decoding for complex fields, so the documented comma-separated
+    #: format reaches _split_origins verbatim ("" -> [], "a,b" -> [a, b]).
+    eva_llm_allowed_origins: Annotated[list[str], NoDecode] = Field(default_factory=list)
 
     # --- optional cloud extension (disabled by default) --------------------
     eva_allow_cloud_inference: bool = False
@@ -74,37 +147,39 @@ class Settings(BaseSettings):
     #: written 0600 best-effort and never read into API responses or logs.
     google_credentials_path: str = "secrets/google_credentials.json"
 
+    @field_validator("eva_llm_base_url", "eva_llm_fallback_base_url")
+    @classmethod
+    def _validate_endpoints(cls, value: str) -> str:
+        return _validated_endpoint(value)
+
     @field_validator("eva_llm_allowed_origins", mode="before")
     @classmethod
     def _split_origins(cls, value: Any) -> Any:
-        return _parse_origins(value)
+        return _split_origins(value)
 
     @field_validator("eva_llm_allowed_origins")
     @classmethod
     def _validate_origins(cls, value: list[str]) -> list[str]:
-        for origin in value:
-            if not origin.startswith(("http://", "https://")):
-                raise ValueError(
-                    f"invalid self-hosted origin {origin!r}: absolute http(s) origin required"
-                )
-            if "/" in origin[len("https://") :]:
-                raise ValueError(
-                    f"invalid self-hosted origin {origin!r}: must be scheme+host[:port] only"
-                )
-        return value
+        # Structural validation + normalization; rejects credentials, paths,
+        # queries, fragments and non-http(s) with fixed generic messages.
+        return [_validated_origin(origin) for origin in value]
 
     # ------------------------------------------------------------------ #
 
     @staticmethod
     def _endpoint_origin(url: str) -> str | None:
-        """scheme+host[:port] of a URL, normalized (trailing slash removed)."""
-        from urllib.parse import urlsplit
+        """scheme+host[:port] of a URL, normalized (trailing slash removed).
 
+        Returns None for anything unsafe - including URLs carrying userinfo -
+        so extracted origins can never contain credentials, and callers that
+        embed this value in diagnostics stay secret-free."""
         try:
             parts = urlsplit(url.strip())
         except ValueError:
             return None
-        if parts.scheme not in ("http", "https") or not parts.netloc:
+        if parts.username is not None or parts.password is not None:
+            return None
+        if parts.scheme not in ("http", "https") or not parts.hostname:
             return None
         return f"{parts.scheme}://{parts.netloc}"
 
@@ -132,7 +207,9 @@ class Settings(BaseSettings):
         elif self.eva_llm_base_url.strip():
             origin = self._endpoint_origin(self.eva_llm_base_url)
             if origin is None:
-                blockers.append("EVA_LLM_BASE_URL is not a valid http(s) URL")
+                blockers.append(
+                    "EVA_LLM_BASE_URL is not a valid safe http(s) URL"
+                )  # never echoes the value (it may carry credentials)
             elif origin not in self.eva_llm_allowed_origins:
                 blockers.append(
                     f"EVA_LLM_BASE_URL origin {origin} is not in EVA_LLM_ALLOWED_ORIGINS"

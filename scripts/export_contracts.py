@@ -124,6 +124,7 @@ API_MODELS: list[Any] = [
     api.TodayCalendarResponse,
     api.MeetingResponse,
     api.ProposedActionResponse,
+    api.ApprovalChallengeResponse,
     api.ActionConfirmResponse,
     api.ActionResponse,
     api.TranscribeResponse,

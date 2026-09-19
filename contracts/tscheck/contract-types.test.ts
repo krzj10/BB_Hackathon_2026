@@ -9,6 +9,7 @@
  * Run: npm --prefix contracts/tscheck run typecheck
  */
 import type {
+  ApprovalChallengeResponse,
   AttentionItemCreatedPayload,
   CalendarProposalRequest,
   EventEnvelope,
@@ -109,6 +110,36 @@ const missingInnerTypeCandidate = {
 
 // @ts-expect-error EventEnvelope payload discriminator is mandatory at the EventPayload boundary
 export const missingInnerPayloadType: EventEnvelope = missingInnerTypeCandidate;
+
+// ---------------------------------------------------------------------------
+// ApprovalChallengeResponse (A03 challenge transport contract)
+// ---------------------------------------------------------------------------
+
+export const issuedChallenge: ApprovalChallengeResponse = {
+  action_id: "act-demo-agenda-acme-001",
+  revision: 1,
+  arguments_digest: "sha256:demo-digest-agenda-0001",
+  challenge: "synthetic-challenge-token-not-a-secret",
+  expires_at: "2026-09-21T12:05:00+02:00",
+};
+
+// @ts-expect-error challenge is mandatory on ApprovalChallengeResponse
+export const missingChallenge: ApprovalChallengeResponse = {
+  action_id: "act-demo-agenda-acme-001",
+  revision: 1,
+  arguments_digest: "sha256:demo-digest-agenda-0001",
+  expires_at: "2026-09-21T12:05:00+02:00",
+};
+
+export const withChannel: ApprovalChallengeResponse = {
+  action_id: "act-demo-agenda-acme-001",
+  revision: 1,
+  arguments_digest: "sha256:demo-digest-agenda-0001",
+  challenge: "synthetic-challenge-token-not-a-secret",
+  expires_at: "2026-09-21T12:05:00+02:00",
+  // @ts-expect-error channel is server-derived at confirmation; not part of the contract
+  channel: "ui",
+};
 
 // ---------------------------------------------------------------------------
 // Narrowing (correlated envelope must narrow payload by outer type)

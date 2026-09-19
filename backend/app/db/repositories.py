@@ -193,6 +193,101 @@ class ActionRepository:
             )
             return cur.rowcount == 1
 
+    def approve_with_receipt(
+        self,
+        receipt: domain.ApprovalReceipt,
+        *,
+        expected_revision: int,
+        expected_arguments_digest: str,
+        expected_policy_version: str,
+        now: datetime,
+    ) -> bool:
+        """Atomically approve a still-valid pending proposal AND persist its
+        approval receipt in one SQLite transaction.
+
+        This is the A03 authorization boundary: a crash can never leave an
+        APPROVED action without its durable receipt (the unsafe two-step
+        record_approval + record_receipt sequence is not used for approvals).
+        The conditional UPDATE decides success by affected-row count - never a
+        prior SELECT - so concurrent confirmations have exactly one winner;
+        the loser sees zero rows and writes no receipt. All binding checks
+        (status, revision, arguments digest, policy version, expiry) are part
+        of the same atomic predicate. No network work may ever occur inside.
+
+        Returns True when this call performed the transition (receipt stored);
+        False when any binding failed or another confirmation already won."""
+        if (
+            receipt.revision != expected_revision
+            or receipt.arguments_digest != expected_arguments_digest
+            or receipt.policy_version != expected_policy_version
+        ):
+            raise ValueError(
+                "receipt must be bound to the revision, digest and policy version it approves"
+            )
+        with self._db.transaction() as conn:
+            cur = conn.execute(
+                """
+                UPDATE proposed_actions
+                   SET status = ?
+                 WHERE id = ? AND status = ?
+                   AND revision = ? AND arguments_digest = ?
+                   AND policy_version = ? AND expires_at > ?
+                """,
+                (
+                    domain.ProposedActionStatus.APPROVED.value,
+                    receipt.action_id,
+                    domain.ProposedActionStatus.PENDING.value,
+                    expected_revision,
+                    expected_arguments_digest,
+                    expected_policy_version,
+                    to_db(now),
+                ),
+            )
+            if cur.rowcount != 1:
+                return False  # nothing approved -> no receipt (single atomic unit)
+            conn.execute(
+                """
+                INSERT INTO approval_receipts (
+                    id, action_id, revision, arguments_digest, channel,
+                    approved_at, policy_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    receipt.id,
+                    receipt.action_id,
+                    receipt.revision,
+                    receipt.arguments_digest,
+                    receipt.channel.value,
+                    to_db(receipt.approved_at),
+                    receipt.policy_version,
+                ),
+            )
+            return True
+
+    def reject_action(
+        self, action_id: str, *, expected_revision: int, expected_arguments_digest: str
+    ) -> bool:
+        """Atomically reject a pending proposal (PENDING -> REJECTED), bound to
+        the exact revision and arguments digest being decided on. A rejected
+        action can never later be approved (the approval predicate requires
+        PENDING). Deliberately not expiry-gated: rejecting an expired-but-
+        still-pending proposal is always safe and must stay possible."""
+        with self._db.transaction() as conn:
+            cur = conn.execute(
+                """
+                UPDATE proposed_actions SET status = ?
+                 WHERE id = ? AND status = ? AND revision = ? AND arguments_digest = ?
+                """,
+                (
+                    domain.ProposedActionStatus.REJECTED.value,
+                    action_id,
+                    domain.ProposedActionStatus.PENDING.value,
+                    expected_revision,
+                    expected_arguments_digest,
+                ),
+            )
+            return cur.rowcount == 1
+
     def claim_action(
         self,
         action_id: str,
