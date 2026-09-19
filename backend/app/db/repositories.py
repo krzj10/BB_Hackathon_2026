@@ -478,6 +478,306 @@ class ActionRepository:
             for row in rows
         ]
 
+    # ------------------------------------------------------------------ #
+    # A04 guarded execution boundary (consumer-specific operations only).
+    # Every method is a short transaction: NO network work may ever occur
+    # inside them - the executor performs provider calls strictly between
+    # claim and finalize. There is still no generic set_status().
+    # ------------------------------------------------------------------ #
+
+    # -- client-generated Google event ids --------------------------------
+
+    def get_or_reserve_google_event_id(
+        self, action_id: str, revision: int, candidate: str, *, now: datetime
+    ) -> str:
+        """Durably reserve a client-generated Google event id for one action
+        revision BEFORE the first create request. The first reservation wins
+        forever (retries and reopens receive the stored id unchanged); this is
+        the reconciliation anchor for lost create responses."""
+        with self._db.transaction() as conn:
+            conn.execute(
+                "INSERT INTO google_event_ids (action_id, revision, google_event_id, created_at)"
+                " VALUES (?, ?, ?, ?)"
+                " ON CONFLICT(action_id, revision) DO NOTHING",
+                (action_id, revision, candidate, to_db(now)),
+            )
+            row = conn.execute(
+                "SELECT google_event_id FROM google_event_ids"
+                " WHERE action_id = ? AND revision = ?",
+                (action_id, revision),
+            ).fetchone()
+        return str(row["google_event_id"])
+
+    def get_google_event_id(self, action_id: str, revision: int) -> str | None:
+        with self._db.connect() as conn:
+            row = conn.execute(
+                "SELECT google_event_id FROM google_event_ids"
+                " WHERE action_id = ? AND revision = ?",
+                (action_id, revision),
+            ).fetchone()
+        return str(row["google_event_id"]) if row else None
+
+    # -- atomic execution claims -------------------------------------------
+
+    def claim_approved_execution(
+        self,
+        action_id: str,
+        *,
+        expected_revision: int,
+        expected_arguments_digest: str,
+        expected_policy_version: str,
+        allowed_channels: tuple[str, ...],
+        started_at: datetime,
+    ) -> int | None:
+        """Atomic authorized execution claim for actions that required
+        approval. ONE transaction verifies and transitions everything:
+
+        - a durable ApprovalReceipt exists for (action, revision) and matches
+          the action's revision, arguments digest and policy version;
+        - the receipt channel is permitted for this action's risk
+          (HIGH: only 'ui' may ever be passed in allowed_channels);
+        - the action is APPROVED, unexpired and bound to exactly the expected
+          revision/digest/policy tuple.
+
+        On success the action moves APPROVED -> EXECUTING and a durable active
+        attempt row is inserted; the returned attempt id anchors finalization.
+        Success is decided by the conditional UPDATE's row count - never a
+        prior SELECT - so concurrent claims have exactly one winner (the loser
+        gets None and performs no provider call). No receipt, or an
+        inconsistent one, can NEVER authorize execution."""
+        if not allowed_channels:
+            raise ValueError("allowed_channels must not be empty")
+        with self._db.transaction() as conn:
+            receipt = conn.execute(
+                "SELECT revision, arguments_digest, policy_version, channel"
+                " FROM approval_receipts WHERE action_id = ? AND revision = ?",
+                (action_id, expected_revision),
+            ).fetchone()
+            if (
+                receipt is None
+                or receipt["arguments_digest"] != expected_arguments_digest
+                or receipt["policy_version"] != expected_policy_version
+                or receipt["channel"] not in allowed_channels
+            ):
+                return None
+            cur = conn.execute(
+                """
+                UPDATE proposed_actions SET status = ?
+                 WHERE id = ? AND status = ?
+                   AND revision = ? AND arguments_digest = ?
+                   AND policy_version = ? AND expires_at > ?
+                """,
+                (
+                    domain.ProposedActionStatus.EXECUTING.value,
+                    action_id,
+                    domain.ProposedActionStatus.APPROVED.value,
+                    expected_revision,
+                    expected_arguments_digest,
+                    expected_policy_version,
+                    to_db(started_at),
+                ),
+            )
+            if cur.rowcount != 1:
+                return None
+            attempt = conn.execute(
+                "INSERT INTO execution_attempts (action_id, revision, started_at)"
+                " VALUES (?, ?, ?)",
+                (action_id, expected_revision, to_db(started_at)),
+            )
+            return int(attempt.lastrowid)
+
+    def claim_no_approval_execution(
+        self,
+        action_id: str,
+        *,
+        expected_revision: int,
+        expected_arguments_digest: str,
+        expected_policy_version: str,
+        started_at: datetime,
+    ) -> int | None:
+        """Atomic claim for requires_approval=false actions (the A03
+        carry-forward requirement). PENDING -> EXECUTING in one transaction
+        with the full binding predicate (revision, digest, current policy
+        version, not expired) plus the active-attempt insert. No receipt is
+        created and none may be fabricated; exactly one concurrent caller
+        wins by rowcount."""
+        with self._db.transaction() as conn:
+            cur = conn.execute(
+                """
+                UPDATE proposed_actions SET status = ?
+                 WHERE id = ? AND status = ? AND requires_approval = 0
+                   AND revision = ? AND arguments_digest = ?
+                   AND policy_version = ? AND expires_at > ?
+                """,
+                (
+                    domain.ProposedActionStatus.EXECUTING.value,
+                    action_id,
+                    domain.ProposedActionStatus.PENDING.value,
+                    expected_revision,
+                    expected_arguments_digest,
+                    expected_policy_version,
+                    to_db(started_at),
+                ),
+            )
+            if cur.rowcount != 1:
+                return None
+            attempt = conn.execute(
+                "INSERT INTO execution_attempts (action_id, revision, started_at)"
+                " VALUES (?, ?, ?)",
+                (action_id, expected_revision, to_db(started_at)),
+            )
+            return int(attempt.lastrowid)
+
+    # -- finalization ---------------------------------------------------------
+
+    def finish_action_execution(
+        self,
+        action_id: str,
+        *,
+        new_status: domain.ProposedActionStatus,
+        result: domain.ToolResult | None,
+        attempt_id: int,
+        outcome: str,
+        finished_at: datetime,
+        detail: str | None = None,
+    ) -> bool:
+        """Close an executing action with its canonical final outcome, persist
+        the durable ToolResult and close the attempt - ONE transaction. Not
+        expiry-gated (expiry bounds starting executions, never recording ones
+        that began). UNKNOWN is honest terminal-for-automatic state; A07 owns
+        later reconciliation."""
+        if new_status not in _FINAL_OUTCOMES:
+            raise ValueError("finish_action_execution accepts only SUCCEEDED, FAILED or UNKNOWN")
+        if outcome not in _ATTEMPT_OUTCOMES:
+            raise ValueError(f"outcome must be one of {sorted(_ATTEMPT_OUTCOMES)}")
+        with self._db.transaction() as conn:
+            cur = conn.execute(
+                "UPDATE proposed_actions SET status = ?"
+                " WHERE id = ? AND status = ?",
+                (new_status.value, action_id, domain.ProposedActionStatus.EXECUTING.value),
+            )
+            ok = cur.rowcount == 1
+            if result is not None:
+                conn.execute(
+                    "INSERT INTO action_execution_results (action_id, status, result_json, updated_at)"
+                    " VALUES (?, ?, ?, ?)"
+                    " ON CONFLICT(action_id) DO UPDATE SET status = excluded.status,"
+                    " result_json = excluded.result_json, updated_at = excluded.updated_at",
+                    (action_id, new_status.value, result.model_dump_json(), to_db(finished_at)),
+                )
+            closed = conn.execute(
+                "UPDATE execution_attempts SET outcome = ?, finished_at = ?, detail = ?"
+                " WHERE id = ? AND finished_at IS NULL",
+                (outcome, to_db(finished_at), detail, attempt_id),
+            )
+            if not ok or closed.rowcount != 1:
+                # Inconsistent executor state: never persist half results.
+                raise ValueError(
+                    f"finish_action_execution found no executing action/active attempt for {action_id!r}"
+                )
+            return True
+
+    def supersede_executing_action(
+        self,
+        action_id: str,
+        *,
+        result: domain.ToolResult | None,
+        attempt_id: int,
+        finished_at: datetime,
+        detail: str,
+    ) -> bool:
+        """EXECUTING -> SUPERSEDED for execution-time staleness (412 precondition
+        failure, resource/policy change discovered during revalidation). The
+        attempt closes as failed with a stable sanitized code and the honest
+        ToolResult is persisted; a fresh proposal is required afterwards."""
+        with self._db.transaction() as conn:
+            cur = conn.execute(
+                "UPDATE proposed_actions SET status = ?"
+                " WHERE id = ? AND status = ?",
+                (
+                    domain.ProposedActionStatus.SUPERSEDED.value,
+                    action_id,
+                    domain.ProposedActionStatus.EXECUTING.value,
+                ),
+            )
+            ok = cur.rowcount == 1
+            if result is not None:
+                conn.execute(
+                    "INSERT INTO action_execution_results (action_id, status, result_json, updated_at)"
+                    " VALUES (?, ?, ?, ?)"
+                    " ON CONFLICT(action_id) DO UPDATE SET status = excluded.status,"
+                    " result_json = excluded.result_json, updated_at = excluded.updated_at",
+                    (
+                        action_id,
+                        domain.ProposedActionStatus.SUPERSEDED.value,
+                        result.model_dump_json(),
+                        to_db(finished_at),
+                    ),
+                )
+            closed = conn.execute(
+                "UPDATE execution_attempts SET outcome = ?, finished_at = ?, detail = ?"
+                " WHERE id = ? AND finished_at IS NULL",
+                ("failed", to_db(finished_at), detail, attempt_id),
+            )
+            if not ok or closed.rowcount != 1:
+                raise ValueError(
+                    f"supersede_executing_action found no executing action/active attempt for {action_id!r}"
+                )
+            return True
+
+    def supersede_unstarted_action(self, action_id: str) -> bool:
+        """PENDING/APPROVED -> SUPERSEDED when authorization went stale before
+        any execution started (policy changed, resource version drifted)."""
+        with self._db.transaction() as conn:
+            cur = conn.execute(
+                "UPDATE proposed_actions SET status = ?"
+                " WHERE id = ? AND status IN (?, ?)",
+                (
+                    domain.ProposedActionStatus.SUPERSEDED.value,
+                    action_id,
+                    domain.ProposedActionStatus.PENDING.value,
+                    domain.ProposedActionStatus.APPROVED.value,
+                ),
+            )
+            return cur.rowcount == 1
+
+    # -- durable last result ------------------------------------------------------
+
+    def get_last_result(self, action_id: str) -> domain.ToolResult | None:
+        with self._db.connect() as conn:
+            row = conn.execute(
+                "SELECT result_json FROM action_execution_results WHERE action_id = ?",
+                (action_id,),
+            ).fetchone()
+        return domain.ToolResult.model_validate_json(row["result_json"]) if row else None
+
+    # -- proposal idempotency ---------------------------------------------------------
+
+    def get_idempotent_proposal(self, session_id: str, request_id: str) -> tuple[str, str] | None:
+        """Return (arguments_digest, action_id) of the proposal already created
+        for this (session, request), if any."""
+        with self._db.connect() as conn:
+            row = conn.execute(
+                "SELECT arguments_digest, action_id FROM proposal_idempotency"
+                " WHERE session_id = ? AND request_id = ?",
+                (session_id, request_id),
+            ).fetchone()
+        return (row["arguments_digest"], row["action_id"]) if row else None
+
+    def record_idempotent_proposal(
+        self, session_id: str, request_id: str, arguments_digest: str, action_id: str
+    ) -> bool:
+        """Claim the idempotency slot; False when another proposal already
+        holds (session, request) - the caller then compares digests."""
+        with self._db.transaction() as conn:
+            cur = conn.execute(
+                "INSERT INTO proposal_idempotency (session_id, request_id, arguments_digest, action_id)"
+                " VALUES (?, ?, ?, ?)"
+                " ON CONFLICT(session_id, request_id) DO NOTHING",
+                (session_id, request_id, arguments_digest, action_id),
+            )
+            return cur.rowcount == 1
+
 
 class SessionRepository:
     """Minimal durable session records (conversation-memory/RAG is out of scope)."""

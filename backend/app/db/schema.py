@@ -174,6 +174,44 @@ DDL_STATEMENTS: tuple[str, ...] = (
         -- Storage boundary only (A01): delivery, replay and consumption are A07.
     )
     """,
+    # ------------------------------------------------------------------ #
+    # A04 guarded execution state (additive under schema version 1).
+    # Runtime execution bookkeeping lives here - deliberately NOT in
+    # ProposedAction.arguments, ApprovalReceipt or event_outbox.
+    # ------------------------------------------------------------------ #
+    """
+    CREATE TABLE IF NOT EXISTS google_event_ids (
+        action_id       TEXT NOT NULL REFERENCES proposed_actions(id),
+        revision        INTEGER NOT NULL CHECK (revision >= 1),
+        -- Client-generated Google-valid event id, reserved durably BEFORE the
+        -- first create request so a lost response can be reconciled by GET.
+        google_event_id TEXT NOT NULL UNIQUE,
+        created_at      TEXT NOT NULL,
+        PRIMARY KEY (action_id, revision)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS action_execution_results (
+        action_id   TEXT PRIMARY KEY REFERENCES proposed_actions(id),
+        -- Canonical ToolResult JSON for the last completed execution; lets
+        -- GET /api/actions/{id} and duplicate requests replay the stored
+        -- outcome without touching Google again.
+        status      TEXT NOT NULL,
+        result_json TEXT NOT NULL,
+        updated_at  TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS proposal_idempotency (
+        session_id       TEXT NOT NULL,
+        request_id       TEXT NOT NULL,
+        arguments_digest TEXT NOT NULL,
+        action_id        TEXT NOT NULL REFERENCES proposed_actions(id),
+        -- Same (session, request) with the same canonical digest replays the
+        -- existing action; a different digest is rejected at this boundary.
+        PRIMARY KEY (session_id, request_id)
+    )
+    """,
 )
 
 
