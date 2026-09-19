@@ -208,8 +208,12 @@ class FocusSessionResponse(ContractModel):
 
 
 class FocusStopResponse(ContractModel):
+    """An explicit stop always returns the completion summary computed from
+    persisted session items (same summary served after reconnect/restart via
+    GET /api/focus/{id}/summary)."""
+
     session: FocusSession
-    summary: FocusCompletionSummary | None = None
+    summary: FocusCompletionSummary
 
 
 class FocusCurrentResponse(ContractModel):

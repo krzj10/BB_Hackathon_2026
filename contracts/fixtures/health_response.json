@@ -1,14 +1,19 @@
 {
-  "status": "degraded",
+  "status": "unavailable",
   "server_time": "2026-09-19T07:00:00+00:00",
   "version": "0.1.0",
   "components": {
     "database": { "status": "degraded", "detail": "persistence layer not initialized yet (A01)" },
     "llm": {
       "status": "unavailable",
-      "detail": "self-hosted endpoint/model not configured: missing EVA_LLM_BASE_URL, EVA_LLM_MODEL"
+      "detail": "self-hosted inference route unusable: missing EVA_LLM_BASE_URL; missing EVA_LLM_MODEL; EVA_LLM_ALLOWED_ORIGINS is empty (explicit allowlist required)",
+      "provider": "openai_compatible",
+      "model": null
     },
-    "llm_fallback": { "status": "unavailable", "detail": "no self-hosted fallback configured" },
+    "llm_fallback": {
+      "status": "unavailable",
+      "detail": "optional self-hosted fallback not configured (allowed; never replaced by cloud)"
+    },
     "google": { "status": "unavailable", "detail": "Google OAuth client id/secret not configured" },
     "stt": { "status": "degraded", "detail": "provider 'faster-whisper' adapter pending (A05)" }
   }

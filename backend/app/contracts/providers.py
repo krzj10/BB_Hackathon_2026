@@ -57,8 +57,18 @@ class LLMModelInfo(ContractModel):
 
 
 class ProviderHealth(ContractModel):
+    """Component readiness with structured identity where known.
+
+    ``provider``/``model`` carry the actual configured provider and serving
+    model id (never guessed). Secrets, API keys, tokens and base-URL
+    credentials must never appear here - only presence flags belong in
+    sanitized responses elsewhere.
+    """
+
     status: HealthStatus
     detail: str | None = None
+    provider: str | None = None
+    model: str | None = None
 
 
 class SearchResult(ContractModel):

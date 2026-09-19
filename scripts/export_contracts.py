@@ -6,12 +6,21 @@ There is no second manual model layer; frontend code must only use the
 generated file and never edit it (docs/EVA_DEVELOPMENT_WORKFLOW.md section 6).
 
 Artifacts written by this script:
-- contracts/schema/eva.schema.json      full schema bundle (backend + review)
+- contracts/schema/eva.schema.json      self-contained Draft 2020-12 bundle
+                                        (all $refs resolve at root $defs)
 - frontend/src/api/types.generated.ts   sanitized TS types for Stream B
 
 Usage:
     python scripts/export_contracts.py            # regenerate artifacts
     python scripts/export_contracts.py --check    # fail on drift (CI/gates)
+
+Discriminated unions (MeetingSpan, CalendarProposalArguments, EventPayload)
+are derived from Pydantic's own discriminator metadata - never hand-mapped:
+- JSON Schema: each boundary entry additionally requires the discriminator
+  property, so a member without it fails schema validation at the boundary.
+- TypeScript: boundaries are emitted as RequireDiscriminator<Member, K> unions;
+  EventEnvelope is emitted as an explicit correlated union (outer ``type`` must
+  match the payload discriminator), derived from the mapping metadata.
 
 Provider-only models (ChatMessage, LLMResponse, AudioInput, ...) are included
 in the schema bundle but excluded from the TypeScript export unless referenced
@@ -29,7 +38,7 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "backend"))
 
-from pydantic import BaseModel, TypeAdapter  # noqa: E402
+from pydantic import TypeAdapter  # noqa: E402
 
 from app.contracts import api, domain, providers  # noqa: E402
 
@@ -37,7 +46,7 @@ SCHEMA_PATH = REPO_ROOT / "contracts" / "schema" / "eva.schema.json"
 TS_PATH = REPO_ROOT / "frontend" / "src" / "api" / "types.generated.ts"
 
 # Frontend-facing contracts, in documentation order. These define the TS export.
-DOMAIN_MODELS: list[type[BaseModel]] = [
+DOMAIN_MODELS: list[Any] = [
     domain.MeetingPriority,
     domain.ActionRisk,
     domain.AttentionPriority,
@@ -108,7 +117,7 @@ DOMAIN_MODELS: list[type[BaseModel]] = [
     domain.EventEnvelope,
 ]
 
-API_MODELS: list[type[BaseModel]] = [
+API_MODELS: list[Any] = [
     api.HealthResponse,
     api.IntegrationStatus,
     api.IntegrationsResponse,
@@ -142,7 +151,7 @@ API_MODELS: list[type[BaseModel]] = [
 
 # Schema-bundle-only models (backend/provider internal; may still appear in TS
 # if referenced by a frontend-facing model - see LLMModelInfo/ProviderHealth).
-PROVIDER_MODELS: list[type[BaseModel]] = [
+PROVIDER_MODELS: list[Any] = [
     providers.ChatRole,
     providers.ChatMessage,
     providers.LLMResponse,
@@ -152,36 +161,98 @@ PROVIDER_MODELS: list[type[BaseModel]] = [
     domain.AudioInput,
 ]
 
-# Named union aliases emitted for discriminated unions used at API boundaries.
-TS_ALIASES: list[tuple[str, dict[str, Any]]] = []
+#: Canonical discriminated-union boundaries, derived from Pydantic metadata.
+UNION_ALIASES: dict[str, Any] = {
+    "MeetingSpan": domain.MeetingSpan,
+    "CalendarProposalArguments": domain.CalendarProposalArguments,
+    "EventPayload": domain.EventPayload,
+}
+
+#: Pure reference aliases (same schema truth, frontend-facing name).
+REFERENCE_ALIASES: dict[str, dict[str, Any]] = {
+    "CalendarProposalRequest": {"$ref": "#/$defs/CalendarProposalArguments"},
+}
 
 
 def _schema_of(model: Any) -> dict[str, Any]:
     return TypeAdapter(model).json_schema(ref_template="#/$defs/{model}")
 
 
+class DefRegistry:
+    """Root $defs registry with conflict detection (no silent overwrite)."""
+
+    def __init__(self) -> None:
+        self.defs: dict[str, Any] = {}
+
+    def add(self, name: str, schema: dict[str, Any]) -> None:
+        existing = self.defs.get(name)
+        if existing is not None and existing != schema:
+            raise RuntimeError(f"conflicting definitions for $defs entry {name!r}")
+        self.defs[name] = schema
+
+    def absorb(self, schema: dict[str, Any]) -> dict[str, Any]:
+        """Strip a schema's private $defs into the root registry and return
+        the schema whose refs now resolve against the root."""
+        schema = dict(schema)
+        for name, sub in (schema.pop("$defs", None) or {}).items():
+            self.add(name, sub)
+        return schema
+
+
+def _boundary_metadata(alias_schema: dict[str, Any]) -> tuple[str | None, list[str], dict[str, str]]:
+    """(discriminator property, member def names, literal->member mapping)."""
+    discriminator = alias_schema.get("discriminator") or {}
+    prop = discriminator.get("propertyName")
+    members = [s["$ref"].rsplit("/", 1)[-1] for s in alias_schema.get("oneOf", []) if "$ref" in s]
+    mapping = {
+        value: ref.rsplit("/", 1)[-1]
+        for value, ref in (discriminator.get("mapping") or {}).items()
+    }
+    return prop, members, mapping
+
+
 # ---------------------------------------------------------------------------
-# Schema bundle
+# Schema bundle (self-contained Draft 2020-12)
 # ---------------------------------------------------------------------------
 
 
 def build_schema_bundle() -> str:
-    models: dict[str, Any] = {}
+    registry = DefRegistry()
+
     for group in (DOMAIN_MODELS, API_MODELS, PROVIDER_MODELS):
         for model in group:
-            models[model.__name__] = _schema_of(model)
+            registry.add(model.__name__, registry.absorb(_schema_of(model)))
+
+    # Discriminated-union boundary entries: keep Pydantic's oneOf+discriminator
+    # metadata and additionally require the discriminator property at the
+    # boundary (the member models keep their canonical defaults).
+    for name, alias in UNION_ALIASES.items():
+        alias_schema = registry.absorb(_schema_of(alias))
+        prop, _members, _mapping = _boundary_metadata(alias_schema)
+        if prop:
+            registry.add(name, {"allOf": [alias_schema, {"required": [prop]}]})
+        else:  # defensive: not a discriminated union as expected
+            registry.add(name, alias_schema)
+
+    for name, ref in REFERENCE_ALIASES.items():
+        registry.add(name, ref)
+
     bundle = {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "title": "EVA canonical contracts v2.0 (A00)",
-        "generated_by": "scripts/export_contracts.py",
-        "serialization": {
+        "description": (
+            "Self-contained contract bundle. Every internal '#/$defs/...' ref "
+            "resolves inside this document. Validate a named contract with "
+            '{\"$ref\": \"#/$defs/<Name>\", ...this document}.'
+        ),
+        "x-eva-serialization": {
             "field_names": "snake_case",
             "enums": "lowercase",
             "extra_fields": "forbid",
             "datetimes": "ISO 8601, timezone-aware",
             "money": "integer minor units + ISO 4217 currency",
         },
-        "models": models,
+        "$defs": registry.defs,
     }
     return json.dumps(bundle, indent=2, ensure_ascii=False) + "\n"
 
@@ -198,13 +269,8 @@ FORMAT_ALIASES = {
     "binary": "string",
 }
 
-
-def _collect_defs(models: list[dict[str, Any]], defs: dict[str, Any]) -> None:
-    for schema in models:
-        for name, sub in (schema.get("$defs") or {}).items():
-            if name in defs and defs[name] != sub:
-                raise RuntimeError(f"conflicting definitions for type {name!r}")
-            defs[name] = sub
+#: Set at build time: member-set signature -> emitted boundary alias name.
+_UNION_LOOKUP: dict[frozenset, str] = {}
 
 
 def _ts_expr(schema: Any) -> str:
@@ -218,10 +284,18 @@ def _ts_expr(schema: Any) -> str:
         return json.dumps(schema["const"])
     if "enum" in schema:
         return " | ".join(json.dumps(v) for v in schema["enum"])
-    if "oneOf" in schema:
-        return " | ".join(_ts_expr(s) for s in schema["oneOf"])
-    if "anyOf" in schema:
-        parts = [_ts_expr(s) for s in schema["anyOf"]]
+    if "oneOf" in schema or "anyOf" in schema:
+        parts_raw = schema.get("oneOf") or schema.get("anyOf")
+        # Inline discriminated unions reference their emitted boundary alias so
+        # the discriminator stays mandatory everywhere, not just via the alias.
+        if "oneOf" in schema and "discriminator" in schema:
+            members = frozenset(
+                s["$ref"].rsplit("/", 1)[-1] for s in parts_raw if isinstance(s, dict) and "$ref" in s
+            )
+            alias = _UNION_LOOKUP.get(members)
+            if alias is not None:
+                return alias
+        parts = [_ts_expr(s) for s in parts_raw]
         non_null = [p for p in parts if p != "null"]
         nulls = [p for p in parts if p == "null"]
         return " | ".join(non_null + nulls) if nulls else " | ".join(parts)
@@ -271,35 +345,38 @@ def _doc_comment(schema: dict[str, Any], indent: str = "") -> str:
     return f"{indent}/** {one_line} */\n"
 
 
-def _emit_named(name: str, schema: dict[str, Any]) -> str:
+def _emit_interface(name: str, schema: dict[str, Any], drop_props: tuple[str, ...] = ()) -> str:
     doc = _doc_comment(schema)
-    if "enum" in schema and all(isinstance(v, str) for v in schema["enum"]):
-        lines = "\n".join(f"  | {json.dumps(v)}" for v in schema["enum"])
-        return f"{doc}export type {name} =\n{lines};\n"
-    if schema.get("type") == "object" and "properties" in schema:
-        required = set(schema.get("required", []))
-        lines: list[str] = []
-        for key, sub in schema["properties"].items():
-            sub_doc = _doc_comment(sub, indent="  ")
-            optional = "" if key in required else "?"
-            lines.append(f"{sub_doc}  {key}{optional}: {_ts_expr(sub)};")
-        extra = (
-            "\n  [key: string]: unknown;"
-            if schema.get("additionalProperties") is True
-            else ""
-        )
-        return f"{doc}export interface {name} {{\n" + "\n".join(lines) + extra + "\n}\n"
-    return f"{doc}export type {name} = {_ts_expr(schema)};\n"
+    required = set(schema.get("required", [])) - set(drop_props)
+    lines: list[str] = []
+    for key, sub in schema["properties"].items():
+        if key in drop_props:
+            continue
+        sub_doc = _doc_comment(sub, indent="  ")
+        optional = "" if key in required else "?"
+        lines.append(f"{sub_doc}  {key}{optional}: {_ts_expr(sub)};")
+    return f"{doc}export interface {name} {{\n" + "\n".join(lines) + "\n}\n"
 
 
 def build_typescript() -> str:
+    # Boundary metadata first: aliases and the inline-union lookup.
+    boundaries: dict[str, tuple[str | None, list[str], dict[str, str]]] = {}
+    for name, alias in UNION_ALIASES.items():
+        alias_schema = _schema_of(alias)
+        boundaries[name] = _boundary_metadata(alias_schema)
+        _UNION_LOOKUP[frozenset(boundaries[name][1])] = name
+
     exported_schemas = [_schema_of(m) for m in DOMAIN_MODELS + API_MODELS]
     defs: dict[str, Any] = {}
-    _collect_defs(exported_schemas, defs)
+    for schema in exported_schemas:
+        for dname, sub in (schema.get("$defs") or {}).items():
+            if dname in defs and defs[dname] != sub:
+                raise RuntimeError(f"conflicting definitions for type {dname!r}")
+            defs[dname] = sub
 
     roots = {m.__name__: _schema_of(m) for m in DOMAIN_MODELS + API_MODELS}
     order = [m.__name__ for m in DOMAIN_MODELS + API_MODELS]
-    leftovers = sorted(n for n in defs if n not in roots)
+    leftovers = sorted(n for n in defs if n not in roots and n != "EventEnvelope")
 
     parts: list[str] = [
         "/* eslint-disable */\n",
@@ -318,43 +395,69 @@ def build_typescript() -> str:
         "export type DateOnly = string;\n"
         "export type Email = string;\n"
         "export type Uri = string;\n\n",
+        "/** Makes the discriminator property mandatory at a union boundary. */\n"
+        "export type RequireDiscriminator<T, K extends keyof T> = T & Required<Pick<T, K>>;\n\n",
     ]
 
     for name in order:
-        parts.append(_emit_named(name, roots[name]))
-        parts.append("\n")
-    for name in leftovers:
-        parts.append(_emit_named(name, defs[name]))
+        if name == "EventEnvelope":
+            # Correlated envelope is emitted after the named types; here only
+            # the shared base fields (without the correlated type/payload pair).
+            parts.append(
+                "/** EventEnvelope fields without the correlated type/payload pair. */\n"
+                + _emit_interface("EventEnvelopeBase", roots[name], drop_props=("type", "payload"))
+            )
+            parts.append("\n")
+            continue
+        schema = roots[name]
+        if "enum" in schema and all(isinstance(v, str) for v in schema["enum"]):
+            lines = "\n".join(f"  | {json.dumps(v)}" for v in schema["enum"])
+            parts.append(f"{_doc_comment(schema)}export type {name} =\n{lines};\n")
+        elif schema.get("type") == "object" and "properties" in schema:
+            parts.append(_emit_interface(name, schema))
+        else:
+            parts.append(f"{_doc_comment(schema)}export type {name} = {_ts_expr(schema)};\n")
         parts.append("\n")
 
-    # Named aliases for the discriminated unions used at API boundaries.
-    union_defs = {
-        "MeetingSpan": ["TimedSpan", "AllDaySpan"],
-        "CalendarProposalRequest": [
-            "CalendarCreateEventArguments",
-            "CalendarRescheduleEventArguments",
-            "CalendarUpdateAgendaArguments",
-        ],
-        "EventPayload": [
-            "VoiceStateChangedPayload",
-            "TranscriptReadyPayload",
-            "BriefingReadyPayload",
-            "AttentionItemCreatedPayload",
-            "DecisionCreatedPayload",
-            "DecisionUpdatedPayload",
-            "FocusStartedPayload",
-            "FocusEndedPayload",
-            "ActionProposedPayload",
-            "ActionStatusChangedPayload",
-            "InferenceUnavailablePayload",
-            "HeartbeatPayload",
-        ],
-    }
-    for alias, members in union_defs.items():
-        expr = " | ".join(members)
+    for name in leftovers:
+        schema = defs[name]
+        if "enum" in schema and all(isinstance(v, str) for v in schema["enum"]):
+            lines = "\n".join(f"  | {json.dumps(v)}" for v in schema["enum"])
+            parts.append(f"{_doc_comment(schema)}export type {name} =\n{lines};\n")
+        elif schema.get("type") == "object" and "properties" in schema:
+            parts.append(_emit_interface(name, schema))
+        else:
+            parts.append(f"{_doc_comment(schema)}export type {name} = {_ts_expr(schema)};\n")
+        parts.append("\n")
+
+    # Discriminated-union boundaries: discriminators are mandatory here even
+    # though member models carry canonical literal defaults.
+    for name, (prop, members, _mapping) in boundaries.items():
+        if not prop or not members:
+            continue
+        lines = "\n".join(
+            f"  | RequireDiscriminator<{member}, {json.dumps(prop)}>" for member in members
+        )
         parts.append(
-            f"/** Discriminated on the \"{'tool' if 'Proposal' in alias else 'kind' if alias == 'MeetingSpan' else 'type'}\" field. */\n"
-            f"export type {alias} = {expr};\n\n"
+            f"/** Discriminated union boundary: \"{prop}\" is mandatory. */\n"
+            f"export type {name} =\n{lines};\n\n"
+        )
+
+    for name, target in REFERENCE_ALIASES.items():
+        parts.append(f"export type {name} = {target['$ref'].rsplit('/', 1)[-1]};\n\n")
+
+    # Correlated EventEnvelope: outer `type` must match the payload's own
+    # discriminator. Derived mechanically from Pydantic mapping metadata.
+    event_prop, _event_members, event_mapping = boundaries["EventPayload"]
+    if event_prop and event_mapping:
+        variants = "\n".join(
+            f"  | (EventEnvelopeBase & {{ type: {json.dumps(value)}; payload: {member} }})"
+            for value, member in event_mapping.items()
+        )
+        parts.append(
+            "/** WebSocket envelope with correlated `type`/payload: a mismatch is a\n"
+            " * compile-time error. Pydantic enforces the same invariant at runtime. */\n"
+            f"export type EventEnvelope =\n{variants};\n\n"
         )
 
     return "".join(parts)

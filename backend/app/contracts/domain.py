@@ -653,6 +653,18 @@ class ActiveContext(ContractModel):
     decision_id: str | None = None
     section: str | None = None
 
+    @model_validator(mode="after")
+    def _fields_agree_with_mode(self) -> "ActiveContext":
+        if self.mode == ActiveContextMode.MEETING and self.meeting is None:
+            raise ValueError("mode=meeting requires a meeting reference")
+        if self.mode == ActiveContextMode.DECISION and self.decision_id is None:
+            raise ValueError("mode=decision requires a decision_id")
+        if self.meeting is not None and self.mode != ActiveContextMode.MEETING:
+            raise ValueError("meeting may only be populated when mode=meeting")
+        if self.decision_id is not None and self.mode != ActiveContextMode.DECISION:
+            raise ValueError("decision_id may only be populated when mode=decision")
+        return self
+
 
 class AssistantRequest(ContractModel):
     request_id: str = Field(min_length=1)

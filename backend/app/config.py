@@ -91,6 +91,19 @@ class Settings(BaseSettings):
 
     # ------------------------------------------------------------------ #
 
+    @staticmethod
+    def _endpoint_origin(url: str) -> str | None:
+        """scheme+host[:port] of a URL, normalized (trailing slash removed)."""
+        from urllib.parse import urlsplit
+
+        try:
+            parts = urlsplit(url.strip())
+        except ValueError:
+            return None
+        if parts.scheme not in ("http", "https") or not parts.netloc:
+            return None
+        return f"{parts.scheme}://{parts.netloc}"
+
     def missing_required_self_hosted_settings(self) -> list[str]:
         """Environment variable names that must be configured before the
         mandatory inference route can serve requests."""
@@ -101,23 +114,50 @@ class Settings(BaseSettings):
             missing.append("EVA_LLM_MODEL")
         return missing
 
+    def self_hosted_route_blockers(self) -> list[str]:
+        """Why the mandatory self-hosted route is not usable yet.
+
+        Usable requires: base URL + model configured, an explicit non-empty
+        origin allowlist, and the endpoint's origin present in that allowlist.
+        Cloud endpoints must never be added to the allowlist; it is
+        user/backend configuration, never model output.
+        """
+        blockers = [f"missing {name}" for name in self.missing_required_self_hosted_settings()]
+        if not self.eva_llm_allowed_origins:
+            blockers.append("EVA_LLM_ALLOWED_ORIGINS is empty (explicit allowlist required)")
+        elif self.eva_llm_base_url.strip():
+            origin = self._endpoint_origin(self.eva_llm_base_url)
+            if origin is None:
+                blockers.append("EVA_LLM_BASE_URL is not a valid http(s) URL")
+            elif origin not in self.eva_llm_allowed_origins:
+                blockers.append(
+                    f"EVA_LLM_BASE_URL origin {origin} is not in EVA_LLM_ALLOWED_ORIGINS"
+                )
+        return blockers
+
     @property
     def self_hosted_configured(self) -> bool:
-        return not self.missing_required_self_hosted_settings()
+        """True only when the mandatory self-hosted route is usable: endpoint,
+        model and an explicit matching private-origin allowlist entry."""
+        return not self.self_hosted_route_blockers()
 
     @property
     def self_hosted_fallback_configured(self) -> bool:
-        return bool(
-            self.eva_llm_fallback_base_url.strip() and self.eva_llm_fallback_model.strip()
-        )
+        """The optional fallback obeys the same private-origin requirement:
+        it is only considered configured when its endpoint origin appears in
+        EVA_LLM_ALLOWED_ORIGINS. Absence is allowed and never enables cloud."""
+        base = self.eva_llm_fallback_base_url.strip()
+        if not base or not self.eva_llm_fallback_model.strip():
+            return False
+        origin = self._endpoint_origin(base)
+        return origin is not None and origin in self.eva_llm_allowed_origins
 
     def is_allowed_self_hosted_origin(self, url: str) -> bool:
         """True only for URLs whose scheme+host[:port] exactly matches a
         configured allowlist origin. Cloud endpoints must never be added to
         the allowlist for the mandatory route."""
-        normalized = url.rstrip("/")
-        return any(normalized == origin or normalized.startswith(origin + "/")
-                   for origin in self.eva_llm_allowed_origins)
+        origin = self._endpoint_origin(url)
+        return origin is not None and origin in self.eva_llm_allowed_origins
 
     @property
     def google_configured(self) -> bool:

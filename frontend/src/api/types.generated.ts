@@ -16,6 +16,9 @@ export type DateOnly = string;
 export type Email = string;
 export type Uri = string;
 
+/** Makes the discriminator property mandatory at a union boundary. */
+export type RequireDiscriminator<T, K extends keyof T> = T & Required<Pick<T, K>>;
+
 export type MeetingPriority =
   | "low"
   | "medium"
@@ -234,7 +237,7 @@ export interface Meeting {
   ref: MeetingRef;
   etag?: string | null;
   title: string;
-  span: TimedSpan | AllDaySpan;
+  span: MeetingSpan;
   attendees?: Participant[];
   organizer_email?: Email | null;
   editable?: boolean;
@@ -413,7 +416,7 @@ export interface ToolResult {
 export interface CalendarCreateEventArguments {
   tool?: "calendar.create_event";
   title: string;
-  span: TimedSpan | AllDaySpan;
+  span: MeetingSpan;
   attendees?: Participant[];
   description?: string | null;
   location?: string | null;
@@ -423,7 +426,7 @@ export interface CalendarCreateEventArguments {
 export interface CalendarRescheduleEventArguments {
   tool?: "calendar.reschedule_event";
   ref: MeetingRef;
-  new_span: TimedSpan | AllDaySpan;
+  new_span: MeetingSpan;
   expected_etag?: string | null;
   send_updates?: SendUpdates;
 }
@@ -556,16 +559,15 @@ export interface HeartbeatPayload {
   server_time: DateTime;
 }
 
+/** EventEnvelope fields without the correlated type/payload pair. */
 /** Persisted with monotonic per-session sequence; consumers deduplicate by event_id and reject stale request ids. */
-export interface EventEnvelope {
+export interface EventEnvelopeBase {
   schema_version?: 1;
   event_id: string;
   sequence: number;
   session_id: string;
   request_id?: string | null;
   occurred_at: DateTime;
-  type: EventType;
-  payload: VoiceStateChangedPayload | TranscriptReadyPayload | BriefingReadyPayload | AttentionItemCreatedPayload | DecisionCreatedPayload | DecisionUpdatedPayload | FocusStartedPayload | FocusEndedPayload | ActionProposedPayload | ActionStatusChangedPayload | InferenceUnavailablePayload | HeartbeatPayload;
 }
 
 export interface HealthResponse {
@@ -690,9 +692,10 @@ export interface FocusSessionResponse {
   session: FocusSession;
 }
 
+/** An explicit stop always returns the completion summary computed from persisted session items (same summary served after reconnect/restart via GET /api/focus/{id}/summary). */
 export interface FocusStopResponse {
   session: FocusSession;
-  summary?: FocusCompletionSummary | null;
+  summary: FocusCompletionSummary;
 }
 
 export interface FocusCurrentResponse {
@@ -747,17 +750,55 @@ export interface LLMModelInfo {
   context_window?: number | null;
 }
 
+/** Component readiness with structured identity where known. ``provider``/``model`` carry the actual configured provider and serving model id (never guessed). Secrets, API keys, tokens and base-URL credentials must never appear here - only presence flags belong in sanitized responses elsewhere. */
 export interface ProviderHealth {
   status: HealthStatus;
   detail?: string | null;
+  provider?: string | null;
+  model?: string | null;
 }
 
-/** Discriminated on the "kind" field. */
-export type MeetingSpan = TimedSpan | AllDaySpan;
+/** Discriminated union boundary: "kind" is mandatory. */
+export type MeetingSpan =
+  | RequireDiscriminator<TimedSpan, "kind">
+  | RequireDiscriminator<AllDaySpan, "kind">;
 
-/** Discriminated on the "tool" field. */
-export type CalendarProposalRequest = CalendarCreateEventArguments | CalendarRescheduleEventArguments | CalendarUpdateAgendaArguments;
+/** Discriminated union boundary: "tool" is mandatory. */
+export type CalendarProposalArguments =
+  | RequireDiscriminator<CalendarCreateEventArguments, "tool">
+  | RequireDiscriminator<CalendarRescheduleEventArguments, "tool">
+  | RequireDiscriminator<CalendarUpdateAgendaArguments, "tool">;
 
-/** Discriminated on the "type" field. */
-export type EventPayload = VoiceStateChangedPayload | TranscriptReadyPayload | BriefingReadyPayload | AttentionItemCreatedPayload | DecisionCreatedPayload | DecisionUpdatedPayload | FocusStartedPayload | FocusEndedPayload | ActionProposedPayload | ActionStatusChangedPayload | InferenceUnavailablePayload | HeartbeatPayload;
+/** Discriminated union boundary: "type" is mandatory. */
+export type EventPayload =
+  | RequireDiscriminator<VoiceStateChangedPayload, "type">
+  | RequireDiscriminator<TranscriptReadyPayload, "type">
+  | RequireDiscriminator<BriefingReadyPayload, "type">
+  | RequireDiscriminator<AttentionItemCreatedPayload, "type">
+  | RequireDiscriminator<DecisionCreatedPayload, "type">
+  | RequireDiscriminator<DecisionUpdatedPayload, "type">
+  | RequireDiscriminator<FocusStartedPayload, "type">
+  | RequireDiscriminator<FocusEndedPayload, "type">
+  | RequireDiscriminator<ActionProposedPayload, "type">
+  | RequireDiscriminator<ActionStatusChangedPayload, "type">
+  | RequireDiscriminator<InferenceUnavailablePayload, "type">
+  | RequireDiscriminator<HeartbeatPayload, "type">;
+
+export type CalendarProposalRequest = CalendarProposalArguments;
+
+/** WebSocket envelope with correlated `type`/payload: a mismatch is a
+ * compile-time error. Pydantic enforces the same invariant at runtime. */
+export type EventEnvelope =
+  | (EventEnvelopeBase & { type: "action_proposed"; payload: ActionProposedPayload })
+  | (EventEnvelopeBase & { type: "action_status_changed"; payload: ActionStatusChangedPayload })
+  | (EventEnvelopeBase & { type: "attention_item_created"; payload: AttentionItemCreatedPayload })
+  | (EventEnvelopeBase & { type: "briefing_ready"; payload: BriefingReadyPayload })
+  | (EventEnvelopeBase & { type: "decision_created"; payload: DecisionCreatedPayload })
+  | (EventEnvelopeBase & { type: "decision_updated"; payload: DecisionUpdatedPayload })
+  | (EventEnvelopeBase & { type: "focus_ended"; payload: FocusEndedPayload })
+  | (EventEnvelopeBase & { type: "focus_started"; payload: FocusStartedPayload })
+  | (EventEnvelopeBase & { type: "heartbeat"; payload: HeartbeatPayload })
+  | (EventEnvelopeBase & { type: "inference_unavailable"; payload: InferenceUnavailablePayload })
+  | (EventEnvelopeBase & { type: "transcript_ready"; payload: TranscriptReadyPayload })
+  | (EventEnvelopeBase & { type: "voice_state_changed"; payload: VoiceStateChangedPayload });
 

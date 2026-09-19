@@ -219,6 +219,9 @@ __marimo__/
 
 # EVA: local uv cache used by the sandboxed backend toolchain
 .uv-cache/
+.npm-cache-tmp/
+pytest-cache-files-*/
+*.tsbuildinfo
 
 # EVA: secrets, databases and demo data must never enter Git
 # (per docs/EVA_DEVELOPMENT_WORKFLOW.md section 4)

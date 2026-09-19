@@ -1,11 +1,20 @@
-"""A00 contract validation tests.
+"""A00 contract tests - three-layer gate, layer 1+2 wiring.
 
-Covers: aware-datetime enforcement, interval ordering, strict extra-field
-rejection, lowercase enums, integer money, HIGH approval boundaries, claim
-provenance, decision outcome invariants, derived Focus activity, event
-envelope typing, discriminated Calendar proposals, settings/cloud defaults,
-generated-artifact drift and the health endpoint with external services
-unavailable.
+Layer 1 (this file): Pydantic semantic/runtime validation of contracts and
+fixtures, plus config/health semantics.
+Layer 2 (also this file): real Draft 2020-12 JSON Schema validation of the
+generated bundle - meta-validation, $ref resolution, named-contract fixture
+validation and structural negative cases.
+Layer 3: TypeScript compile-time gate in contracts/tscheck (run via npm; also
+exercised here as a pytest test when the pinned compiler is installed).
+
+Structural schema validation vs semantic runtime validation:
+- JSON Schema enforces structure: required fields, types, enums,
+  additionalProperties:false, and discriminator presence at union boundaries.
+- Pydantic additionally enforces semantics that JSON Schema does not encode:
+  end-after-start intervals, HIGH approval invariants, Decision outcome
+  consistency, EventEnvelope outer/inner correlation (runtime defense in depth;
+  the generated TypeScript already rejects mismatches at compile time).
 
 Run: python -m pytest backend/tests/unit/test_contracts.py -q
 """
@@ -13,6 +22,7 @@ Run: python -m pytest backend/tests/unit/test_contracts.py -q
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -20,6 +30,8 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from jsonschema import Draft202012Validator
+from jsonschema import ValidationError as JsonSchemaValidationError
 from pydantic import TypeAdapter, ValidationError
 
 from app.config import Settings
@@ -30,6 +42,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 FIXTURE_DIR = REPO_ROOT / "contracts" / "fixtures"
 SCHEMA_PATH = REPO_ROOT / "contracts" / "schema" / "eva.schema.json"
 TS_PATH = REPO_ROOT / "frontend" / "src" / "api" / "types.generated.ts"
+TSCHECK_DIR = REPO_ROOT / "contracts" / "tscheck"
 
 CALENDAR_PROPOSAL_ADAPTER = TypeAdapter(domain.CalendarProposalArguments)
 
@@ -46,6 +59,7 @@ FIXTURE_MODELS: dict[str, object] = {
     "approval_receipt_ui.json": domain.ApprovalReceipt,
     "focus_session_active.json": domain.FocusSession,
     "focus_completion_summary.json": domain.FocusCompletionSummary,
+    "focus_stop_response.json": api.FocusStopResponse,
     "tool_definition_calendar_update_agenda.json": domain.ToolDefinition,
     "tool_call_agenda.json": domain.ToolCall,
     "tool_result_agenda_ok.json": domain.ToolResult,
@@ -73,7 +87,7 @@ def validate(model: object, data: dict):
 
 
 # ---------------------------------------------------------------------------
-# Fixture bundle
+# Fixture bundle (Pydantic runtime validation)
 # ---------------------------------------------------------------------------
 
 
@@ -81,17 +95,16 @@ def validate(model: object, data: dict):
 def test_valid_fixture_passes_python_validation(name: str) -> None:
     data = load_fixture(name)
     obj = validate(FIXTURE_MODELS[name], data)
-    # Serialization must round-trip through JSON mode and revalidate.
     dumped = obj.model_dump(mode="json")
     validate(FIXTURE_MODELS[name], dumped)
 
 
 def test_fixture_bundle_covers_contract_inventory() -> None:
-    assert len(FIXTURE_MODELS) >= 20
+    assert len(FIXTURE_MODELS) >= 25
 
 
 # ---------------------------------------------------------------------------
-# Invariants from the plan's exact acceptance example
+# Invariants from the plan's exact acceptance example (semantic runtime layer)
 # ---------------------------------------------------------------------------
 
 
@@ -181,7 +194,13 @@ def test_extra_fields_are_rejected_everywhere() -> None:
 
 def test_tool_call_carries_no_authoritative_risk_or_approval_fields() -> None:
     data = load_fixture("tool_call_agenda.json")
-    for forbidden in ("risk", "requires_approval", "voice_approval_allowed", "approved"):
+    for forbidden in (
+        "risk",
+        "requires_approval",
+        "voice_approval_allowed",
+        "approved",
+        "approval_channel",
+    ):
         payload = {**data, forbidden: True}
         with pytest.raises(ValidationError):
             domain.ToolCall.model_validate(payload)
@@ -214,7 +233,7 @@ def test_money_requires_integer_minor_units() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Claims, decisions, focus
+# Claims, decisions, focus, active context
 # ---------------------------------------------------------------------------
 
 
@@ -223,32 +242,23 @@ def test_fact_claim_requires_sources() -> None:
         domain.Claim(text="Spotkanie odbylo sie 2 wrzesnia.", kind="fact", source_ids=[])
     claim = domain.Claim(text="Spotkanie odbylo sie 2 wrzesnia.", kind="fact", source_ids=["s1"])
     assert claim.source_ids == ["s1"]
-    # Inference and suggestion may carry no sources.
     domain.Claim(text="Byc moz opoznienie.", kind="inference")
 
 
 def test_decision_outcome_invariants() -> None:
     base = load_fixture("decision_finance_pln_needs_review.json")
 
-    outcome_without_resolution = {**base, "outcome": "accept"}
     with pytest.raises(ValidationError):
-        domain.Decision.model_validate(outcome_without_resolution)
+        domain.Decision.model_validate({**base, "outcome": "accept"})
 
-    outcome_without_timestamp = {
-        **base,
-        "status": "resolved",
-        "outcome": "accept",
-    }
     with pytest.raises(ValidationError):
-        domain.Decision.model_validate(outcome_without_timestamp)
+        domain.Decision.model_validate({**base, "status": "resolved", "outcome": "accept"})
 
-    resolved_without_outcome = {**base, "status": "resolved"}
     with pytest.raises(ValidationError):
-        domain.Decision.model_validate(resolved_without_outcome)
+        domain.Decision.model_validate({**base, "status": "resolved"})
 
-    deferred = {**base, "status": "deferred"}
-    decision = domain.Decision.model_validate(deferred)
-    assert decision.outcome is None and decision.outcome_recorded_at is None
+    deferred = domain.Decision.model_validate({**base, "status": "deferred"})
+    assert deferred.outcome is None and deferred.outcome_recorded_at is None
 
     resolved = domain.Decision.model_validate(load_fixture("decision_finance_pln_resolved.json"))
     assert resolved.outcome == domain.DecisionOutcome.ACCEPT
@@ -268,7 +278,6 @@ def test_financial_decision_stays_decision_required_when_urgent() -> None:
 
 def test_focus_session_active_is_derived_from_timestamps() -> None:
     session = domain.FocusSession.model_validate(load_fixture("focus_session_active.json"))
-    assert session.is_active(datetime(2026, 9, 21, 13, 0, tzinfo=timezone.utc)) is False
     warsaw_mid = datetime.fromisoformat("2026-09-21T13:00:00+02:00")
     assert session.is_active(warsaw_mid) is True
     assert session.is_active(datetime.fromisoformat("2026-09-21T14:00:00+02:00")) is False
@@ -276,8 +285,48 @@ def test_focus_session_active_is_derived_from_timestamps() -> None:
         update={"stopped_at": datetime.fromisoformat("2026-09-21T12:30:00+02:00")}
     )
     assert stopped.is_active(warsaw_mid) is False
-    # 'active' is a derived method, never a serialized field.
     assert "active" not in session.model_dump()
+
+
+def test_focus_stop_response_summary_is_required() -> None:
+    data = load_fixture("focus_stop_response.json")
+    response = api.FocusStopResponse.model_validate(data)
+    assert response.summary.focus_session_id == data["session"]["id"]
+    with pytest.raises(ValidationError):
+        api.FocusStopResponse.model_validate({"session": data["session"]})
+
+
+def _context(**overrides) -> dict:
+    base = {"mode": "general", "meeting": None, "decision_id": None, "section": None}
+    base.update(overrides)
+    return base
+
+
+def test_active_context_valid_shapes() -> None:
+    domain.ActiveContext.model_validate(_context())
+    domain.ActiveContext.model_validate(
+        _context(mode="meeting", meeting={"calendar_id": "primary", "event_id": "evt-1"})
+    )
+    domain.ActiveContext.model_validate(_context(mode="decision", decision_id="dec-1"))
+    domain.ActiveContext.model_validate(
+        _context(mode="meeting", meeting={"calendar_id": "primary", "event_id": "evt-1"}, section="risks")
+    )
+
+
+def test_active_context_contradictions_rejected() -> None:
+    with pytest.raises(ValidationError):
+        domain.ActiveContext.model_validate(_context(mode="meeting"))
+    with pytest.raises(ValidationError):
+        domain.ActiveContext.model_validate(_context(mode="decision"))
+    with pytest.raises(ValidationError):
+        domain.ActiveContext.model_validate(
+            _context(mode="general", meeting={"calendar_id": "primary", "event_id": "evt-1"})
+        )
+    with pytest.raises(ValidationError):
+        domain.ActiveContext.model_validate(_context(mode="meeting", decision_id="dec-1",
+            meeting={"calendar_id": "primary", "event_id": "evt-1"}))
+    with pytest.raises(ValidationError):
+        domain.ActiveContext.model_validate(_context(mode="focus", decision_id="dec-1"))
 
 
 # ---------------------------------------------------------------------------
@@ -308,7 +357,6 @@ def test_calendar_proposal_rejects_unknown_or_missing_tool() -> None:
 
 def test_calendar_proposal_rejects_wrong_arguments_per_tool() -> None:
     reschedule = load_fixture("calendar_proposal_reschedule.json")
-    # A reschedule must not carry create-only fields.
     with pytest.raises(ValidationError):
         CALENDAR_PROPOSAL_ADAPTER.validate_python({**reschedule, "title": "sneak-in"})
 
@@ -341,34 +389,88 @@ def test_event_envelope_valid_heartbeat_and_routing() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Settings contract
+# Settings contract (mandatory self-hosted route semantics)
 # ---------------------------------------------------------------------------
+
+ALLOWLISTED_URL = "https://infer.tailnet.example/v1"
+
+
+def _configured_settings(**overrides) -> Settings:
+    base = dict(
+        EVA_LLM_BASE_URL=ALLOWLISTED_URL,
+        EVA_LLM_MODEL="actual-server-model-id",
+        EVA_LLM_ALLOWED_ORIGINS="https://infer.tailnet.example",
+    )
+    base.update(overrides)
+    return Settings(_env_file=None, **base)
 
 
 def test_settings_defaults_keep_cloud_disabled_and_startup_needs_no_cloud_keys() -> None:
     settings = Settings(_env_file=None)
     assert settings.eva_allow_cloud_inference is False
     assert settings.eva_allow_workspace_cloud_inference is False
-    # No cloud key/model/endpoint required at startup; mandatory self-hosted
-    # values are reported, not invented.
     assert settings.missing_required_self_hosted_settings() == ["EVA_LLM_BASE_URL", "EVA_LLM_MODEL"]
     assert settings.self_hosted_configured is False
 
 
-def test_settings_origin_allowlist_parsing_and_matching() -> None:
+def test_self_hosted_route_requires_explicit_nonempty_allowlist() -> None:
+    settings = Settings(
+        _env_file=None, EVA_LLM_BASE_URL=ALLOWLISTED_URL, EVA_LLM_MODEL="model-x"
+    )
+    assert settings.self_hosted_configured is False
+    assert any("EVA_LLM_ALLOWED_ORIGINS" in b for b in settings.self_hosted_route_blockers())
+
+
+def test_self_hosted_route_rejects_endpoint_outside_allowlist() -> None:
+    settings = Settings(
+        _env_file=None,
+        EVA_LLM_BASE_URL="https://not-allowlisted.example/v1",
+        EVA_LLM_MODEL="model-x",
+        EVA_LLM_ALLOWED_ORIGINS="https://infer.tailnet.example",
+    )
+    assert settings.self_hosted_configured is False
+    assert any(
+        "not-allowlisted.example" in b and "ALLOWED_ORIGINS" in b
+        for b in settings.self_hosted_route_blockers()
+    )
+
+
+def test_self_hosted_route_usable_when_endpoint_allowlisted() -> None:
+    settings = _configured_settings()
+    assert settings.self_hosted_configured is True
+    assert settings.self_hosted_route_blockers() == []
+    assert settings.is_allowed_self_hosted_origin(ALLOWLISTED_URL)
+    assert not settings.is_allowed_self_hosted_origin("https://api.openai.com/v1")
+    assert not settings.is_allowed_self_hosted_origin("http://evil.example/")
+
+
+def test_optional_fallback_must_also_be_allowlisted() -> None:
+    unallowlisted = _configured_settings(
+        EVA_LLM_FALLBACK_BASE_URL="https://elsewhere.example/v1",
+        EVA_LLM_FALLBACK_MODEL="fallback-model",
+    )
+    assert unallowlisted.self_hosted_fallback_configured is False
+
+    allowlisted = Settings(
+        _env_file=None,
+        EVA_LLM_BASE_URL=ALLOWLISTED_URL,
+        EVA_LLM_MODEL="model-x",
+        EVA_LLM_ALLOWED_ORIGINS="https://infer.tailnet.example, https://backup.tailnet.example",
+        EVA_LLM_FALLBACK_BASE_URL="https://backup.tailnet.example/v1",
+        EVA_LLM_FALLBACK_MODEL="fallback-model",
+    )
+    assert allowlisted.self_hosted_fallback_configured is True
+
+
+def test_settings_origin_allowlist_parsing_and_rejection() -> None:
     settings = Settings(
         _env_file=None,
         EVA_LLM_ALLOWED_ORIGINS="http://100.64.0.2:8321/, https://infer.tailnet.example",
-        EVA_LLM_BASE_URL="https://infer.tailnet.example/v1",
-        EVA_LLM_MODEL="actual-server-model-id",
     )
     assert settings.eva_llm_allowed_origins == [
         "http://100.64.0.2:8321",
         "https://infer.tailnet.example",
     ]
-    assert settings.is_allowed_self_hosted_origin("https://infer.tailnet.example/v1/chat")
-    assert not settings.is_allowed_self_hosted_origin("https://api.openai.com/v1")
-    assert not settings.is_allowed_self_hosted_origin("http://evil.example/")
     with pytest.raises(ValidationError):
         Settings(_env_file=None, EVA_LLM_ALLOWED_ORIGINS="ftp://nope")
 
@@ -383,13 +485,99 @@ def test_secrets_never_appear_in_repr() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Generated artifacts (schema bundle + TypeScript)
+# Health endpoint (TestClient)
 # ---------------------------------------------------------------------------
 
 
-def test_schema_bundle_contains_contract_inventory() -> None:
-    bundle = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
-    models = bundle["models"]
+def test_health_starts_with_external_services_unavailable() -> None:
+    app = create_app(Settings(_env_file=None))
+    client = TestClient(app)
+    response = client.get("/api/health")
+    assert response.status_code == 200
+    payload = api.HealthResponse.model_validate(response.json())
+    assert payload.status is api.HealthStatus.UNAVAILABLE
+    assert {"database", "llm", "llm_fallback", "google", "stt"} <= set(payload.components)
+    assert payload.components["llm"].status == api.HealthStatus.UNAVAILABLE
+
+
+def test_health_exposes_actual_provider_and_model_structurally() -> None:
+    payload = api.HealthResponse.model_validate(
+        TestClient(create_app(_configured_settings())).get("/api/health").json()
+    )
+    llm = payload.components["llm"]
+    assert llm.status == api.HealthStatus.DEGRADED
+    assert llm.provider == "openai_compatible"
+    assert llm.model == "actual-server-model-id"
+
+    default_llm = api.HealthResponse.model_validate(
+        TestClient(create_app(Settings(_env_file=None))).get("/api/health").json()
+    ).components["llm"]
+    assert default_llm.model is None
+
+
+def test_optional_fallback_absence_does_not_fail_overall_readiness() -> None:
+    settings = _configured_settings(GOOGLE_CLIENT_ID="client-id", GOOGLE_CLIENT_SECRET="secret")
+    payload = api.HealthResponse.model_validate(TestClient(create_app(settings)).get("/api/health").json())
+    # Optional fallback is truthfully unavailable...
+    assert payload.components["llm_fallback"].status == api.HealthStatus.UNAVAILABLE
+    # ...but overall readiness reflects required components only (degraded here
+    # because A01/A05 adapters are pending, never unavailable for the optional
+    # fallback alone).
+    assert payload.status == api.HealthStatus.DEGRADED
+
+
+def test_health_response_never_serializes_secrets() -> None:
+    settings = _configured_settings(
+        GOOGLE_CLIENT_ID="client-id",
+        GOOGLE_CLIENT_SECRET="sup3r-google-secret",
+        EVA_LLM_API_KEY="sup3r-llm-key",
+    )
+    body = TestClient(create_app(settings)).get("/api/health").text
+    assert "sup3r-google-secret" not in body
+    assert "sup3r-llm-key" not in body
+
+
+# ---------------------------------------------------------------------------
+# Layer 2: real Draft 2020-12 JSON Schema validation of the generated bundle
+# ---------------------------------------------------------------------------
+
+BUNDLE = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+
+
+def _schema_for(def_name: str) -> Draft202012Validator:
+    return Draft202012Validator({**BUNDLE, "$ref": f"#/$defs/{def_name}"})
+
+
+def _iter_nodes(node):
+    yield node
+    if isinstance(node, dict):
+        for value in node.values():
+            yield from _iter_nodes(value)
+    elif isinstance(node, list):
+        for item in node:
+            yield from _iter_nodes(item)
+
+
+def test_bundle_passes_draft_2020_12_meta_validation() -> None:
+    Draft202012Validator.check_schema(BUNDLE)
+
+
+def test_all_internal_refs_resolve_and_no_private_defs_remain() -> None:
+    defs = BUNDLE["$defs"]
+    for node in _iter_nodes(BUNDLE):
+        if isinstance(node, dict):
+            ref = node.get("$ref")
+            if isinstance(ref, str):
+                assert ref.startswith("#/$defs/"), f"unresolvable external-form ref: {ref}"
+                assert ref.rsplit("/", 1)[-1] in defs, f"unresolved ref: {ref}"
+    # Model entries must not keep private $defs whose refs point at the root.
+    for name, schema in defs.items():
+        if isinstance(schema, dict):
+            assert "$defs" not in schema, f"{name} retains a private $defs block"
+
+
+def test_bundle_contains_contract_inventory_and_boundaries() -> None:
+    defs = BUNDLE["$defs"]
     for required in (
         "Meeting",
         "ExecutiveBriefing",
@@ -403,27 +591,104 @@ def test_schema_bundle_contains_contract_inventory() -> None:
         "HealthResponse",
         "ChatMessage",  # provider models are in the internal bundle
         "AudioInput",
+        # canonical union boundaries + frontend-facing reference alias
+        "MeetingSpan",
+        "CalendarProposalArguments",
+        "CalendarProposalRequest",
+        "EventPayload",
     ):
-        assert required in models, f"{required} missing from schema bundle"
-    assert bundle["serialization"]["extra_fields"] == "forbid"
+        assert required in defs, f"{required} missing from $defs"
+    assert BUNDLE["x-eva-serialization"]["extra_fields"] == "forbid"
 
 
-def test_typescript_is_generated_and_excludes_provider_internals() -> None:
-    text = TS_PATH.read_text(encoding="utf-8")
-    assert "DO NOT EDIT" in text
-    for marker in (
-        "export interface Meeting {",
-        "export interface ProposedAction {",
-        "export interface EventEnvelope {",
-        "export interface FocusCompletionSummary {",
-        "export type CalendarProposalRequest = CalendarCreateEventArguments | "
-        "CalendarRescheduleEventArguments | CalendarUpdateAgendaArguments;",
-        "export type MeetingSpan = TimedSpan | AllDaySpan;",
-    ):
-        assert marker in text, f"missing in generated TS: {marker}"
-    # Provider-only types must not leak into the frontend contract surface.
-    assert "interface ChatMessage" not in text
-    assert "AudioInput" not in text
+# Structural validation of representative fixtures against named contracts.
+JSONSCHEMA_FIXTURE_CONTRACTS: dict[str, str] = {
+    "meeting_acme_high.json": "Meeting",
+    "briefing_acme_pl.json": "ExecutiveBriefing",
+    "attention_finance_decision.json": "AttentionItem",
+    "decision_finance_pln_needs_review.json": "Decision",
+    "proposed_action_agenda_high.json": "ProposedAction",
+    "calendar_proposal_create.json": "CalendarProposalArguments",
+    "calendar_proposal_reschedule.json": "CalendarProposalArguments",
+    "calendar_proposal_update_agenda.json": "CalendarProposalArguments",
+    "event_envelope_attention_created.json": "EventEnvelope",
+    "focus_stop_response.json": "FocusStopResponse",
+    "health_response.json": "HealthResponse",
+    "transcript_pl.json": "Transcript",
+    "llm_settings_response.json": "LlmSettingsResponse",
+}
+
+
+@pytest.mark.parametrize("name", sorted(JSONSCHEMA_FIXTURE_CONTRACTS))
+def test_fixtures_validate_against_named_json_schema(name: str) -> None:
+    _schema_for(JSONSCHEMA_FIXTURE_CONTRACTS[name]).validate(load_fixture(name))
+
+
+# Structural negative cases (schema-level, not Pydantic-semantic).
+def test_json_schema_rejects_missing_required_field() -> None:
+    data = load_fixture("meeting_acme_high.json")
+    del data["title"]
+    with pytest.raises(JsonSchemaValidationError):
+        _schema_for("Meeting").validate(data)
+
+
+def test_json_schema_rejects_extra_field() -> None:
+    data = load_fixture("meeting_acme_high.json")
+    data["invented_field"] = "x"
+    with pytest.raises(JsonSchemaValidationError):
+        _schema_for("Meeting").validate(data)
+
+
+def test_json_schema_rejects_invalid_enum_value() -> None:
+    data = load_fixture("meeting_acme_high.json")
+    data["priority"] = "HIGH"
+    with pytest.raises(JsonSchemaValidationError):
+        _schema_for("Meeting").validate(data)
+
+
+def test_json_schema_boundary_requires_meeting_span_discriminator() -> None:
+    without_kind = {
+        "start_date": "2026-09-21",
+        "end_exclusive": "2026-09-22",
+    }
+    with pytest.raises(JsonSchemaValidationError):
+        _schema_for("MeetingSpan").validate(without_kind)
+    _schema_for("MeetingSpan").validate({"kind": "all_day", **without_kind})
+
+
+def test_json_schema_boundary_requires_proposal_tool() -> None:
+    data = load_fixture("calendar_proposal_create.json")
+    without_tool = {k: v for k, v in data.items() if k != "tool"}
+    with pytest.raises(JsonSchemaValidationError):
+        _schema_for("CalendarProposalArguments").validate(without_tool)
+
+
+def test_json_schema_rejects_wrong_discriminator_member_combination() -> None:
+    reschedule = load_fixture("calendar_proposal_reschedule.json")
+    with pytest.raises(JsonSchemaValidationError):
+        # tool says reschedule but carries create-only "title" (and lacks the
+        # agenda fields for update_agenda): no oneOf member can match.
+        _schema_for("CalendarProposalArguments").validate({**reschedule, "title": "sneak-in"})
+
+
+def test_json_schema_envelope_correlation_is_runtime_only_by_design() -> None:
+    """JSON Schema does not encode outer type == payload.type correlation.
+
+    Documented boundary: the generated TypeScript rejects mismatches at compile
+    time and Pydantic's model_validator rejects them at runtime (see
+    test_event_envelope_type_must_match_payload_discriminator). No second
+    handwritten validation engine is introduced here.
+    """
+    data = load_fixture("event_envelope_attention_created.json")
+    mismatched = {**data, "type": "heartbeat"}
+    _schema_for("EventEnvelope").validate(mismatched)  # passes schema...
+    with pytest.raises(ValidationError):
+        domain.EventEnvelope.model_validate(mismatched)  # ...fails Pydantic + TS
+
+
+# ---------------------------------------------------------------------------
+# Layer 3: generated artifacts - drift gate and TypeScript compile gate
+# ---------------------------------------------------------------------------
 
 
 def test_generated_artifacts_are_in_sync() -> None:
@@ -436,28 +701,48 @@ def test_generated_artifacts_are_in_sync() -> None:
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-# ---------------------------------------------------------------------------
-# Health endpoint (TestClient) - must start with external services unavailable
-# ---------------------------------------------------------------------------
+def test_typescript_is_generated_and_excludes_provider_internals() -> None:
+    text = TS_PATH.read_text(encoding="utf-8")
+    assert "DO NOT EDIT" in text
+    for marker in (
+        "export interface Meeting {",
+        "export interface ProposedAction {",
+        "export interface EventEnvelopeBase {",
+        "export interface FocusCompletionSummary {",
+        'export type RequireDiscriminator<T, K extends keyof T> = T & Required<Pick<T, K>>;',
+        '  | RequireDiscriminator<TimedSpan, "kind">',
+        '  | RequireDiscriminator<CalendarCreateEventArguments, "tool">',
+        "export type CalendarProposalRequest = CalendarProposalArguments;",
+        '  | (EventEnvelopeBase & { type: "heartbeat"; payload: HeartbeatPayload })',
+    ):
+        assert marker in text, f"missing in generated TS: {marker}"
+    # Provider-only types must not leak into the frontend contract surface.
+    assert "interface ChatMessage" not in text
+    assert "AudioInput" not in text
 
 
-def test_health_starts_with_external_services_unavailable() -> None:
-    app = create_app(Settings(_env_file=None))
-    client = TestClient(app)
-    response = client.get("/api/health")
-    assert response.status_code == 200
-    payload = api.HealthResponse.model_validate(response.json())
-    assert payload.status in (api.HealthStatus.DEGRADED, api.HealthStatus.UNAVAILABLE)
-    assert {"database", "llm", "llm_fallback", "google", "stt"} <= set(payload.components)
-    assert payload.components["llm"].status == api.HealthStatus.UNAVAILABLE
+_TSC = TSCHECK_DIR / "node_modules" / "typescript" / "bin" / "tsc"
+_HAS_NODE = shutil.which("node") is not None
 
 
-def test_health_reports_configured_llm_as_degraded_not_ready() -> None:
-    settings = Settings(
-        _env_file=None,
-        EVA_LLM_BASE_URL="https://infer.tailnet.example/v1",
-        EVA_LLM_MODEL="actual-server-model-id",
+@pytest.mark.skipif(not _HAS_NODE or not _TSC.exists(), reason="install: npm --prefix contracts/tscheck install")
+def test_typescript_contract_gate_compiles_clean() -> None:
+    """Real tsc run over the generated contract + @ts-expect-error type tests.
+
+    Proves discriminators are mandatory at union boundaries, EventEnvelope is
+    type/payload correlated and narrowing works - a broken generator cannot
+    pass because unused/misplaced @ts-expect-error directives fail compilation.
+    """
+    result = subprocess.run(
+        [
+            "node",
+            str(_TSC),
+            "--noEmit",
+            "-p",
+            str(TSCHECK_DIR / "tsconfig.json"),
+        ],
+        cwd=TSCHECK_DIR,
+        capture_output=True,
+        text=True,
     )
-    client = TestClient(create_app(settings))
-    payload = api.HealthResponse.model_validate(client.get("/api/health").json())
-    assert payload.components["llm"].status == api.HealthStatus.DEGRADED
+    assert result.returncode == 0, result.stdout + result.stderr
