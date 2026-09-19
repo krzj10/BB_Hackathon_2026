@@ -609,22 +609,7 @@
           "type": "string"
         },
         "span": {
-          "discriminator": {
-            "mapping": {
-              "all_day": "#/$defs/AllDaySpan",
-              "timed": "#/$defs/TimedSpan"
-            },
-            "propertyName": "kind"
-          },
-          "oneOf": [
-            {
-              "$ref": "#/$defs/TimedSpan"
-            },
-            {
-              "$ref": "#/$defs/AllDaySpan"
-            }
-          ],
-          "title": "Span"
+          "$ref": "#/$defs/MeetingSpan"
         },
         "attendees": {
           "items": {
@@ -1636,22 +1621,7 @@
           "type": "string"
         },
         "span": {
-          "discriminator": {
-            "mapping": {
-              "all_day": "#/$defs/AllDaySpan",
-              "timed": "#/$defs/TimedSpan"
-            },
-            "propertyName": "kind"
-          },
-          "oneOf": [
-            {
-              "$ref": "#/$defs/TimedSpan"
-            },
-            {
-              "$ref": "#/$defs/AllDaySpan"
-            }
-          ],
-          "title": "Span"
+          "$ref": "#/$defs/MeetingSpan"
         },
         "attendees": {
           "items": {
@@ -1709,22 +1679,7 @@
           "$ref": "#/$defs/MeetingRef"
         },
         "new_span": {
-          "discriminator": {
-            "mapping": {
-              "all_day": "#/$defs/AllDaySpan",
-              "timed": "#/$defs/TimedSpan"
-            },
-            "propertyName": "kind"
-          },
-          "oneOf": [
-            {
-              "$ref": "#/$defs/TimedSpan"
-            },
-            {
-              "$ref": "#/$defs/AllDaySpan"
-            }
-          ],
-          "title": "New Span"
+          "$ref": "#/$defs/MeetingSpan"
         },
         "expected_etag": {
           "anyOf": [
@@ -2396,62 +2351,7 @@
           "$ref": "#/$defs/EventType"
         },
         "payload": {
-          "discriminator": {
-            "mapping": {
-              "action_proposed": "#/$defs/ActionProposedPayload",
-              "action_status_changed": "#/$defs/ActionStatusChangedPayload",
-              "attention_item_created": "#/$defs/AttentionItemCreatedPayload",
-              "briefing_ready": "#/$defs/BriefingReadyPayload",
-              "decision_created": "#/$defs/DecisionCreatedPayload",
-              "decision_updated": "#/$defs/DecisionUpdatedPayload",
-              "focus_ended": "#/$defs/FocusEndedPayload",
-              "focus_started": "#/$defs/FocusStartedPayload",
-              "heartbeat": "#/$defs/HeartbeatPayload",
-              "inference_unavailable": "#/$defs/InferenceUnavailablePayload",
-              "transcript_ready": "#/$defs/TranscriptReadyPayload",
-              "voice_state_changed": "#/$defs/VoiceStateChangedPayload"
-            },
-            "propertyName": "type"
-          },
-          "oneOf": [
-            {
-              "$ref": "#/$defs/VoiceStateChangedPayload"
-            },
-            {
-              "$ref": "#/$defs/TranscriptReadyPayload"
-            },
-            {
-              "$ref": "#/$defs/BriefingReadyPayload"
-            },
-            {
-              "$ref": "#/$defs/AttentionItemCreatedPayload"
-            },
-            {
-              "$ref": "#/$defs/DecisionCreatedPayload"
-            },
-            {
-              "$ref": "#/$defs/DecisionUpdatedPayload"
-            },
-            {
-              "$ref": "#/$defs/FocusStartedPayload"
-            },
-            {
-              "$ref": "#/$defs/FocusEndedPayload"
-            },
-            {
-              "$ref": "#/$defs/ActionProposedPayload"
-            },
-            {
-              "$ref": "#/$defs/ActionStatusChangedPayload"
-            },
-            {
-              "$ref": "#/$defs/InferenceUnavailablePayload"
-            },
-            {
-              "$ref": "#/$defs/HeartbeatPayload"
-            }
-          ],
-          "title": "Payload"
+          "$ref": "#/$defs/EventPayload"
         }
       },
       "required": [

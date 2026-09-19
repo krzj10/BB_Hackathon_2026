@@ -211,6 +211,47 @@ def _boundary_metadata(alias_schema: dict[str, Any]) -> tuple[str | None, list[s
     return prop, members, mapping
 
 
+def _build_boundaries() -> tuple[
+    dict[str, tuple[str | None, list[str], dict[str, str]]], dict[frozenset, str]
+]:
+    """(alias name -> metadata, member-set signature -> alias name).
+
+    Derived mechanically from Pydantic TypeAdapter metadata - never hand-mapped.
+    """
+    boundaries: dict[str, tuple[str | None, list[str], dict[str, str]]] = {}
+    lookup: dict[frozenset, str] = {}
+    for name, alias in UNION_ALIASES.items():
+        prop, members, mapping = _boundary_metadata(_schema_of(alias))
+        boundaries[name] = (prop, members, mapping)
+        if prop and members:
+            lookup[frozenset(members)] = name
+    return boundaries, lookup
+
+
+def _normalize_nested_boundaries(node: Any, lookup: dict[frozenset, str]) -> Any:
+    """Schema-aware rewrite: any nested discriminated-union node whose member
+    set matches a canonical named boundary is replaced with a $ref to that
+    strengthened definition. Raw member models and unrelated unions are left
+    untouched; the boundary definitions themselves keep their own oneOf."""
+    if isinstance(node, dict):
+        if "oneOf" in node and "discriminator" in node:
+            members = frozenset(
+                s["$ref"].rsplit("/", 1)[-1]
+                for s in node["oneOf"]
+                if isinstance(s, dict) and "$ref" in s
+            )
+            alias = lookup.get(members)
+            if alias is not None and len(members) == len(node["oneOf"]):
+                replacement: dict[str, Any] = {"$ref": f"#/$defs/{alias}"}
+                if "description" in node:
+                    replacement = {"description": node["description"], **replacement}
+                return replacement
+        return {k: _normalize_nested_boundaries(v, lookup) for k, v in node.items()}
+    if isinstance(node, list):
+        return [_normalize_nested_boundaries(v, lookup) for v in node]
+    return node
+
+
 # ---------------------------------------------------------------------------
 # Schema bundle (self-contained Draft 2020-12)
 # ---------------------------------------------------------------------------
@@ -218,16 +259,25 @@ def _boundary_metadata(alias_schema: dict[str, Any]) -> tuple[str | None, list[s
 
 def build_schema_bundle() -> str:
     registry = DefRegistry()
+    _boundaries, boundary_lookup = _build_boundaries()
 
     for group in (DOMAIN_MODELS, API_MODELS, PROVIDER_MODELS):
         for model in group:
-            registry.add(model.__name__, registry.absorb(_schema_of(model)))
+            # Normalize the whole document (root + private defs) so nested
+            # discriminated unions reuse the strengthened named boundary
+            # definitions and every merged copy of a def is identical.
+            schema = _normalize_nested_boundaries(_schema_of(model), boundary_lookup)
+            registry.add(model.__name__, registry.absorb(schema))
 
     # Discriminated-union boundary entries: keep Pydantic's oneOf+discriminator
     # metadata and additionally require the discriminator property at the
     # boundary (the member models keep their canonical defaults).
     for name, alias in UNION_ALIASES.items():
-        alias_schema = registry.absorb(_schema_of(alias))
+        alias_schema = dict(_schema_of(alias))
+        # Private member defs are normalized like every other schema; only the
+        # boundary root keeps its canonical inline oneOf.
+        for dname, sub in (alias_schema.pop("$defs", None) or {}).items():
+            registry.add(dname, _normalize_nested_boundaries(sub, boundary_lookup))
         prop, _members, _mapping = _boundary_metadata(alias_schema)
         if prop:
             registry.add(name, {"allOf": [alias_schema, {"required": [prop]}]})
@@ -360,11 +410,8 @@ def _emit_interface(name: str, schema: dict[str, Any], drop_props: tuple[str, ..
 
 def build_typescript() -> str:
     # Boundary metadata first: aliases and the inline-union lookup.
-    boundaries: dict[str, tuple[str | None, list[str], dict[str, str]]] = {}
-    for name, alias in UNION_ALIASES.items():
-        alias_schema = _schema_of(alias)
-        boundaries[name] = _boundary_metadata(alias_schema)
-        _UNION_LOOKUP[frozenset(boundaries[name][1])] = name
+    boundaries, boundary_lookup = _build_boundaries()
+    _UNION_LOOKUP.update(boundary_lookup)
 
     exported_schemas = [_schema_of(m) for m in DOMAIN_MODELS + API_MODELS]
     defs: dict[str, Any] = {}
@@ -447,11 +494,14 @@ def build_typescript() -> str:
         parts.append(f"export type {name} = {target['$ref'].rsplit('/', 1)[-1]};\n\n")
 
     # Correlated EventEnvelope: outer `type` must match the payload's own
-    # discriminator. Derived mechanically from Pydantic mapping metadata.
+    # discriminator, and the payload itself crosses the EventPayload boundary
+    # so its discriminator is mandatory too. Derived mechanically from Pydantic
+    # mapping metadata.
     event_prop, _event_members, event_mapping = boundaries["EventPayload"]
     if event_prop and event_mapping:
         variants = "\n".join(
-            f"  | (EventEnvelopeBase & {{ type: {json.dumps(value)}; payload: {member} }})"
+            f"  | (EventEnvelopeBase & {{ type: {json.dumps(value)}; "
+            f"payload: RequireDiscriminator<{member}, {json.dumps(event_prop)}> }})"
             for value, member in event_mapping.items()
         )
         parts.append(

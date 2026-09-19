@@ -671,6 +671,60 @@ def test_json_schema_rejects_wrong_discriminator_member_combination() -> None:
         _schema_for("CalendarProposalArguments").validate({**reschedule, "title": "sneak-in"})
 
 
+# Nested discriminated-union boundaries: removing the discriminator from a
+# nested object that crosses a union boundary must fail BOTH the JSON Schema
+# (via $ref to the strengthened named boundary) and Pydantic.
+def test_json_schema_meeting_requires_nested_span_kind() -> None:
+    data = load_fixture("meeting_acme_high.json")
+    del data["span"]["kind"]
+    with pytest.raises(JsonSchemaValidationError):
+        _schema_for("Meeting").validate(data)
+    with pytest.raises(ValidationError):
+        domain.Meeting.model_validate(data)
+
+
+def test_json_schema_calendar_create_requires_nested_span_kind() -> None:
+    data = load_fixture("calendar_proposal_create.json")
+    del data["span"]["kind"]
+    with pytest.raises(JsonSchemaValidationError):
+        _schema_for("CalendarProposalArguments").validate(data)
+    with pytest.raises(ValidationError):
+        CALENDAR_PROPOSAL_ADAPTER.validate_python(data)
+
+
+def test_json_schema_calendar_reschedule_requires_nested_new_span_kind() -> None:
+    data = load_fixture("calendar_proposal_reschedule.json")
+    del data["new_span"]["kind"]
+    with pytest.raises(JsonSchemaValidationError):
+        _schema_for("CalendarProposalArguments").validate(data)
+    with pytest.raises(ValidationError):
+        CALENDAR_PROPOSAL_ADAPTER.validate_python(data)
+
+
+def test_json_schema_event_envelope_requires_payload_type() -> None:
+    data = load_fixture("event_envelope_attention_created.json")
+    del data["payload"]["type"]  # outer type and all other fields stay valid
+    with pytest.raises(JsonSchemaValidationError):
+        _schema_for("EventEnvelope").validate(data)
+    with pytest.raises(ValidationError):
+        domain.EventEnvelope.model_validate(data)
+
+
+def test_json_schema_nested_boundaries_reuse_named_definitions() -> None:
+    """Nested usages must $ref the strengthened boundary, not embed a weaker
+    inline duplicate of the same union."""
+    defs = BUNDLE["$defs"]
+    for def_name, prop in (
+        ("Meeting", "span"),
+        ("CalendarCreateEventArguments", "span"),
+        ("CalendarRescheduleEventArguments", "new_span"),
+        ("EventEnvelope", "payload"),
+    ):
+        assert defs[def_name]["properties"][prop] == {
+            "$ref": f"#/$defs/{'MeetingSpan' if 'span' in prop else 'EventPayload'}"
+        }, f"{def_name}.{prop} must reference the strengthened boundary definition"
+
+
 def test_json_schema_envelope_correlation_is_runtime_only_by_design() -> None:
     """JSON Schema does not encode outer type == payload.type correlation.
 
@@ -713,7 +767,7 @@ def test_typescript_is_generated_and_excludes_provider_internals() -> None:
         '  | RequireDiscriminator<TimedSpan, "kind">',
         '  | RequireDiscriminator<CalendarCreateEventArguments, "tool">',
         "export type CalendarProposalRequest = CalendarProposalArguments;",
-        '  | (EventEnvelopeBase & { type: "heartbeat"; payload: HeartbeatPayload })',
+        '  | (EventEnvelopeBase & { type: "heartbeat"; payload: RequireDiscriminator<HeartbeatPayload, "type"> })',
     ):
         assert marker in text, f"missing in generated TS: {marker}"
     # Provider-only types must not leak into the frontend contract surface.

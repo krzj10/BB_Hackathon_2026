@@ -789,16 +789,16 @@ export type CalendarProposalRequest = CalendarProposalArguments;
 /** WebSocket envelope with correlated `type`/payload: a mismatch is a
  * compile-time error. Pydantic enforces the same invariant at runtime. */
 export type EventEnvelope =
-  | (EventEnvelopeBase & { type: "action_proposed"; payload: ActionProposedPayload })
-  | (EventEnvelopeBase & { type: "action_status_changed"; payload: ActionStatusChangedPayload })
-  | (EventEnvelopeBase & { type: "attention_item_created"; payload: AttentionItemCreatedPayload })
-  | (EventEnvelopeBase & { type: "briefing_ready"; payload: BriefingReadyPayload })
-  | (EventEnvelopeBase & { type: "decision_created"; payload: DecisionCreatedPayload })
-  | (EventEnvelopeBase & { type: "decision_updated"; payload: DecisionUpdatedPayload })
-  | (EventEnvelopeBase & { type: "focus_ended"; payload: FocusEndedPayload })
-  | (EventEnvelopeBase & { type: "focus_started"; payload: FocusStartedPayload })
-  | (EventEnvelopeBase & { type: "heartbeat"; payload: HeartbeatPayload })
-  | (EventEnvelopeBase & { type: "inference_unavailable"; payload: InferenceUnavailablePayload })
-  | (EventEnvelopeBase & { type: "transcript_ready"; payload: TranscriptReadyPayload })
-  | (EventEnvelopeBase & { type: "voice_state_changed"; payload: VoiceStateChangedPayload });
+  | (EventEnvelopeBase & { type: "action_proposed"; payload: RequireDiscriminator<ActionProposedPayload, "type"> })
+  | (EventEnvelopeBase & { type: "action_status_changed"; payload: RequireDiscriminator<ActionStatusChangedPayload, "type"> })
+  | (EventEnvelopeBase & { type: "attention_item_created"; payload: RequireDiscriminator<AttentionItemCreatedPayload, "type"> })
+  | (EventEnvelopeBase & { type: "briefing_ready"; payload: RequireDiscriminator<BriefingReadyPayload, "type"> })
+  | (EventEnvelopeBase & { type: "decision_created"; payload: RequireDiscriminator<DecisionCreatedPayload, "type"> })
+  | (EventEnvelopeBase & { type: "decision_updated"; payload: RequireDiscriminator<DecisionUpdatedPayload, "type"> })
+  | (EventEnvelopeBase & { type: "focus_ended"; payload: RequireDiscriminator<FocusEndedPayload, "type"> })
+  | (EventEnvelopeBase & { type: "focus_started"; payload: RequireDiscriminator<FocusStartedPayload, "type"> })
+  | (EventEnvelopeBase & { type: "heartbeat"; payload: RequireDiscriminator<HeartbeatPayload, "type"> })
+  | (EventEnvelopeBase & { type: "inference_unavailable"; payload: RequireDiscriminator<InferenceUnavailablePayload, "type"> })
+  | (EventEnvelopeBase & { type: "transcript_ready"; payload: RequireDiscriminator<TranscriptReadyPayload, "type"> })
+  | (EventEnvelopeBase & { type: "voice_state_changed"; payload: RequireDiscriminator<VoiceStateChangedPayload, "type"> });
 

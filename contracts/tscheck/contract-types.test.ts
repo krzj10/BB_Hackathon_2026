@@ -80,16 +80,35 @@ export const missingPayloadType: EventPayload = {
 
 declare const attentionPayload: AttentionItemCreatedPayload;
 
-// @ts-expect-error outer event type must match the payload discriminator
-export const mismatchedEvent: EventEnvelope = {
+// Two-step assignment keeps the reported error position stable on the
+// assignment line regardless of how deeply TypeScript drills into literals.
+const mismatchedCandidate = {
   schema_version: 1,
   event_id: "evt-test-bad",
   sequence: 1,
   session_id: "session-test",
   occurred_at: "2026-09-21T12:00:00+02:00",
-  type: "heartbeat",
+  type: "heartbeat" as const,
   payload: attentionPayload,
 };
+
+// @ts-expect-error outer event type must match the payload discriminator
+export const mismatchedEvent: EventEnvelope = mismatchedCandidate;
+
+const missingInnerTypeCandidate = {
+  schema_version: 1,
+  event_id: "evt-test",
+  sequence: 1,
+  session_id: "session-test",
+  occurred_at: "2026-09-19T19:00:00Z",
+  type: "heartbeat" as const,
+  payload: {
+    server_time: "2026-09-19T19:00:00Z",
+  },
+};
+
+// @ts-expect-error EventEnvelope payload discriminator is mandatory at the EventPayload boundary
+export const missingInnerPayloadType: EventEnvelope = missingInnerTypeCandidate;
 
 // ---------------------------------------------------------------------------
 // Narrowing (correlated envelope must narrow payload by outer type)
