@@ -932,3 +932,119 @@ def test_late_arrival_overlap_uses_internal_date(env) -> None:
     assert [i.source_id for i in result.new_items] == ["late-bird"]  # processed once
     again = env.service.poll_recent()
     assert again.new_items == ()                               # durable exactly-once
+
+
+# =========================================================================== #
+# REMEDIATION - evidence fidelity must not trap the cursor (PART 9-14)
+# =========================================================================== #
+
+
+def _real_path_service(env, responses):
+    """GmailIngestionService over the REAL GmailService with scripted reads;
+    the cursor is pre-seeded one hour back so runs are steady-state polls."""
+    from app.google.gmail import GmailService
+
+    env.cursors.set(GMAIL_CURSOR_KEY, (T0 - timedelta(hours=1)).isoformat(), now=T0)
+    sink = RecordingSink(env.rules)
+    service = GmailIngestionService(
+        gmail_source_factory=lambda: GmailService(ScriptedHttp(responses)),
+        cursors=env.cursors, attention_repo=env.repo, sink=sink, clock=lambda: T0,
+    )
+    return service, sink
+
+
+def _threads_page() -> dict:
+    return {"threads": [{"id": "t1"}]}
+
+
+def _html_raw(msg_id: str) -> dict:
+    internal = int((T0 - timedelta(seconds=60)).timestamp() * 1000)
+    return {
+        "id": msg_id,
+        "internalDate": str(internal),
+        "payload": {
+            "mimeType": "text/html",
+            "headers": [
+                {"name": "From", "value": "vendor@example.com"},
+                {"name": "Subject", "value": "Estimate"},
+                {"name": "Date", "value": "Mon, 21 Sep 2026 09:59:00 +0000"},
+            ],
+            "body": {"data": b64("<div>Please review the estimate &amp; sign</div>")},
+        },
+    }
+
+
+def test_html_only_message_advances_cursor_and_dedups_second_poll(env) -> None:
+    payload = {"messages": [_html_raw("html-c-1")]}
+    service, sink = _real_path_service(env, [_threads_page(), payload,
+                                             _threads_page(), payload])
+
+    first = service.poll_recent()
+    assert sink.calls == ["html-c-1"]                          # ingested once
+    assert env.cursors.is_seen("gmail", "html-c-1")
+    assert first.retrieval_status == "complete"                # fidelity note ≠ unsafe
+    advanced = env.cursors.get(GMAIL_CURSOR_KEY)
+    assert advanced == T0.isoformat()                          # cursor ADVANCED
+
+    second = service.poll_recent()
+    assert second.new_items == () and sink.calls == ["html-c-1"]  # deduped, no re-ingest
+
+
+def test_attachment_message_advances_cursor(env) -> None:
+    raw = raw_message("att-c-1", "See attached invoice.", "Mon, 21 Sep 2026 09:59:00 +0000")
+    raw["payload"] = {
+        "mimeType": "multipart/mixed",
+        "headers": [
+            {"name": "From", "value": "vendor@example.com"},
+            {"name": "Subject", "value": "Invoice"},
+            {"name": "Date", "value": "Mon, 21 Sep 2026 09:59:00 +0000"},
+        ],
+        "parts": [
+            {"mimeType": "text/plain", "body": {"data": b64("See attached invoice.")}},
+            {"mimeType": "application/pdf", "filename": "invoice.pdf", "body": {}},
+        ],
+    }
+    service, sink = _real_path_service(env, [_threads_page(), {"messages": [raw]}])
+
+    result = service.poll_recent()
+
+    assert sink.calls == ["att-c-1"] and env.cursors.is_seen("gmail", "att-c-1")
+    assert result.retrieval_status == "complete"               # attachment ≠ cursor stall
+    assert env.cursors.get(GMAIL_CURSOR_KEY) == T0.isoformat()
+
+
+def test_truncated_body_message_advances_cursor(env) -> None:
+    raw = raw_message("trunc-c-1", "x" * 21_000, "Mon, 21 Sep 2026 09:59:00 +0000")
+    service, sink = _real_path_service(env, [_threads_page(), {"messages": [raw]}])
+
+    result = service.poll_recent()
+
+    assert sink.calls == ["trunc-c-1"]                         # bounded body IS the contract
+    assert result.retrieval_status == "complete"
+    assert env.cursors.get(GMAIL_CURSOR_KEY) == T0.isoformat()
+
+
+def test_missing_rfc_date_with_valid_internal_advances_cursor(env) -> None:
+    raw = raw_message("nodate-c-1", "No header date here.", "Mon, 21 Sep 2026 09:59:00 +0000")
+    raw["payload"]["headers"] = [h for h in raw["payload"]["headers"] if h["name"] != "Date"]
+    service, sink = _real_path_service(env, [_threads_page(), {"messages": [raw]}])
+
+    result = service.poll_recent()
+
+    assert sink.calls == ["nodate-c-1"]                        # internalDate owns membership
+    assert result.retrieval_status == "complete"
+    assert env.cursors.get(GMAIL_CURSOR_KEY) == T0.isoformat()
+
+
+def test_malformed_raw_message_processed_others_holds_cursor(env) -> None:
+    good = raw_message("ok-c-1", "Fine.", "Mon, 21 Sep 2026 09:59:00 +0000")
+    bad = {"id": "bad-c-1", "internalDate": good["internalDate"],
+           "payload": {"mimeType": "text/plain", "headers": [], "body": {}}}
+    cursor_before = (T0 - timedelta(hours=1)).isoformat()
+    service, sink = _real_path_service(env, [_threads_page(), {"messages": [bad, good]}])
+
+    result = service.poll_recent()
+
+    assert sink.calls == ["ok-c-1"]                            # valid one still processed
+    assert result.retrieval_status == "partial"                # but loss is structural
+    assert env.cursors.get(GMAIL_CURSOR_KEY) == cursor_before  # cursor held, never blind

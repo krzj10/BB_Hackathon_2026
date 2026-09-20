@@ -201,6 +201,18 @@ class ThreadEvidence:
     #: internalDate per message id, aware UTC. A message absent from this map
     #: has no trustworthy provider timestamp and is NOT window-qualified.
     internal_dates: dict[str, datetime] = field(default_factory=dict)
+    #: INTERNAL cursor-safety signal (not a canonical contract), distinct from
+    #: ``retrieval_status``:
+    #: - retrieval_status = EVIDENCE FIDELITY of the normalized read (HTML
+    #:   fallback, skipped attachment, bounded body, missing RFC Date...);
+    #: - ingestion_complete = whether A06 may safely advance its cursor past
+    #:   this thread, i.e. NO potential message was structurally lost: a
+    #:   missing/invalid provider internalDate (window membership unknown),
+    #:   a non-object entry, or a raw message that could not be normalized
+    #:   into a canonical NormalizedSourceEvent sets this False. Benign
+    #:   fidelity notes never do - permanent content limits must not trap
+    #:   the polling cursor forever.
+    ingestion_complete: bool = True
 
 
 class GmailService:
@@ -339,21 +351,28 @@ class GmailService:
         )
         for raw in payload.get("messages") or []:
             if not isinstance(raw, dict):
+                # A potential Gmail message was structurally lost.
                 evidence.notes.append("skipped non-object message entry")
+                evidence.ingestion_complete = False
                 continue
             # Provider arrival time first: it owns ingestion-window
-            # membership. Missing/invalid values flag the thread PARTIAL;
-            # they are NEVER backfilled from the sender-controlled Date header.
+            # membership. Missing/invalid values flag the thread PARTIAL and
+            # cursor-unsafe; they are NEVER backfilled from the
+            # sender-controlled Date header.
             internal_at, internal_note = parse_internal_date(raw)
             if internal_at is not None and raw.get("id"):
                 evidence.internal_dates[raw["id"]] = internal_at
             elif internal_note is not None:
                 evidence.notes.append(internal_note)
+                evidence.ingestion_complete = False  # membership unknown
             try:
                 message = self._normalize_message(raw, retrieved_at, evidence.notes)
             except ValueError as exc:  # malformed message: honest partial result
                 evidence.notes.append(f"skipped malformed message: {exc}")
                 logger.warning("gmail: skipped malformed message in thread %s", thread_id)
+                # A raw message that cannot become a canonical event is a
+                # structural loss - the cursor must not pass it blindly.
+                evidence.ingestion_complete = False
                 continue
             if message is not None:
                 evidence.messages.append(message)

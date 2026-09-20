@@ -231,6 +231,7 @@ def test_missing_or_invalid_internal_date_flagged_safely(bad) -> None:
     evidence = service.get_thread("t")
     assert "msg-bad" not in evidence.internal_dates      # never guessed
     assert evidence.retrieval_status is RetrievalStatus.PARTIAL
+    assert evidence.ingestion_complete is False          # cursor-unsafe loss
     assert any("internalDate" in note for note in evidence.notes)
     # Notes carry ids only - no body content:
     assert all("Hello EVA" not in note for note in evidence.notes)
@@ -245,6 +246,85 @@ def test_parse_internal_date_helper_is_utc_and_strict() -> None:
     for bad in ({}, {"internalDate": "x"}, {"internalDate": "-1"}):
         value, note = parse_internal_date({"id": "m", **bad})
         assert value is None and note is not None
+
+
+# ---------------------------------------------------------------------------
+# Evidence fidelity vs ingestion completeness (cursor-safety split)
+# ---------------------------------------------------------------------------
+
+
+def test_html_only_partial_fidelity_but_ingestion_complete() -> None:
+    raw = {
+        "id": "msg-html2",
+        "internalDate": "1789985280000",
+        "payload": {
+            "mimeType": "text/html",
+            "headers": [{"name": "From", "value": "a@example.com"}],
+            "body": {"data": b64("<p>Invoice <b>1000</b></p>")},
+        },
+    }
+    service = GmailService(FakeHttp([{"messages": [raw]}]))
+    evidence = service.get_thread("t")
+    assert evidence.retrieval_status is RetrievalStatus.PARTIAL   # fidelity lost
+    assert evidence.ingestion_complete is True                    # cursor-safe
+
+
+def test_attachment_partial_fidelity_but_ingestion_complete() -> None:
+    raw = {
+        "id": "msg-att2",
+        "internalDate": "1789985280000",
+        "payload": {
+            "mimeType": "multipart/mixed",
+            "headers": [{"name": "From", "value": "a@example.com"}],
+            "parts": [
+                {"mimeType": "text/plain", "body": {"data": b64("see attached")}},
+                {"mimeType": "application/pdf", "filename": "invoice.pdf", "body": {}},
+            ],
+        },
+    }
+    service = GmailService(FakeHttp([{"messages": [raw]}]))
+    evidence = service.get_thread("t")
+    assert any("attachment skipped" in note for note in evidence.notes)
+    assert evidence.retrieval_status is RetrievalStatus.PARTIAL
+    assert evidence.ingestion_complete is True
+
+
+def test_truncated_body_partial_fidelity_but_ingestion_complete() -> None:
+    big = "x" * (MAX_BODY_CHARS + 500)
+    service = GmailService(FakeHttp([{"messages": [message(body_text=big)]}]))
+    evidence = service.get_thread("t")
+    assert any("truncated" in note for note in evidence.notes)
+    assert evidence.retrieval_status is RetrievalStatus.PARTIAL
+    assert evidence.ingestion_complete is True   # the bounded body IS the contract
+
+
+def test_missing_rfc_date_with_valid_internal_is_ingestion_complete() -> None:
+    raw = message("msg-nd2")  # helper carries a valid internalDate
+    raw["payload"]["headers"] = [h for h in raw["payload"]["headers"] if h["name"] != "Date"]
+    service = GmailService(FakeHttp([{"messages": [raw]}]))
+    evidence = service.get_thread("t")
+    assert any("Date header" in note for note in evidence.notes)
+    assert evidence.retrieval_status is RetrievalStatus.PARTIAL
+    assert evidence.ingestion_complete is True   # internalDate owns membership
+
+
+def test_malformed_canonical_message_marks_ingestion_incomplete() -> None:
+    broken = {"id": "msg-broken2", "internalDate": "1789985280000",
+              "payload": {"mimeType": "text/plain", "headers": [], "body": {}}}
+    service = GmailService(FakeHttp([{"messages": [broken, message("msg-ok2")]}]))
+    evidence = service.get_thread("t")
+    assert [m.source_id for m in evidence.messages] == ["msg-ok2"]
+    assert evidence.retrieval_status is RetrievalStatus.PARTIAL
+    assert evidence.ingestion_complete is False  # a potential message was lost
+
+
+def test_non_object_message_entry_marks_ingestion_incomplete_without_crash() -> None:
+    service = GmailService(FakeHttp([{"messages": ["not-a-dict", message("msg-ok3")]}]))
+    evidence = service.get_thread("t")
+    assert [m.source_id for m in evidence.messages] == ["msg-ok3"]
+    assert any("non-object" in note for note in evidence.notes)
+    assert evidence.retrieval_status is RetrievalStatus.PARTIAL
+    assert evidence.ingestion_complete is False
 
 
 # ---------------------------------------------------------------------------

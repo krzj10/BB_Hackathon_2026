@@ -25,6 +25,14 @@ Guarantees:
   sender-controlled RFC Date header;
 - a source is marked seen ONLY AFTER successful downstream ingestion, so a
   transient failure retries on the next overlapping poll;
+- cursor advancement tracks INGESTION completeness (no potential message was
+  structurally lost or left un-window-qualifiable), NOT evidence fidelity:
+  benign A02 notes - HTML fallback normalization, attachment skipped by
+  design, body bounded to the canonical size, missing/malformed RFC Date with
+  a valid internalDate, or an empty-but-canonical message (body=None is a
+  valid NormalizedSourceEvent; content is never fabricated) - never trap the
+  cursor, while lost/unnormalizable messages or unknown provider timestamps
+  always hold it;
 - NO Gmail HTTP request and NO AttentionEngine call ever happens while a
   SQLite write transaction is open (repository methods are individually
   short-lived);
@@ -245,7 +253,11 @@ class GmailIngestionService:
             discovered: list[str] = []
             for summary in summaries:
                 evidence = gmail.get_thread(summary.thread_id)
-                if evidence.retrieval_status is not RetrievalStatus.COMPLETE:
+                # CURSOR SAFETY, not evidence fidelity: benign A02 notes (HTML
+                # fallback, skipped attachment, bounded body, missing RFC Date)
+                # never hold the cursor; structural loss (lost/unqualifiable
+                # message) does. Search-level PARTIAL still blocks below.
+                if not getattr(evidence, "ingestion_complete", False):
                     status = RetrievalStatus.PARTIAL
                 # Baseline marks seen ONLY messages whose provider timestamp
                 # belongs to the baseline window - thread history stays
@@ -305,7 +317,13 @@ class GmailIngestionService:
             events: list[tuple[NormalizedSourceEvent, datetime]] = []
             for summary in summaries:
                 evidence = gmail.get_thread(summary.thread_id)
-                if evidence.retrieval_status is not RetrievalStatus.COMPLETE:
+                # Cursor safety uses the INGESTION-completeness signal only:
+                # PARTIAL retrieval_status from benign fidelity notes (HTML
+                # normalized, attachment skipped, bounded body, missing RFC
+                # Date with valid internalDate) must NOT stall the cursor -
+                # advancing means every window message was canonically
+                # represented, not that every byte was retrieved perfectly.
+                if not getattr(evidence, "ingestion_complete", False):
                     status = RetrievalStatus.PARTIAL
                 qualified, uncertain = self._window_qualified(
                     evidence, window_start, poll_started_at
