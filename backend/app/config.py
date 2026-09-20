@@ -127,6 +127,13 @@ class Settings(BaseSettings):
     #: format reaches _split_origins verbatim ("" -> [], "a,b" -> [a, b]).
     eva_llm_allowed_origins: Annotated[list[str], NoDecode] = Field(default_factory=list)
 
+    #: Exact browser origins allowed to reach EVA's mutating API (A04). This is
+    #: deliberately SEPARATE from eva_llm_allowed_origins, which protects the
+    #: private inference destination - not browser access to EVA. Comma-
+    #: separated exact http(s) origins; no wildcards; same credential/path/
+    #: query safety rules as every other origin in this file.
+    eva_app_allowed_origins: Annotated[list[str], NoDecode] = Field(default_factory=list)
+
     # --- optional cloud extension (disabled by default) --------------------
     eva_allow_cloud_inference: bool = False
     eva_allow_workspace_cloud_inference: bool = False
@@ -152,12 +159,12 @@ class Settings(BaseSettings):
     def _validate_endpoints(cls, value: str) -> str:
         return _validated_endpoint(value)
 
-    @field_validator("eva_llm_allowed_origins", mode="before")
+    @field_validator("eva_llm_allowed_origins", "eva_app_allowed_origins", mode="before")
     @classmethod
     def _split_origins(cls, value: Any) -> Any:
         return _split_origins(value)
 
-    @field_validator("eva_llm_allowed_origins")
+    @field_validator("eva_llm_allowed_origins", "eva_app_allowed_origins")
     @classmethod
     def _validate_origins(cls, value: list[str]) -> list[str]:
         # Structural validation + normalization; rejects credentials, paths,
@@ -239,6 +246,18 @@ class Settings(BaseSettings):
         the allowlist for the mandatory route."""
         origin = self._endpoint_origin(url)
         return origin is not None and origin in self.eva_llm_allowed_origins
+
+    def is_allowed_app_origin(self, origin: str | None) -> bool:
+        """Exact-match browser-origin check for EVA's own mutating routes
+        (A04). The compared value must already be a bare normalized origin;
+        wildcards are not supported by construction (closed list)."""
+        if not origin:
+            return False
+        try:
+            normalized = _validated_origin(origin)
+        except UnsafeEndpointConfigurationError:
+            return False
+        return normalized in self.eva_app_allowed_origins
 
     @property
     def google_configured(self) -> bool:

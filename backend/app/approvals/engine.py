@@ -387,11 +387,21 @@ class ActionApprovalEngine:
 
     # -- proposal --------------------------------------------------------------------
 
-    def propose(self, call: ToolCall, context: ProposalContext) -> ProposedAction:
-        """Validate, evaluate and durably persist a PENDING proposal.
+    def propose(
+        self, call: ToolCall, context: ProposalContext, *, persist: bool = True
+    ) -> ProposedAction:
+        """Validate, evaluate and (by default) durably persist a PENDING proposal.
 
         Every authoritative field below is server-derived; created/expires come
-        from the server clock only (context.now), never from the caller."""
+        from the server clock only (context.now), never from the caller.
+
+        ``persist=False`` performs the identical policy evaluation and returns
+        the fully-formed action WITHOUT writing it - the A04 route persists it
+        atomically together with its idempotency slot
+        (:meth:`ActionRepository.create_idempotent_action`), so a losing
+        concurrent duplicate can never leave an orphan PENDING row. Policy
+        semantics are identical either way; only WHEN persistence happens
+        changes."""
         args = self.validate_arguments(call.name, call.arguments)
         risk, reasons, meeting = self._risk_assessment(args, context)
         requires_approval, voice_allowed = self._approval_flags(risk)
@@ -465,7 +475,8 @@ class ActionApprovalEngine:
             expires_at=expires_at,
             status=ProposedActionStatus.PENDING,
         )
-        self._repo.create_action(action)
+        if persist:
+            self._repo.create_action(action)
         return action
 
     def _impact(self, args: BaseModel, risk: ActionRisk, meeting: Meeting | None) -> str:
