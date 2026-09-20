@@ -23,6 +23,7 @@ from .api.actions import router as actions_router
 from .api.auth_google import router as auth_google_router
 from .api.calendar import router as calendar_router
 from .api.health import router as health_router
+from .api.voice import router as voice_router
 from .approvals.engine import ActionApprovalEngine
 from .approvals.policy import load_policy
 from .config import Settings
@@ -34,6 +35,10 @@ from .dependencies import get_settings
 from .google.auth import GoogleAuth
 from .google.calendar import CalendarService
 from .google.http import AuthorizedGoogleHttp
+from .voice.audio import FfmpegAudioNormalizer
+from .voice.faster_whisper import FasterWhisperProvider
+from .voice.stt_base import TranscriptionService, canonicalize_stt_provider_name
+from .voice.whisper_cpp import WhisperCppProvider
 
 logger = logging.getLogger("eva.main")
 
@@ -52,6 +57,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             logger.warning(
                 "self-hosted inference not configured; missing %s", ", ".join(missing)
             )
+        # A05 best-effort STT warmup: failures are recorded as sanitized
+        # provider-unavailable state and NEVER crash unrelated startup.
+        service = getattr(app.state, "stt_service", None)
+        if service is not None:
+            await service.warmup()
         yield
 
     app = FastAPI(title="EVA Core Platform", version=__version__, lifespan=lifespan)
@@ -172,6 +182,37 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.tool_registry = registry
     app.state.tool_executor = executor
 
+    # -- A05 voice pipeline: one normalizer + one STT service per application.
+    # Tests replace app.state.audio_normalizer / stt_service (and the inject
+    # hooks below) with hermetic fakes - no real ffmpeg, binaries or models.
+    primary_name = canonicalize_stt_provider_name(settings.eva_stt_provider)
+    whisper_provider = FasterWhisperProvider(
+        model_name=settings.eva_whisper_model,
+        device=settings.eva_whisper_device,
+        compute_type=settings.eva_whisper_compute_type,
+        model_factory=getattr(app.state, "whisper_model_factory", None),
+    )
+    whisper_cpp = WhisperCppProvider(
+        binary=settings.eva_whisper_cpp_binary or None,
+        model_path=settings.eva_whisper_cpp_model_path or None,
+        timeout_seconds=settings.eva_stt_timeout_seconds,
+        runner=getattr(app.state, "whisper_cpp_runner", None),
+    )
+    if primary_name == "faster-whisper":
+        stt_primary, stt_fallback = whisper_provider, whisper_cpp
+    else:  # canonicalized to 'whisper.cpp'
+        stt_primary, stt_fallback = whisper_cpp, whisper_provider
+
+    app.state.audio_normalizer = FfmpegAudioNormalizer(
+        ffmpeg_binary=settings.eva_ffmpeg_binary
+    )
+    app.state.stt_service = TranscriptionService(
+        primary=stt_primary,
+        fallback=stt_fallback,
+        max_concurrency=settings.eva_stt_max_concurrency,
+        timeout_seconds=settings.eva_stt_timeout_seconds,
+    )
+
     # Browser mutation protection (see api/security.py threat model): CORS is
     # limited to the exact configured app origins; no credentials/cookies.
     if settings.eva_app_allowed_origins:
@@ -187,6 +228,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(auth_google_router)
     app.include_router(calendar_router)
     app.include_router(actions_router)
+    app.include_router(voice_router)
     return app
 
 

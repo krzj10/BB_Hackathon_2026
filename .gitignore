@@ -246,3 +246,16 @@ dist/
 .next/
 playwright-report/
 test-results/
+
+# EVA A05: audio and STT model artifacts must never enter Git.
+# Uploads/normalized WAV are request-scoped (system temp) - any stray file
+# of these types is runtime debris or a privacy leak, never source.
+*.wav
+*.webm
+*.ogg
+*.oga
+*.m4a
+*.mp3
+ggml-*.bin
+eva-audio-*
+eva-wcpp-*
