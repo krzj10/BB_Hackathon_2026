@@ -583,7 +583,7 @@ describe("useVoiceSession acquisition-window races", () => {
 });
 
 describe("useVoiceSession capture-local recorder ownership", () => {
-  it("a delayed onstop from recording A cannot corrupt recording B or publish A's audio", async () => {
+  it("ignores start during stopping, then a superseding start during transcribing", async () => {
     const first = makeStream();
     const second = makeStream();
     let call = 0;
@@ -592,19 +592,24 @@ describe("useVoiceSession capture-local recorder ownership", () => {
     );
     vi.stubGlobal("MediaRecorder", DelayedRecorder);
 
-    const uploadedTexts: string[] = [];
     const blobs: Blob[] = [];
+    // Each STT request stays pending until the test resolves it, so A's
+    // in-flight transcription is genuinely superseded rather than settled.
+    const pending: Array<{
+      request: TranscribeAudioRequest;
+      resolve: (response: TranscribeResponse) => void;
+    }> = [];
     const clientWithBlob: EvaClient = {
-      transcribeAudio: (request: TranscribeAudioRequest) => {
-        blobs.push(request.audio);
-        uploadedTexts.push(request.requestId);
-        return Promise.resolve(transcriptResponse(request.requestId, "B transcript"));
-      },
+      transcribeAudio: (request: TranscribeAudioRequest) =>
+        new Promise<TranscribeResponse>((resolve) => {
+          blobs.push(request.audio);
+          pending.push({ request, resolve });
+        }),
     } as unknown as EvaClient;
 
     render(<VoiceHarness client={clientWithBlob} />);
 
-    // Recording A: start, then release while the recorder is still flushing.
+    // 1-2. Recording A releases; the recorder is still flushing (stopping).
     fireEvent.click(screen.getByTestId("start"));
     await flush();
     const recorderA = FakeRecorder.instances[0] as DelayedRecorder;
@@ -613,7 +618,31 @@ describe("useVoiceSession capture-local recorder ownership", () => {
     await flush();
     expect(recorderA.released).toBe(false); // onstop has NOT fired yet
 
-    // Recording B starts while A is still stopping: captures stay isolated.
+    // 3. canStart is false while stopping.
+    expect(lastSession?.canStart).toBe(false);
+
+    // 4. A start during stopping is ignored: no new getUserMedia request
+    //    and no second recorder may exist.
+    fireEvent.click(screen.getByTestId("start"));
+    await flush();
+    expect(getUserMedia).toHaveBeenCalledTimes(1);
+    expect(FakeRecorder.instances).toHaveLength(1);
+    // Presentation already shows transcribing; internally still stopping.
+    expect(screen.getByTestId("state")).toHaveTextContent("transcribing");
+
+    // 5. A's onstop fires; its finalize uploads normally and STT starts.
+    act(() => {
+      recorderA.release();
+    });
+    await flush();
+    expect(first.track.stop).toHaveBeenCalled();
+    expect(blobs).toHaveLength(1);
+
+    // 6-7. Phase becomes transcribing; canStart is true again.
+    expect(screen.getByTestId("state")).toHaveTextContent("transcribing");
+    expect(lastSession?.canStart).toBe(true);
+
+    // 8. Starting now is allowed and supersedes A's in-flight transcription.
     fireEvent.click(screen.getByTestId("start"));
     await flush();
     expect(getUserMedia).toHaveBeenCalledTimes(2);
@@ -621,16 +650,8 @@ describe("useVoiceSession capture-local recorder ownership", () => {
     expect(recorderB).not.toBe(recorderA);
     expect(recorderB.state).toBe("recording");
 
-    // A's LATE final dataavailable + onstop land during B's lifetime.
-    act(() => {
-      recorderA.release();
-    });
-    await flush();
-    // A's stale finalize must never start an STT upload.
-    expect(blobs).toHaveLength(0);
-    expect(first.track.stop).toHaveBeenCalled();
-
-    // B records and uploads only its own capture-local chunks.
+    // B records and uploads only its own capture-local chunks; A's LATE
+    // response must be ignored as superseded.
     recorderB.ondataavailable?.({ data: new Blob(["B-data"], { type: "audio/webm" }) });
     fireEvent.click(screen.getByTestId("stop"));
     await flush();
@@ -640,19 +661,26 @@ describe("useVoiceSession capture-local recorder ownership", () => {
     });
     await flush();
 
-    expect(blobs).toHaveLength(1);
+    expect(blobs).toHaveLength(2);
     const uploaded = await new Promise<string>((resolve) => {
       const reader = new FileReader();
       reader.onload = () => resolve(String(reader.result));
-      reader.readAsText(blobs[0]);
+      reader.readAsText(blobs[1]);
     });
     // B's own capture data (including B's own async final flush) ...
     expect(uploaded).toContain("B-data");
     // ... but NEVER recording A's data.
     expect(uploaded).not.toContain("A-data");
+    expect(pending).toHaveLength(2);
+    act(() => {
+      pending[1].resolve(
+        transcriptResponse(pending[1].request.requestId, "B transcript")
+      );
+    });
+    await flush();
+    // A's pending transcription is superseded: only B's transcript publishes.
     expect(screen.getByTestId("transcript")).toHaveTextContent("B transcript");
     expect(screen.getByTestId("state")).toHaveTextContent("idle");
-    expect(uploadedTexts).toHaveLength(1);
     expect(second.track.stop).toHaveBeenCalled();
   });
 

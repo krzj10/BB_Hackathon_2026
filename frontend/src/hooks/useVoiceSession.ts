@@ -415,10 +415,18 @@ export function useVoiceSession(options: UseVoiceSessionOptions = {}): VoiceSess
   );
 
   const startListening = React.useCallback(() => {
-    // Double-start guard covering BOTH the listening phase and the
-    // acquisition window: repeated pointer/key events while getUserMedia is
-    // still pending must never create a second microphone request.
-    if (phaseRef.current === "acquiring" || phaseRef.current === "listening") return;
+    // Start guard matching the public contract: canStart === true means a
+    // new PTT interaction may begin. Ignore calls during acquiring,
+    // listening, and stopping — repeated pointer/key events while getUserMedia
+    // is still pending, or while the previous recorder is flushing its final
+    // onstop, must never create a second microphone request.
+    if (
+      phaseRef.current === "acquiring" ||
+      phaseRef.current === "listening" ||
+      phaseRef.current === "stopping"
+    ) {
+      return;
+    }
 
     // Starting a new PTT while an older transcription is in progress:
     // invalidate the old request, ignore any late response, start cleanly.
@@ -426,9 +434,6 @@ export function useVoiceSession(options: UseVoiceSessionOptions = {}): VoiceSess
       supersedeInFlight();
       applyCapturePhase("idle");
     }
-    // phase "stopping" falls through deliberately: the previous recorder is
-    // only flushing. Its stale finalize detects the generation change below
-    // and discards itself without uploading (capture-local chunk ownership).
 
     const generation = ++generationRef.current;
     applyCapturePhase("acquiring");
