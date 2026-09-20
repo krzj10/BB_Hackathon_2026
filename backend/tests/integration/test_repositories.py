@@ -469,6 +469,33 @@ def test_ingestion_cursors_and_seen_sources(db) -> None:
     assert cursors.mark_seen("gmail", "msg-001", now=NOW) is False
 
 
+def test_seen_ledger_is_seen_check(db) -> None:
+    """A06 durable dedup read surface."""
+    cursors = CursorRepository(db)
+    assert cursors.is_seen("gmail", "msg-a") is False
+    cursors.mark_seen("gmail", "msg-a", now=NOW)
+    assert cursors.is_seen("gmail", "msg-a") is True
+    assert cursors.is_seen("gmail", "msg-b") is False
+    assert cursors.is_seen("calendar", "msg-a") is False  # per-source ledger
+
+
+def test_attention_list_received_between_half_open_and_stable(db) -> None:
+    """A06 Focus-completion support read: [start, end), stable order."""
+    repo = AttentionRepository(db)
+    base = domain.AttentionItem.model_validate(load_fixture("attention_finance_decision.json"))
+    t0 = datetime(2026, 9, 21, 10, 0, tzinfo=timezone.utc)
+    for index in range(4):
+        repo.add(
+            base.model_copy(
+                update={"id": f"it-{index}", "source_id": f"src-{index}",
+                        "received_at": t0 + timedelta(minutes=index)}
+            )
+        )
+    window = repo.list_received_between(t0 + timedelta(minutes=1), t0 + timedelta(minutes=3))
+    assert [item.source_id for item in window] == ["src-1", "src-2"]  # end excluded
+    assert repo.list_received_between(t0 + timedelta(hours=5), t0 + timedelta(hours=6)) == []
+
+
 def test_outbox_append_is_ordered_deduplicated_and_durable(tmp_path) -> None:
     path = tmp_path / "outbox.db"
     database = Database(f"sqlite:///{path}")
