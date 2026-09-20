@@ -9,11 +9,14 @@ import type {
   ProposedActionResponse,
   ActionResponse,
   ActionConfirmResponse,
+  ApprovalChallengeResponse,
   ApprovalRequest,
   DecisionOutcomeProposalRequest,
+  ToolResult,
 } from "../api/types.generated";
 import { useEvaQuery } from "../hooks/useEvaQuery";
 import { formatDeadline, formatMoney, formatTimeInWarsaw } from "../lib/format";
+import { getEvaSessionId, newRequestId } from "../lib/session";
 
 function formatRisk(risk: Decision["risk"]): { label: string; className: string } {
   switch (risk) {
@@ -70,10 +73,13 @@ function formatActionStatus(status: ProposedAction["status"]): { label: string; 
 type DecisionDetailState =
   | { phase: "detail"; decision: Decision }
   | { phase: "proposing"; decision: Decision; outcome: "accept" | "reject" }
-  | { phase: "approval"; decision: Decision; proposedAction: ProposedAction }
+  | { phase: "approval"; decision: Decision; proposedAction: ProposedAction; approvalError: string | null }
   | { phase: "proposal-registered"; decision: Decision; proposedAction: ProposedAction }
   | { phase: "confirming"; decision: Decision; proposedAction: ProposedAction; choice: "approve" | "reject" }
-  | { phase: "result"; decision: Decision; confirmResponse: ActionConfirmResponse };
+  | { phase: "result"; decision: Decision; confirmResponse: ActionConfirmResponse }
+  /** POST confirm was SENT but its response was lost: the outcome is uncertain until GET /api/actions/{id} reports authoritative state. */
+  | { phase: "reconciling"; decision: Decision; proposedAction: ProposedAction; readError: string | null }
+  | { phase: "uncertain"; decision: Decision; proposedAction: ProposedAction; action: ProposedAction; lastResult: ToolResult | null };
 
 interface DecisionDetailContainerProps {
   decision: Decision;
@@ -91,8 +97,10 @@ function DecisionDetailContainer({ decision, onClose, setReloadKey }: DecisionDe
     try {
       const request: DecisionOutcomeProposalRequest = {
         outcome,
-        session_id: "sess-demo-001",
-        request_id: `req-${Date.now()}`,
+        // Single browser-session authority — the same identity the transport
+        // attaches to every EVA application API request.
+        session_id: getEvaSessionId(),
+        request_id: newRequestId(),
       };
       const response: ProposedActionResponse = await client.proposeDecisionOutcome(decision.id, request);
       const proposedAction = response.action;
@@ -100,12 +108,14 @@ function DecisionDetailContainer({ decision, onClose, setReloadKey }: DecisionDe
       // The backend field is authoritative — never inferred from risk.
       // The challenge is NOT fetched here; only after an explicit UI choice.
       if (proposedAction.requires_approval) {
-        setState({ phase: "approval", decision, proposedAction });
+        setState({ phase: "approval", decision, proposedAction, approvalError: null });
       } else {
         setState({ phase: "proposal-registered", decision, proposedAction });
       }
     } catch (error) {
       console.error("Failed to propose decision outcome:", error);
+      // The proposal was NOT created; returning to the detail of the SAME
+      // decision is safe here because nothing was submitted for approval.
       setState({ phase: "detail", decision });
     }
   };
@@ -120,36 +130,108 @@ function DecisionDetailContainer({ decision, onClose, setReloadKey }: DecisionDe
     }
   };
 
+  /**
+   * Recovery for a confirmation whose HTTP response was lost: GET /api/actions/{id}
+   * is the PRIMARY mechanism (never a blind confirm replay). Called once
+   * automatically after the lost response and again by the manual Check state
+   * control — bounded, never an auto-loop.
+   */
+  const reconcileAfterLostConfirm = async (
+    currentDecision: Decision,
+    proposedAction: ProposedAction
+  ) => {
+    try {
+      const response: ActionResponse = await client.getAction(proposedAction.id);
+      const authoritative = response.action;
+      if (authoritative.status === "pending") {
+        // The same proposal still exists untouched — retry the confirmation
+        // on THIS action (a fresh challenge is fetched on retry).
+        setState({
+          phase: "approval",
+          decision: currentDecision,
+          proposedAction: authoritative,
+          approvalError:
+            "The confirmation response was lost, but the action is still pending. Nothing was decided yet — you can retry the confirmation on this same action.",
+        });
+        return;
+      }
+      if (authoritative.status === "succeeded" || authoritative.status === "failed") {
+        // The terminal outcome is known: refresh authoritative list state.
+        setReloadKey((n) => n + 1);
+      }
+      setState({
+        phase: "uncertain",
+        decision: currentDecision,
+        proposedAction,
+        action: authoritative,
+        lastResult: response.last_result ?? null,
+      });
+    } catch (error) {
+      console.error("Failed to read action state after lost confirm response:", error);
+      setState({
+        phase: "reconciling",
+        decision: currentDecision,
+        proposedAction,
+        readError: "EVA could not read the current action state. The outcome is still uncertain — check again.",
+      });
+    }
+  };
+
   const handleConfirmChoice = async (choice: "approve" | "reject") => {
     if (state.phase !== "approval") return;
     const { proposedAction, decision: currentDecision } = state;
     setState({ phase: "confirming", decision: currentDecision, proposedAction, choice });
 
+    // ---- PRE-CONFIRM: nothing has been submitted yet -----------------------
+    let challengeResponse: ApprovalChallengeResponse;
     try {
       // Challenge is obtained only NOW, after the explicit UI choice, through
       // the client flow — never manufactured or reused by the UI.
-      const challengeResponse = await client.getApprovalChallenge(proposedAction.id);
+      challengeResponse = await client.getApprovalChallenge(proposedAction.id);
       if (
         challengeResponse.action_id !== proposedAction.id ||
         challengeResponse.revision !== proposedAction.revision ||
         challengeResponse.arguments_digest !== proposedAction.arguments_digest
       ) {
-        throw new Error("Approval challenge binding does not match the proposed action");
+        throw new Error("challenge binding mismatch");
       }
+    } catch (error) {
+      console.error("Failed to obtain the approval challenge:", error);
+      // Pre-confirm failure: confirmation was NOT submitted, so staying on
+      // the SAME proposal with a retryable error is safe. No new proposal.
+      setState({
+        phase: "approval",
+        decision: currentDecision,
+        proposedAction,
+        approvalError:
+          "EVA could not obtain the approval challenge. Nothing was confirmed — you can retry on this same action.",
+      });
+      return;
+    }
 
-      const confirmRequest: ApprovalRequest = {
-        action_id: proposedAction.id,
-        revision: proposedAction.revision,
-        arguments_digest: proposedAction.arguments_digest,
-        choice,
-        challenge: challengeResponse.challenge,
-      };
+    const confirmRequest: ApprovalRequest = {
+      action_id: proposedAction.id,
+      revision: proposedAction.revision,
+      arguments_digest: proposedAction.arguments_digest,
+      choice,
+      challenge: challengeResponse.challenge,
+    };
 
-      const confirmResponse: ActionConfirmResponse = await client.confirmAction(proposedAction.id, confirmRequest);
+    // ---- CONFIRM SUBMITTED: the outcome may only be learned via recovery ---
+    try {
+      const confirmResponse: ActionConfirmResponse = await client.confirmAction(
+        proposedAction.id,
+        confirmRequest
+      );
+      setReloadKey((n) => n + 1);
       setState({ phase: "result", decision: currentDecision, confirmResponse });
     } catch (error) {
-      console.error("Failed to confirm action:", error);
-      setState({ phase: "detail", decision: currentDecision });
+      console.error("Confirmation response was lost:", error);
+      // The request may have gone through. NEVER return to ordinary detail
+      // and never enable another proposal: enter reconciliation, keep the
+      // action id/binding, and query the authoritative action state.
+      setState({ phase: "reconciling", decision: currentDecision, proposedAction, readError: null });
+      await reconcileAfterLostConfirm(currentDecision, proposedAction);
     }
   };
 
@@ -298,7 +380,7 @@ function DecisionDetailContainer({ decision, onClose, setReloadKey }: DecisionDe
           </Card>
         )}
 
-        {state.phase === "detail" && decision.status === "needs_review" && (
+        {state.phase === "detail" && (decision.status === "needs_review" || decision.status === "deferred") && (
           <Card className="border-primary/30">
             <CardHeader>
               <CardTitle className="text-[14px] flex items-center gap-2">
@@ -327,17 +409,21 @@ function DecisionDetailContainer({ decision, onClose, setReloadKey }: DecisionDe
                 >
                   RECORD REJECT
                 </button>
-                <button
-                  type="button"
-                  onClick={handleDefer}
-                  className="rounded-control border border-border-strong px-4 py-2 text-[13.5px] font-medium text-foreground transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                >
-                  DEFER
-                </button>
+                {decision.status === "needs_review" && (
+                  <button
+                    type="button"
+                    onClick={handleDefer}
+                    className="rounded-control border border-border-strong px-4 py-2 text-[13.5px] font-medium text-foreground transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  >
+                    DEFER
+                  </button>
+                )}
               </div>
-              <p className="text-[12px] text-subtle-foreground">
-                DEFER is not equivalent to reject/accept. It postpones the decision.
-              </p>
+              {decision.status === "needs_review" && (
+                <p className="text-[12px] text-subtle-foreground">
+                  DEFER is not equivalent to reject/accept. It postpones the decision.
+                </p>
+              )}
             </CardContent>
           </Card>
         )}
@@ -368,12 +454,150 @@ function DecisionDetailContainer({ decision, onClose, setReloadKey }: DecisionDe
         )}
 
         {state.phase === "approval" && (
-          <ActionApproval
-            action={state.proposedAction}
-            onConfirm={handleConfirmChoice}
-            onClose={onClose}
-          />
+          <>
+            {state.approvalError && (
+              <p role="alert" className="rounded-control border border-warning/40 bg-warning/10 px-3 py-2 text-[13px] text-warning">
+                {state.approvalError}
+              </p>
+            )}
+            <ActionApproval
+              action={state.proposedAction}
+              onConfirm={handleConfirmChoice}
+              onClose={onClose}
+            />
+          </>
         )}
+
+        {state.phase === "reconciling" && (
+          <Card className="border-warning/30 bg-warning/5 dark:bg-warning/10">
+            <CardHeader>
+              <CardTitle className="text-[13px] flex items-center gap-2">
+                <span className="text-warning motion-safe:animate-pulse">⏳</span>
+                Checking what actually happened…
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-3">
+              <p className="text-[13px] font-medium text-warning">
+                The confirmation response was lost. The outcome is uncertain — EVA is checking the
+                authoritative action state.
+              </p>
+              <p className="text-[12px] text-muted-foreground">
+                Action: <span className="font-mono">{state.proposedAction.id}</span> · revision{" "}
+                {state.proposedAction.revision}
+              </p>
+              {state.readError && (
+                <p role="alert" className="text-[13px] text-danger">
+                  {state.readError}
+                </p>
+              )}
+              <button
+                type="button"
+                onClick={() => reconcileAfterLostConfirm(state.decision, state.proposedAction)}
+                className="rounded-control border border-border-strong px-4 py-2 text-[13.5px] font-medium text-foreground transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                Check state
+              </button>
+            </CardContent>
+          </Card>
+        )}
+
+        {state.phase === "uncertain" && (() => {
+          const { action } = state;
+          const actionStatus = formatActionStatus(action.status);
+          const inProgress = action.status === "approved" || action.status === "executing";
+          const terminalRejected =
+            action.status === "rejected" || action.status === "expired" || action.status === "superseded";
+          return (
+            <Card
+              className={
+                action.status === "succeeded"
+                  ? "border-success/30 bg-success/5 dark:bg-success/10"
+                  : action.status === "failed"
+                    ? "border-danger/30 bg-danger/5 dark:bg-danger/10"
+                    : action.status === "unknown"
+                      ? "border-warning/40 bg-warning/5 dark:bg-warning/10"
+                      : "border-muted bg-muted/30"
+              }
+            >
+              <CardHeader>
+                <CardTitle className="text-[13px] flex items-center gap-2">
+                  <span>{action.status === "succeeded" ? "✅" : action.status === "failed" ? "🚫" : action.status === "unknown" ? "❓" : "ℹ️"}</span>
+                  Authoritative action state: {actionStatus.label}
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-3">
+                {action.status === "unknown" && (
+                  <p role="alert" className="text-[13.5px] font-semibold text-warning">
+                    Outcome unknown. Do not repeat this action until its state is reconciled.
+                  </p>
+                )}
+                {inProgress && (
+                  <p className="text-[13px] text-muted-foreground">
+                    The action was accepted and is being processed. Outcome details are not final yet.
+                  </p>
+                )}
+                {action.status === "succeeded" && state.lastResult && (
+                  <p className="text-[13px] text-success">
+                    The action completed successfully. The decision list has been refreshed from the
+                    authoritative state.
+                  </p>
+                )}
+                {action.status === "failed" && (
+                  <p className="text-[13px] text-danger">
+                    The existing action failed. It is not retried or silently replaced — record a new
+                    explicit outcome if still needed.
+                  </p>
+                )}
+                {terminalRejected && (
+                  <p className="text-[13px] text-muted-foreground">
+                    This action reached the terminal state <strong>{actionStatus.label}</strong>. You can
+                    record a new explicit outcome when appropriate.
+                  </p>
+                )}
+                <p className="text-[12px] text-muted-foreground">
+                  Action: <span className="font-mono">{action.id}</span> · revision {action.revision}
+                </p>
+                {state.lastResult && (
+                  <details>
+                    <summary className="cursor-pointer text-[12.5px] text-primary">Tool result details</summary>
+                    <pre className="mt-2 text-[11px] text-muted-foreground bg-muted p-2 rounded border border-border/60 overflow-auto max-h-32">
+                      {JSON.stringify(state.lastResult, null, 2)}
+                    </pre>
+                  </details>
+                )}
+                <div className="flex flex-wrap gap-3">
+                  {(inProgress || action.status === "unknown") && (
+                    <button
+                      type="button"
+                      onClick={() => reconcileAfterLostConfirm(state.decision, state.proposedAction)}
+                      className="rounded-control border border-border-strong px-4 py-2 text-[13.5px] font-medium text-foreground transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    >
+                      Check state
+                    </button>
+                  )}
+                  {terminalRejected && (
+                    <button
+                      type="button"
+                      onClick={() => setState({ phase: "detail", decision: state.decision })}
+                      className="rounded-control bg-primary px-4 py-2 text-[13.5px] font-medium text-primary-foreground transition-colors hover:bg-primary/90"
+                    >
+                      Record a new outcome
+                    </button>
+                  )}
+                  {action.status === "succeeded" && (
+                    <button
+                      type="button"
+                      onClick={onClose}
+                      className="rounded-control border border-border-strong px-4 py-2 text-[13.5px] font-medium text-foreground transition-colors hover:bg-accent"
+                    >
+                      Close
+                    </button>
+                  )}
+                </div>
+              </CardContent>
+            </Card>
+          );
+        })()}
 
         {state.phase === "confirming" && (
           <Card className="border-primary/30 bg-primary/5 dark:bg-primary/10">

@@ -113,7 +113,7 @@ function FocusStartForm({ onStart }: { onStart: (request: FocusStartRequest) => 
   );
 }
 
-function ActiveFocusDisplay({ session, onStop }: { session: FocusSession; onStop: () => Promise<FocusStopResponse> }) {
+function ActiveFocusDisplay({ session, onStop }: { session: FocusSession; onStop: () => Promise<void> }) {
   const thresholdStyle = formatThreshold(session.threshold);
   const [isStopping, setIsStopping] = React.useState(false);
 
@@ -220,26 +220,43 @@ function FocusOff({ onStart }: { onStart: (request: FocusStartRequest) => Promis
 export function FocusPanel({ onSessionChange }: FocusPanelProps) {
   const [reloadKey, setReloadKey] = React.useState(0);
   const [stopResult, setStopResult] = React.useState<FocusStopResponse | null>(null);
+  // Stable, sanitized mutation error state: raw provider/stack/body text is
+  // never shown, and the previous error clears on the next success.
+  const [mutationError, setMutationError] = React.useState<string | null>(null);
   const client = getEvaClient();
   const focus = useEvaQuery(`focus:${reloadKey}`, (c) => c.getCurrentFocus(), client);
 
   const handleStart = async (request: FocusStartRequest) => {
-    const response = await client.startFocus(request);
-    setStopResult(null);
-    setReloadKey((n) => n + 1);
-    if (response.session && onSessionChange) {
-      onSessionChange(response.session);
+    try {
+      const response = await client.startFocus(request);
+      setMutationError(null);
+      setStopResult(null);
+      setReloadKey((n) => n + 1);
+      if (response.session && onSessionChange) {
+        onSessionChange(response.session);
+      }
+    } catch (error) {
+      console.error("Failed to start Focus:", error);
+      // Focus remains OFF; the existing form is the retry path.
+      setMutationError("Focus could not be started. Try again.");
     }
   };
 
   const handleStop = async () => {
-    const response = await client.stopFocus();
-    setStopResult(response);
-    setReloadKey((n) => n + 1);
-    if (onSessionChange) {
-      onSessionChange(null);
+    try {
+      const response = await client.stopFocus();
+      setMutationError(null);
+      setStopResult(response);
+      setReloadKey((n) => n + 1);
+      if (onSessionChange) {
+        onSessionChange(null);
+      }
+    } catch (error) {
+      console.error("Failed to stop Focus:", error);
+      // The current session remains visibly ACTIVE and the Stop button stays
+      // usable for a retry.
+      setMutationError("Focus could not be stopped. Focus is still active.");
     }
-    return response;
   };
 
   const session = focus.status === "ready" ? focus.data?.session ?? null : null;
@@ -294,6 +311,11 @@ export function FocusPanel({ onSessionChange }: FocusPanelProps) {
         </CardTitle>
       </CardHeader>
       <CardContent>
+        {mutationError && (
+          <p role="alert" className="mb-4 rounded-control border border-danger/30 bg-danger/5 px-3 py-2 text-[13px] text-danger">
+            {mutationError}
+          </p>
+        )}
         {session ? (
           <ActiveFocusDisplay session={session} onStop={handleStop} />
         ) : stopResult ? (

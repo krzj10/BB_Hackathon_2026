@@ -10,10 +10,12 @@ import type {
   FocusSession,
   FocusCompletionSummary,
   FocusSessionResponse,
+  FocusStopResponse,
   Meeting,
   TodayCalendarResponse,
   ExecutiveBriefing,
   ProposedAction,
+  ProposedActionResponse,
   ActionResponse,
   ActionConfirmResponse,
   ToolResult,
@@ -94,7 +96,6 @@ const fixtureToday: TodayCalendarResponse = {
   retrieval_status: "complete",
 };
 const fixtureAttention: AttentionListResponse = { items: [financeAttention] };
-const fixtureDecisions: DecisionListResponse = { items: [financeDecision] };
 
 const emptyToday: TodayCalendarResponse = {
   day: FIXTURE_DAY,
@@ -134,14 +135,6 @@ const attentionExplanation: AttentionExplanationResponse = {
   delivery_reasons: financeAttention.delivery_reasons ?? [],
   policy_version: canonicalExplanationPolicyVersion,
   sources: financeAttention.sources ?? [],
-};
-
-const decisionDetail: DecisionResponse = {
-  decision: financeDecision,
-};
-
-const decisionDetailResolved: DecisionResponse = {
-  decision: financeDecisionResolved,
 };
 
 const actionPendingResponse: ActionResponse = {
@@ -229,6 +222,14 @@ export function createMockClient(options: MockClientOptions = {}): EvaClient {
   // mock clients never share or reset each other's Focus/approval state.
   let focusState: FocusSession | null = activeFocusSession;
 
+  // Decision state: CLIENT-LOCAL copies initialized from the canonical
+  // fixtures (never the imported fixture objects themselves). Every mutation
+  // (defer, recorded outcome) updates these copies so getDecisions/getDecision
+  // always observe the same coherent state.
+  const decisionsState: Decision[] = [
+    { ...(mode === "decision-resolved" ? financeDecisionResolved : financeDecision) },
+  ];
+
   // Approval state: the current pending proposal, the one-time challenge
   // issued for it, and whether that challenge has already been consumed.
   let storedProposal: ProposedAction | null = null;
@@ -240,10 +241,26 @@ export function createMockClient(options: MockClientOptions = {}): EvaClient {
   // dropped immediately after that call is processed).
   let settingsState: LlmSettingsResponse = llmSettings;
 
-  return {
+  // Test-only synchronous view of the client-local state (the mock IS test
+  // infrastructure). In error/pending modes the API itself cannot report
+  // state, so commit-on-success semantics are verified through this view.
+  // Never part of the EvaClient transport contract.
+  const internals = {
+    get focus(): FocusSession | null {
+      return focusState;
+    },
+    get decisions(): readonly Decision[] {
+      return decisionsState;
+    },
+    get proposal(): ProposedAction | null {
+      return storedProposal;
+    },
+  };
+
+  const mockClient: EvaClient = {
     getTodayCalendar: () => respond(mode, fixtureToday, emptyToday),
     getAttention: () => respond(mode, fixtureAttention, emptyAttention),
-    getDecisions: () => respond(mode, fixtureDecisions, emptyDecisions),
+    getDecisions: () => respond(mode, { items: decisionsState }, emptyDecisions),
     getCurrentFocus: () => respond(mode, { session: focusState }, emptyFocus),
 
     getBriefing: (request: BriefingRequest) => {
@@ -282,7 +299,16 @@ export function createMockClient(options: MockClientOptions = {}): EvaClient {
       }, { ...attentionExplanation, item_id: attentionId }),
 
     startFocus: (request: FocusStartRequest) => {
-      focusState = {
+      // Commit-on-success: the client-local session is created ONLY after the
+      // outcome is known to succeed. Error mode rejects with the previous
+      // state untouched; pending mode never resolves and activates nothing.
+      if (mode === "pending") {
+        return new Promise<FocusSessionResponse>(() => {});
+      }
+      if (mode === "error") {
+        return Promise.reject(new Error("Simulated transport failure (mock error mode)"));
+      }
+      const session: FocusSession = {
         id: "focus-demo-001",
         starts_at: new Date().toISOString(),
         ends_at: new Date(Date.now() + request.duration_minutes * 60 * 1000).toISOString(),
@@ -291,21 +317,18 @@ export function createMockClient(options: MockClientOptions = {}): EvaClient {
         policy_version: "policy-v1",
         stopped_at: null,
       };
-      const sessionResponse: FocusSessionResponse = { session: focusState };
-      return respondByMode(mode, {
-        fixtures: sessionResponse,
-        empty: { session: { id: "", starts_at: "", ends_at: "", threshold: "medium", policy_version: "", stopped_at: null } },
-        "focus-active": sessionResponse,
-        "focus-completed": sessionResponse,
-        "action-pending": sessionResponse,
-        "action-high-confirmation": sessionResponse,
-        "action-unknown": sessionResponse,
-        "decision-resolved": sessionResponse,
-        "partial-evidence": sessionResponse,
-      }, sessionResponse);
+      focusState = session;
+      return Promise.resolve({ session } as FocusSessionResponse);
     },
 
     stopFocus: (_request?: FocusStopRequest) => {
+      if (mode === "pending") {
+        return new Promise<FocusStopResponse>(() => {});
+      }
+      if (mode === "error") {
+        // Failure: the current session remains active — never cleared early.
+        return Promise.reject(new Error("Simulated transport failure (mock error mode)"));
+      }
       if (!focusState) {
         return Promise.reject(new Error("No active Focus session to stop"));
       }
@@ -314,17 +337,7 @@ export function createMockClient(options: MockClientOptions = {}): EvaClient {
         stopped_at: new Date().toISOString(),
       };
       focusState = null;
-      return respondByMode(mode, {
-        fixtures: { session: stoppedSession, summary: focusCompletionSummary },
-        empty: { session: { ...activeFocusSession, stopped_at: "2026-09-21T13:30:00+02:00" }, summary: focusCompletionSummary },
-        "focus-active": { session: stoppedSession, summary: focusCompletionSummary },
-        "focus-completed": { session: stoppedSession, summary: focusCompletionSummary },
-        "action-pending": { session: stoppedSession, summary: focusCompletionSummary },
-        "action-high-confirmation": { session: stoppedSession, summary: focusCompletionSummary },
-        "action-unknown": { session: stoppedSession, summary: focusCompletionSummary },
-        "decision-resolved": { session: stoppedSession, summary: focusCompletionSummary },
-        "partial-evidence": { session: stoppedSession, summary: focusCompletionSummary },
-      }, { session: stoppedSession, summary: focusCompletionSummary });
+      return Promise.resolve({ session: stoppedSession, summary: focusCompletionSummary } as FocusStopResponse);
     },
 
     getFocusSummary: (_sessionId: string) =>
@@ -340,20 +353,24 @@ export function createMockClient(options: MockClientOptions = {}): EvaClient {
         "partial-evidence": { summary: focusCompletionSummary },
       }, { summary: focusCompletionSummary }),
 
-    getDecision: (_decisionId: string) =>
-      respondByMode(mode, {
-        fixtures: decisionDetail,
-        empty: { decision: { ...financeDecision, context: [], alternatives: [], risks: [], preference_conflicts: [], sources: [] } },
-        "focus-active": decisionDetail,
-        "focus-completed": decisionDetail,
-        "action-pending": decisionDetail,
-        "action-high-confirmation": decisionDetail,
-        "action-unknown": decisionDetail,
-        "decision-resolved": decisionDetailResolved,
-        "partial-evidence": decisionDetail,
-      }, decisionDetail),
+    getDecision: (decisionId: string) => {
+      if (mode === "pending") {
+        return new Promise<DecisionResponse>(() => {});
+      }
+      if (mode === "error") {
+        return Promise.reject(new Error("Simulated transport failure (mock error mode)"));
+      }
+      // The client-local store is authoritative: defer/record-outcome
+      // mutations are visible to subsequent detail reads.
+      const stored = decisionsState.find((d) => d.id === decisionId);
+      if (!stored) {
+        return Promise.reject(new Error(`Decision "${decisionId}" does not exist in the mock store`));
+      }
+      return Promise.resolve({ decision: stored } as DecisionResponse);
+    },
 
     proposeDecisionOutcome: (decisionId: string, request: DecisionOutcomeProposalRequest) => {
+      const storedDecision = decisionsState.find((d) => d.id === decisionId);
       const outcomeProposedAction: ProposedAction = {
         id: `act-demo-decision-record-${decisionId}`,
         session_id: request.session_id,
@@ -369,7 +386,7 @@ export function createMockClient(options: MockClientOptions = {}): EvaClient {
         summary: `Record ${request.outcome.toUpperCase()} outcome for financial decision: ${financeDecision.title}`,
         reason: `User recorded ${request.outcome.toUpperCase()} outcome for financial decision`,
         impact: "Local decision record only. No payment, purchase, supplier commitment, or external instruction is sent.",
-        before: { outcome: null, status: "needs_review" },
+        before: { outcome: storedDecision?.outcome ?? null, status: storedDecision?.status ?? "needs_review" },
         after: { outcome: request.outcome, status: "resolved" },
         resource_version: "1",
         policy_version: "policy-v1",
@@ -381,34 +398,42 @@ export function createMockClient(options: MockClientOptions = {}): EvaClient {
         status: "pending",
       };
 
-      // Store the exact proposed action; any previously issued challenge is
-      // invalidated because it was bound to a different proposal.
+      // Commit-on-success: the stored proposal (and challenge invalidation)
+      // happen only after the outcome is known to succeed. Error mode leaves
+      // any previous proposal/challenge state untouched.
+      if (mode === "pending") {
+        return new Promise<ProposedActionResponse>(() => {});
+      }
+      if (mode === "error") {
+        return Promise.reject(new Error("Simulated transport failure (mock error mode)"));
+      }
       storedProposal = outcomeProposedAction;
       issuedChallenge = null;
       challengeConsumed = false;
-
-      return statefulRespond(mode, { action: outcomeProposedAction });
+      return Promise.resolve({ action: outcomeProposedAction } as ProposedActionResponse);
     },
 
-    deferDecision: (_decisionId: string, _request?: DeferDecisionRequest) => {
+    deferDecision: (decisionId: string, _request?: DeferDecisionRequest) => {
+      if (mode === "pending") {
+        return new Promise<DecisionResponse>(() => {});
+      }
+      if (mode === "error") {
+        // Failure: the stored decision must remain unchanged.
+        return Promise.reject(new Error("Simulated transport failure (mock error mode)"));
+      }
+      const index = decisionsState.findIndex((d) => d.id === decisionId);
+      if (index < 0) {
+        return Promise.reject(new Error(`Decision "${decisionId}" does not exist in the mock store`));
+      }
       const deferredDecision: Decision = {
-        ...financeDecision,
+        ...decisionsState[index],
         status: "deferred",
         outcome: null,
         outcome_recorded_at: null,
         proposed_action_id: null,
       };
-      return respondByMode(mode, {
-        fixtures: { decision: deferredDecision },
-        empty: { decision: deferredDecision },
-        "focus-active": { decision: deferredDecision },
-        "focus-completed": { decision: deferredDecision },
-        "action-pending": { decision: deferredDecision },
-        "action-high-confirmation": { decision: deferredDecision },
-        "action-unknown": { decision: deferredDecision },
-        "decision-resolved": { decision: deferredDecision },
-        "partial-evidence": { decision: deferredDecision },
-      }, { decision: deferredDecision });
+      decisionsState[index] = deferredDecision;
+      return Promise.resolve({ decision: deferredDecision } as DecisionResponse);
     },
 
     getAction: (actionId: string) => {
@@ -507,6 +532,8 @@ export function createMockClient(options: MockClientOptions = {}): EvaClient {
       challengeConsumed = true;
 
       if (request.choice === "reject") {
+        // Rejection is terminal for the action; the decision itself stays
+        // unresolved/deferred — no outcome is recorded for it.
         const rejectedAction: ProposedAction = { ...storedProposal, status: "rejected" };
         storedProposal = rejectedAction;
         return Promise.resolve({ action: rejectedAction, receipt: null, result: null });
@@ -519,6 +546,21 @@ export function createMockClient(options: MockClientOptions = {}): EvaClient {
       const recordedOutcome: DecisionOutcome = (storedProposal.arguments as { outcome?: DecisionOutcome }).outcome ?? "accept";
       const recordedAt = new Date().toISOString();
       const succeededAction: ProposedAction = { ...storedProposal, status: "succeeded" };
+      // The client-local decision store reflects the SAME recorded outcome so
+      // list/detail reads observe coherent state (rejected: left untouched).
+      const proposal = storedProposal;
+      const decisionIndex = decisionsState.findIndex(
+        (d) => d.id === (proposal.arguments as { decision_id?: string }).decision_id
+      );
+      if (decisionIndex >= 0) {
+        decisionsState[decisionIndex] = {
+          ...decisionsState[decisionIndex],
+          status: "resolved",
+          outcome: recordedOutcome,
+          outcome_recorded_at: recordedAt,
+          proposed_action_id: storedProposal.id,
+        };
+      }
       const confirmResponse: ActionConfirmResponse = {
         action: succeededAction,
         receipt: {
@@ -652,4 +694,5 @@ export function createMockClient(options: MockClientOptions = {}): EvaClient {
       return Promise.resolve(response);
     },
   };
+  return Object.assign(mockClient, { __mockInternals: internals });
 }

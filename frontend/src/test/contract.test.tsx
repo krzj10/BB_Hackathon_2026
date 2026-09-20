@@ -36,7 +36,9 @@ import type {
   VoiceState,
   ExecutiveBriefing,
   Transcript,
+  FocusStopResponse,
 } from "../api/types.generated";
+import { getEvaSessionId } from "../lib/session";
 
 function stubEvaClient(): Pick<
   EvaClient,
@@ -1256,5 +1258,594 @@ describe("Voice/preview interaction cannot confirm a HIGH approval", () => {
     expect(challengeSpy).toHaveBeenCalledTimes(1);
     expect(confirmSpy).toHaveBeenCalledTimes(1);
     expect(challengeSpy.mock.invocationCallOrder[0]).toBeLessThan(confirmSpy.mock.invocationCallOrder[0]);
+  });
+});
+
+describe("Session identity: single browser-session authority", () => {
+  it("REST transport automatically attaches the stable per-tab X-EVA-Session-ID and keeps other headers intact", async () => {
+    const fetchMock = vi.fn().mockImplementation(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ items: [] }),
+      text: async () => JSON.stringify({ items: [] }),
+    } as Response));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = createRestClient();
+    await client.getDecisions();
+    await client.getDecisions();
+
+    const [first, second] = fetchMock.mock.calls;
+    const h1 = first[1].headers as Record<string, string>;
+    const h2 = second[1].headers as Record<string, string>;
+    // automatic attachment, stable for the browser session
+    expect(h1["X-EVA-Session-ID"]).toBe(getEvaSessionId());
+    expect(h1["X-EVA-Session-ID"]).not.toBe("");
+    expect(h2["X-EVA-Session-ID"]).toBe(h1["X-EVA-Session-ID"]);
+    // unrelated headers remain intact alongside the session id
+    expect(h1["Accept"]).toBe("application/json");
+    expect(h1["Content-Type"]).toBe("application/json");
+  });
+
+  it("action GET, challenge and confirm share ONE session identity", async () => {
+    const action = syntheticAction({ id: "act-x" });
+    const fetchMock = vi.fn().mockImplementation(async (url: unknown) => {
+      const u = String(url);
+      const body = u.includes("/challenge")
+        ? {
+            action_id: action.id,
+            revision: action.revision,
+            arguments_digest: action.arguments_digest,
+            challenge: "tok",
+            expires_at: action.expires_at,
+          }
+        : u.includes("/confirm")
+          ? { action, receipt: null, result: null }
+          : { action };
+      return {
+        ok: true,
+        status: 200,
+        json: async () => body,
+        text: async () => JSON.stringify(body),
+      } as Response;
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = createRestClient();
+    await client.getAction(action.id);
+    await client.getApprovalChallenge(action.id);
+    await client.confirmAction(action.id, {
+      action_id: action.id,
+      revision: action.revision,
+      arguments_digest: action.arguments_digest,
+      choice: "approve",
+      challenge: "tok",
+    });
+
+    const sessionIds = fetchMock.mock.calls.map(([, init]) => (init.headers as Record<string, string>)["X-EVA-Session-ID"]);
+    expect(sessionIds).toHaveLength(3);
+    expect(new Set(sessionIds).size).toBe(1);
+    expect(sessionIds[0]).toBe(getEvaSessionId());
+  });
+
+  it("the voice transport and REST transport share the same session authority", async () => {
+    const fetchMock = vi.fn().mockImplementation(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ request_id: "r", transcript: {} }),
+      text: async () => JSON.stringify({ request_id: "r", transcript: {} }),
+    }) as Response);
+    vi.stubGlobal("fetch", fetchMock);
+
+    await createRestClient().transcribeAudio({
+      audio: new Blob(["x"]),
+      requestId: "r",
+      sessionId: getEvaSessionId(),
+    });
+    const [, init] = fetchMock.mock.calls[0];
+    expect((init.headers as Record<string, string>)["X-EVA-Session-ID"]).toBe(getEvaSessionId());
+  });
+
+  it("decision proposals carry the transport session identity and a fresh request id", async () => {
+    const client = createMockClient();
+    const proposeSpy = vi.spyOn(client, "proposeDecisionOutcome");
+
+    const { default: DecisionsFresh } = await importWithClient<typeof import("../pages/Decisions")>("../pages/Decisions", client);
+    render(<DecisionsFresh />);
+    fireEvent.click(await screen.findByRole("button", { name: /Open Faktura za migracje/i }));
+    fireEvent.click(await screen.findByRole("button", { name: "RECORD ACCEPT" }));
+    await screen.findByText(/High Risk — Explicit Confirmation Required/i);
+
+    const [decisionId, request] = proposeSpy.mock.calls[0] as [string, DecisionOutcomeProposalRequest];
+    expect(decisionId).toBe("dec-demo-finance-001");
+    // SAME session authority the transport attaches to every request
+    expect(request.session_id).toBe(getEvaSessionId());
+    // a genuine fresh request id — never `req-<Date.now()>`
+    expect(request.request_id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+    // the mock echoes the proposal session identity into the canonical action
+    const stored = await client.getAction("act-demo-decision-record-dec-demo-finance-001");
+    expect(stored.action.session_id).toBe(getEvaSessionId());
+  });
+
+  it("no demo/hardcoded session id remains in frontend source", () => {
+    // Raw-content scan of the frontend source tree via Vite's glob — no
+    // parallel module graph execution, no node builtins.
+    const modules = import.meta.glob("../**/*.{ts,tsx}", {
+      eager: true,
+      query: "?raw",
+      import: "default",
+    }) as Record<string, string>;
+    const offenders = Object.keys(modules).filter(
+      (p) => !p.endsWith("types.generated.ts") && modules[p].includes("sess-demo-001")
+    );
+    expect(offenders).toEqual([]);
+  });
+});
+
+describe("Lost confirm response enters reconciliation, never detail", () => {
+  async function openApprovalFor(client: EvaClient) {
+    const { default: DecisionsFresh } = await importWithClient<typeof import("../pages/Decisions")>("../pages/Decisions", client);
+    render(<DecisionsFresh />);
+    fireEvent.click(await screen.findByRole("button", { name: /Open Faktura za migracje/i }));
+    fireEvent.click(await screen.findByRole("button", { name: "RECORD ACCEPT" }));
+    await screen.findByText(/High Risk — Explicit Confirmation Required/i);
+  }
+
+  it("challenge failure is a PRE-CONFIRM failure: same proposal, retryable error, no confirm request", async () => {
+    const client = createMockClient();
+    const challengeSpy = vi.spyOn(client, "getApprovalChallenge").mockRejectedValueOnce(new Error("challenge down"));
+    const confirmSpy = vi.spyOn(client, "confirmAction");
+
+    await openApprovalFor(client);
+    fireEvent.click(screen.getByRole("button", { name: "Confirm (Approve)" }));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(/Nothing was confirmed/);
+    // the SAME proposal is still presented with a retry path
+    expect(screen.getByRole("button", { name: "Confirm (Approve)" })).toBeInTheDocument();
+    expect(screen.getByText(/High Risk — Explicit Confirmation Required/i)).toBeInTheDocument();
+    expect(confirmSpy).not.toHaveBeenCalled();
+
+    // retrying on the same action succeeds end-to-end
+    fireEvent.click(screen.getByRole("button", { name: "Confirm (Approve)" }));
+    expect(await screen.findByText("Action status: Succeeded.")).toBeInTheDocument();
+    expect(confirmSpy).toHaveBeenCalledTimes(1);
+    expect(challengeSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("challenge binding mismatch is pre-confirm: no confirm request is sent", async () => {
+    const client = createMockClient();
+    vi.spyOn(client, "getApprovalChallenge").mockResolvedValue({
+      action_id: "act-other",
+      revision: 99,
+      arguments_digest: "sha256:other",
+      challenge: "tok",
+      expires_at: "2026-09-21T12:05:00+02:00",
+    });
+    const confirmSpy = vi.spyOn(client, "confirmAction");
+
+    await openApprovalFor(client);
+    fireEvent.click(screen.getByRole("button", { name: "Confirm (Approve)" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(/Nothing was confirmed/);
+    expect(confirmSpy).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "Confirm (Approve)" })).toBeInTheDocument();
+  });
+
+  it("confirm transport rejects after invocation → reconciliation; the action id survives; GET SUCCEEDED renders success", async () => {
+    const client = createMockClient();
+    const proposeSpy = vi.spyOn(client, "proposeDecisionOutcome");
+    vi.spyOn(client, "confirmAction").mockRejectedValueOnce(new Error("response lost"));
+    const succeeded = syntheticAction({ id: "act-demo-decision-record-dec-demo-finance-001", status: "succeeded" });
+    const getActionSpy = vi.spyOn(client, "getAction").mockResolvedValue({
+      action: succeeded,
+      last_result: {
+        call_id: "call-x",
+        tool: "decision.record_outcome",
+        status: "ok",
+        data: { decision_id: "dec-demo-finance-001", outcome: "accept" },
+        error: null,
+        sources: [],
+        action_id: succeeded.id,
+        duration_ms: 12,
+      },
+    });
+
+    await openApprovalFor(client);
+    fireEvent.click(screen.getByRole("button", { name: "Confirm (Approve)" }));
+
+    expect(await screen.findByText(/Authoritative action state: Succeeded/)).toBeInTheDocument();
+    // recovery queried the authoritative state for the SAME action id
+    expect(getActionSpy).toHaveBeenCalledWith("act-demo-decision-record-dec-demo-finance-001");
+    expect(screen.getAllByText(/act-demo-decision-record-dec-demo-finance-001/).length).toBeGreaterThan(0);
+    // no second proposal while uncertain
+    expect(proposeSpy).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("button", { name: "RECORD ACCEPT" })).not.toBeInTheDocument();
+  });
+
+  it("GET returns UNKNOWN → explicit truthful warning, action id retained, only state checking possible", async () => {
+    const client = createMockClient();
+    const proposeSpy = vi.spyOn(client, "proposeDecisionOutcome");
+    vi.spyOn(client, "confirmAction").mockRejectedValueOnce(new Error("response lost"));
+    vi.spyOn(client, "getAction").mockResolvedValue({
+      action: syntheticAction({ id: "act-demo-decision-record-dec-demo-finance-001", status: "unknown" }),
+    });
+
+    await openApprovalFor(client);
+    fireEvent.click(screen.getByRole("button", { name: "Confirm (Approve)" }));
+
+    expect(await screen.findByText(/Outcome unknown\. Do not repeat this action until its state is reconciled\./)).toBeInTheDocument();
+    expect(screen.getByText(/Authoritative action state: Unknown/)).toBeInTheDocument();
+    expect(screen.getByText(/act-demo-decision-record-dec-demo-finance-001/)).toBeInTheDocument();
+    // only reconciliation is possible — no new proposal, no confirm retry
+    expect(screen.getByRole("button", { name: "Check state" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "RECORD ACCEPT" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Confirm (Approve)" })).not.toBeInTheDocument();
+    expect(proposeSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("GET returns EXECUTING → in-progress state with a bounded manual recheck", async () => {
+    const client = createMockClient();
+    vi.spyOn(client, "confirmAction").mockRejectedValueOnce(new Error("response lost"));
+    const getActionSpy = vi.spyOn(client, "getAction")
+      .mockResolvedValueOnce({ action: syntheticAction({ id: "act-demo-decision-record-dec-demo-finance-001", status: "executing" }) })
+      .mockResolvedValueOnce({ action: syntheticAction({ id: "act-demo-decision-record-dec-demo-finance-001", status: "succeeded" }) });
+
+    await openApprovalFor(client);
+    fireEvent.click(screen.getByRole("button", { name: "Confirm (Approve)" }));
+
+    expect(await screen.findByText(/Authoritative action state: Executing/)).toBeInTheDocument();
+    expect(screen.getByText(/accepted and is being processed/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Check state" })).toBeInTheDocument();
+
+    // manual bounded recheck — no auto-loop
+    fireEvent.click(screen.getByRole("button", { name: "Check state" }));
+    expect(await screen.findByText(/Authoritative action state: Succeeded/)).toBeInTheDocument();
+    expect(getActionSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("GET returns PENDING → retry the SAME proposal with a fresh challenge; no new proposal", async () => {
+    const client = createMockClient();
+    const proposeSpy = vi.spyOn(client, "proposeDecisionOutcome");
+    const challengeSpy = vi.spyOn(client, "getApprovalChallenge");
+    const confirmSpy = vi.spyOn(client, "confirmAction");
+    confirmSpy.mockRejectedValueOnce(new Error("response lost"));
+    // The authoritative GET reports the same binding the stored proposal has.
+    vi.spyOn(client, "getAction").mockResolvedValue({
+      action: syntheticAction({
+        id: "act-demo-decision-record-dec-demo-finance-001",
+        arguments_digest: "sha256:demo-digest-decision-record-dec-demo-finance-001",
+        status: "pending",
+      }),
+    });
+
+    await openApprovalFor(client);
+    fireEvent.click(screen.getByRole("button", { name: "Confirm (Approve)" }));
+
+    expect(await screen.findByText(/still pending/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Confirm (Approve)" })).toBeInTheDocument();
+    expect(proposeSpy).toHaveBeenCalledTimes(1);
+
+    // retry confirmation on THIS action; a fresh challenge is fetched
+    fireEvent.click(screen.getByRole("button", { name: "Confirm (Approve)" }));
+    expect(await screen.findByText("Action status: Succeeded.")).toBeInTheDocument();
+    expect(challengeSpy).toHaveBeenCalledTimes(2);
+    expect(confirmSpy).toHaveBeenCalledTimes(2);
+    const [retryActionId] = confirmSpy.mock.calls[1];
+    expect(retryActionId).toBe("act-demo-decision-record-dec-demo-finance-001");
+  });
+
+  it("a reconciliation read failure stays uncertain with a manual Check state retry", async () => {
+    const client = createMockClient();
+    vi.spyOn(client, "confirmAction").mockRejectedValueOnce(new Error("response lost"));
+    const getActionSpy = vi.spyOn(client, "getAction")
+      .mockRejectedValueOnce(new Error("read failed"))
+      .mockResolvedValueOnce({ action: syntheticAction({ id: "act-demo-decision-record-dec-demo-finance-001", status: "succeeded" }) });
+
+    await openApprovalFor(client);
+    fireEvent.click(screen.getByRole("button", { name: "Confirm (Approve)" }));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(/outcome is still uncertain/);
+    expect(screen.getByText(/act-demo-decision-record-dec-demo-finance-001/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "RECORD ACCEPT" })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Check state" }));
+    expect(await screen.findByText(/Authoritative action state: Succeeded/)).toBeInTheDocument();
+    expect(getActionSpy).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("Deferred decisions remain actionable", () => {
+  it("a deferred decision can still RECORD ACCEPT through the same HIGH approval flow", async () => {
+    const client = createMockClient();
+    await client.deferDecision("dec-demo-finance-001");
+
+    const { default: DecisionsFresh } = await importWithClient<typeof import("../pages/Decisions")>("../pages/Decisions", client);
+    render(<DecisionsFresh />);
+    fireEvent.click(await screen.findByRole("button", { name: /Open Faktura za migracje/i }));
+
+    // Deferred presentation AND actionable Record Outcome with the SAME safety copy
+    expect((await screen.findAllByText("Deferred")).length).toBeGreaterThan(0);
+    expect(screen.getByText(/internal\/local decision record/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "RECORD ACCEPT" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "RECORD REJECT" })).toBeEnabled();
+    // DEFER is not offered again — repeating it is meaningless
+    expect(screen.queryByRole("button", { name: "DEFER" })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "RECORD ACCEPT" }));
+    // the SAME HIGH approval UI — voice is never sufficient
+    expect(await screen.findByText(/High Risk — Explicit Confirmation Required/i)).toBeInTheDocument();
+    expect(screen.getByText(/not sufficient/i)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Confirm (Approve)" }));
+    expect(await screen.findByText("Action status: Succeeded.")).toBeInTheDocument();
+  });
+
+  it("a deferred decision can RECORD REJECT and the reject outcome is preserved end-to-end", async () => {
+    const client = createMockClient();
+    await client.deferDecision("dec-demo-finance-001");
+
+    const { default: DecisionsFresh } = await importWithClient<typeof import("../pages/Decisions")>("../pages/Decisions", client);
+    render(<DecisionsFresh />);
+    fireEvent.click(await screen.findByRole("button", { name: /Open Faktura za migracje/i }));
+    fireEvent.click(await screen.findByRole("button", { name: "RECORD REJECT" }));
+
+    expect(await screen.findByText(/High Risk — Explicit Confirmation Required/i)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Confirm (Approve)" }));
+    expect(await screen.findByText("Action status: Succeeded.")).toBeInTheDocument();
+
+    // The stored decision now carries the REJECT outcome from the deferred state
+    const list = await client.getDecisions();
+    expect(list.items[0]).toMatchObject({ status: "resolved", outcome: "reject" });
+  });
+});
+
+describe("Mock decision state is client-local and coherent", () => {
+  interface MockInternals {
+    focus: FocusSession | null;
+    decisions: readonly Decision[];
+    proposal: ProposedAction | null;
+  }
+  const internalsOf = (client: EvaClient): MockInternals =>
+    (client as unknown as { __mockInternals: MockInternals }).__mockInternals;
+
+  it("defer updates the SAME stored decision visible to list and detail reads", async () => {
+    const client = createMockClient();
+    await client.deferDecision("dec-demo-finance-001");
+
+    const list = await client.getDecisions();
+    expect(list.items[0].status).toBe("deferred");
+    const detail = await client.getDecision("dec-demo-finance-001");
+    expect(detail.decision.status).toBe("deferred");
+
+    // imported fixture objects were never mutated
+    expect((fixtureDecision as unknown as Decision).status).toBe("needs_review");
+    expect(list.items[0]).not.toBe(fixtureDecision);
+  });
+
+  it("a recorded outcome appears on list AND detail reload; fixtures stay pristine", async () => {
+    const client = createMockClient();
+    const { action } = await client.proposeDecisionOutcome("dec-demo-finance-001", {
+      outcome: "accept",
+      session_id: "sess-x",
+      request_id: "req-x",
+    });
+    const challenge = await client.getApprovalChallenge(action.id);
+    await client.confirmAction(action.id, {
+      action_id: action.id,
+      revision: action.revision,
+      arguments_digest: action.arguments_digest,
+      choice: "approve",
+      challenge: challenge.challenge,
+    });
+
+    const list = await client.getDecisions();
+    expect(list.items[0]).toMatchObject({
+      status: "resolved",
+      outcome: "accept",
+      proposed_action_id: action.id,
+    });
+    expect(list.items[0].outcome_recorded_at).toBeTruthy();
+    const detail = await client.getDecision("dec-demo-finance-001");
+    expect(detail.decision.outcome).toBe("accept");
+    expect((fixtureDecision as unknown as Decision).status).toBe("needs_review");
+    expect((fixtureDecision as unknown as Decision).outcome).toBeNull();
+  });
+
+  it("a new mock client begins from pristine fixture state", async () => {
+    const first = createMockClient();
+    await first.deferDecision("dec-demo-finance-001");
+    await first.proposeDecisionOutcome("dec-demo-finance-001", { outcome: "accept", session_id: "s", request_id: "r" });
+
+    const fresh = createMockClient();
+    const list = await fresh.getDecisions();
+    expect(list.items[0].status).toBe("needs_review");
+    expect(internalsOf(fresh).proposal).toBeNull();
+    expect(internalsOf(fresh).decisions).not.toBe(internalsOf(first).decisions);
+  });
+
+  it("failed Focus start/stop and failed defer commit NOTHING (commit-on-success)", async () => {
+    const failing = createMockClient({ mode: "error" });
+    const before = internalsOf(failing).decisions;
+    const focusBefore = internalsOf(failing).focus;
+
+    await expect(failing.startFocus({ duration_minutes: 60, threshold: "high" })).rejects.toThrow("Simulated transport failure");
+    await expect(failing.stopFocus()).rejects.toThrow("Simulated transport failure");
+    await expect(failing.deferDecision("dec-demo-finance-001")).rejects.toThrow("Simulated transport failure");
+
+    const internals = internalsOf(failing);
+    expect(internals.decisions).toBe(before);
+    expect(internals.decisions[0].status).toBe("needs_review");
+    expect(internals.focus).toBe(focusBefore);
+    expect(internals.focus?.id).toBe("focus-demo-001");
+    expect(internals.focus?.stopped_at).toBeNull();
+    expect(internals.proposal).toBeNull();
+  });
+
+  it("pending Focus start/stop never resolve and never secretly activate or stop Focus", async () => {
+    const pending = createMockClient({ mode: "pending" });
+    let startSettled = false;
+    let stopSettled = false;
+    void pending.startFocus({ duration_minutes: 60, threshold: "medium" }).then(() => {
+      startSettled = true;
+    });
+    void pending.stopFocus().then(() => {
+      stopSettled = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(startSettled).toBe(false);
+    expect(stopSettled).toBe(false);
+    const internals = internalsOf(pending);
+    expect(internals.focus?.id).toBe("focus-demo-001");
+    expect(internals.focus?.stopped_at).toBeNull();
+    expect(internals.focus?.threshold).toBe("medium"); // fixture session untouched
+  });
+
+  it("pending/error proposals commit no stored proposal and leave prior state untouched", async () => {
+    const withPrior = createMockClient();
+    await withPrior.proposeDecisionOutcome("dec-demo-finance-001", { outcome: "accept", session_id: "s", request_id: "r" });
+    const priorProposal = internalsOf(withPrior).proposal;
+    expect(priorProposal).not.toBeNull();
+
+    const pending = createMockClient({ mode: "pending" });
+    let settled = false;
+    void pending
+      .proposeDecisionOutcome("dec-demo-finance-001", { outcome: "reject", session_id: "s", request_id: "r" })
+      .then(() => {
+        settled = true;
+      });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(settled).toBe(false);
+    expect(internalsOf(pending).proposal).toBeNull();
+
+    const failing = createMockClient({ mode: "error" });
+    await expect(
+      failing.proposeDecisionOutcome("dec-demo-finance-001", { outcome: "reject", session_id: "s", request_id: "r" })
+    ).rejects.toThrow("Simulated transport failure");
+    expect(internalsOf(failing).proposal).toBeNull();
+  });
+
+  it("a rejected approval leaves the decision unresolved (no fabricated outcome)", async () => {
+    const client = createMockClient();
+    const { action } = await client.proposeDecisionOutcome("dec-demo-finance-001", {
+      outcome: "reject",
+      session_id: "sess-reject",
+      request_id: "req-reject",
+    });
+    const challenge = await client.getApprovalChallenge(action.id);
+    const response = await client.confirmAction(action.id, {
+      action_id: action.id,
+      revision: action.revision,
+      arguments_digest: action.arguments_digest,
+      choice: "reject",
+      challenge: challenge.challenge,
+    });
+
+    expect(response.action.status).toBe("rejected");
+    const list = await client.getDecisions();
+    expect(list.items[0].status).toBe("needs_review");
+    expect(list.items[0].outcome).toBeNull();
+    expect(list.items[0].proposed_action_id).toBeNull();
+  });
+});
+
+describe("Focus mutation errors are visible, truthful and retryable", () => {
+  const activeSession: FocusSession = {
+    id: "focus-ui-001",
+    starts_at: "2026-09-21T12:00:00+02:00",
+    ends_at: "2026-09-21T13:00:00+02:00",
+    threshold: "high",
+    sender_overrides: ["ceo.demo@example.com"],
+    policy_version: "policy-v1",
+    stopped_at: null,
+  };
+  const stopSummary: FocusCompletionSummary = {
+    focus_session_id: "focus-ui-001",
+    ended_at: "2026-09-21T12:40:00+02:00",
+    total_received: 1,
+    deferred_count: 0,
+    decision_count: 0,
+    action_count: 0,
+    fyi_count: 1,
+    attention_item_ids: [],
+  };
+
+  function focusClient(overrides: Partial<EvaClient>): EvaClient {
+    return {
+      // Canonical fixture reads so Today renders the main layout (with the
+      // FocusPanel) instead of its full-page empty state.
+      getTodayCalendar: async () => ({
+        day: "2026-09-21",
+        timezone: "Europe/Warsaw",
+        meetings: [fixtureAcme as Meeting],
+        retrieval_status: "complete",
+      }),
+      getAttention: async () => ({ items: [fixtureAttention] } as unknown as AttentionListResponse),
+      getDecisions: async () => ({ items: [fixtureDecision] as unknown as DecisionListResponse["items"] }),
+      getCurrentFocus: async () => ({ session: null }),
+      ...stubEvaClient(),
+      ...overrides,
+    } as EvaClient;
+  }
+
+  it("start failure keeps Focus off with an accessible retryable error; success clears it", async () => {
+    let startCalls = 0;
+    let current: FocusSession | null = null;
+    const client = focusClient({
+      getCurrentFocus: async () => ({ session: current }),
+      startFocus: async () => {
+        startCalls += 1;
+        if (startCalls === 1) throw new Error("raw provider text must not surface");
+        current = activeSession;
+        return { session: activeSession };
+      },
+    });
+
+    const { default: TodayFresh } = await importWithClient<typeof import("../pages/Today")>("../pages/Today", client);
+    render(<TodayFresh />);
+    await screen.findByText("Focus off");
+
+    fireEvent.click(screen.getByRole("button", { name: "Start Focus" }));
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("Focus could not be started. Try again.");
+    // Focus remains OFF — no pretended session
+    expect(screen.getByText("Focus off")).toBeInTheDocument();
+    expect(screen.queryByText("Focus active")).not.toBeInTheDocument();
+
+    // retry through the existing form succeeds and clears the error
+    fireEvent.click(screen.getByRole("button", { name: "Start Focus" }));
+    expect(await screen.findByText("Focus active")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("stop failure keeps the active session visible and the Stop button usable; retry succeeds", async () => {
+    let stopCalls = 0;
+    let current: FocusSession | null = activeSession;
+    const client = focusClient({
+      getCurrentFocus: async () => ({ session: current }),
+      stopFocus: async () => {
+        stopCalls += 1;
+        if (stopCalls === 1) throw new Error("raw provider text must not surface");
+        current = null;
+        return { session: { ...activeSession, stopped_at: "2026-09-21T12:40:00+02:00" }, summary: stopSummary } as FocusStopResponse;
+      },
+    });
+
+    const { default: TodayFresh } = await importWithClient<typeof import("../pages/Today")>("../pages/Today", client);
+    render(<TodayFresh />);
+    await screen.findByText("Focus active");
+
+    fireEvent.click(screen.getByRole("button", { name: "Stop Focus" }));
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("Focus could not be stopped. Focus is still active.");
+    // the current session remains visibly ACTIVE and retryable
+    expect(screen.getByText("Focus active")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Stop Focus" })).toBeEnabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Stop Focus" }));
+    expect(await screen.findByText("Focus Completed")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).toBeNull();
   });
 });
