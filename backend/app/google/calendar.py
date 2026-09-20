@@ -35,7 +35,10 @@ from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
 from ..contracts.domain import (
+    AgendaSectionMode,
     AllDaySpan,
+    CalendarCreateEventArguments,
+    CalendarRescheduleEventArguments,
     Meeting,
     MeetingPriority,
     MeetingRef,
@@ -43,6 +46,7 @@ from ..contracts.domain import (
     Reason,
     ReasonOrigin,
     RetrievalStatus,
+    SendUpdates,
     SourceKind,
     SourceRef,
     TimedSpan,
@@ -163,6 +167,16 @@ class EventPage:
     next_page_token: str | None = None
 
 
+@dataclass(frozen=True)
+class CalendarMutationState:
+    """INTERNAL A04 mutation-safety view (never a public API contract). The
+    canonical Meeting stays provider-shape-free; recurrence facts needed only
+    by the guarded executor are carried alongside it."""
+
+    meeting: Meeting
+    is_recurring: bool
+
+
 class CalendarService:
     """Read-only Calendar API surface (list/get). Writes are A04 territory."""
 
@@ -274,3 +288,186 @@ class CalendarService:
             retrieval_status=status,
             retrieval_notes=notes,
         )
+
+    # ------------------------------------------------------------------ #
+    # A04 guarded mutation adapters (INTERNAL: only the ToolExecutor may
+    # call these - never an API route or any other surface). Every mutation
+    # performs a GET read-back through normalize_event() so a success that
+    # cannot be verified is reported by the executor as UNKNOWN, not OK.
+    # ------------------------------------------------------------------ #
+
+    def create_event(
+        self,
+        *,
+        args: CalendarCreateEventArguments,
+        google_event_id: str,
+        calendar_id: str = "primary",
+    ) -> Meeting:
+        """POST a new event with the DURABLE client-generated event id (the
+        reconciliation anchor). sendUpdates is passed exactly as approved.
+
+        REST shape per Google events.insert: the client-supplied ID lives in
+        the Event resource body (``id``), NOT in a query parameter; query
+        params carry only supported insert options such as sendUpdates."""
+        body = create_event_body(args)
+        body["id"] = google_event_id
+        payload = self._http.post_json(
+            f"{CALENDAR_BASE}/calendars/{calendar_id}/events",
+            {"sendUpdates": google_send_updates(args.send_updates)},
+            body,
+        )
+        # Read-back through the SAME normalization path as reads (LVI/LVIII):
+        # trust the GET, not only the POST response.
+        event_id = payload.get("id") or google_event_id
+        return self.get_event(calendar_id=calendar_id, event_id=event_id)
+
+    def get_event_mutation_state(self, *, calendar_id: str, event_id: str) -> "CalendarMutationState":
+        """INTERNAL A04 mutation-safety read (not a public contract surface).
+
+        Returns the canonical Meeting PLUS raw-payload facts the canonical
+        contract intentionally does not carry: whether the resource belongs to
+        a recurring series. An event is recurring when it has a
+        ``recurringEventId`` (series instance) OR a non-empty ``recurrence``
+        array (series master). Normal A02 reads are unchanged."""
+        payload = self._http.get_json(
+            f"{CALENDAR_BASE}/calendars/{calendar_id}/events/{event_id}", None
+        )
+        meeting = normalize_event(calendar_id, payload, datetime.now(timezone.utc))
+        is_recurring = bool(payload.get("recurringEventId")) or bool(payload.get("recurrence"))
+        return CalendarMutationState(meeting=meeting, is_recurring=is_recurring)
+
+    def reschedule_event(
+        self,
+        *,
+        args: CalendarRescheduleEventArguments,
+        if_match: str,
+        calendar_id: str = "primary",
+    ) -> Meeting:
+        """PATCH only the span fields with If-Match on the approved ETag.
+        Nothing else on the event is touched."""
+        start, end = span_payload(args.new_span)
+        self._http.patch_json(
+            f"{CALENDAR_BASE}/calendars/{calendar_id}/events/{args.ref.event_id}",
+            {"sendUpdates": google_send_updates(args.send_updates)},
+            {"start": start, "end": end},
+            {"If-Match": if_match},
+        )
+        return self.get_event(calendar_id=calendar_id, event_id=args.ref.event_id)
+
+    def update_agenda_event(
+        self,
+        *,
+        calendar_id: str,
+        event_id: str,
+        new_description: str,
+        send_updates: SendUpdates,
+        if_match: str,
+    ) -> Meeting:
+        """PATCH only the description with the EVA section replaced; all other
+        event data is untouched. If-Match enforces the approved snapshot."""
+        self._http.patch_json(
+            f"{CALENDAR_BASE}/calendars/{calendar_id}/events/{event_id}",
+            {"sendUpdates": google_send_updates(send_updates)},
+            {"description": new_description},
+            {"If-Match": if_match},
+        )
+        return self.get_event(calendar_id=calendar_id, event_id=event_id)
+
+
+# --------------------------------------------------------------------------- #
+# Mutation payload helpers (pure, deterministic, unit-tested)
+# --------------------------------------------------------------------------- #
+
+#: Stable EVA agenda-section delimiters inside the event description. HTML
+#: comments are invisible in calendar UIs, unambiguous to parse and never
+#: invented for user text.
+EVA_AGENDA_START = "<!-- EVA-AGENDA-BEGIN -->"
+EVA_AGENDA_END = "<!-- EVA-AGENDA-END -->"
+
+
+def google_send_updates(send: SendUpdates) -> str:
+    """Canonical internal enum -> Google sendUpdates parameter."""
+    return {
+        SendUpdates.ALL: "all",
+        SendUpdates.EXTERNAL_ONLY: "externalOnly",
+        SendUpdates.NONE: "none",
+    }[send]
+
+
+def span_payload(span: TimedSpan | AllDaySpan) -> tuple[dict[str, str], dict[str, str]]:
+    """Contract span -> Google start/end payload.
+
+    Never converts between kinds: timed stays dateTime+timeZone, all-day
+    stays date with the EXCLUSIVE end preserved exactly."""
+    if isinstance(span, TimedSpan):
+        return (
+            {"dateTime": span.start.isoformat(), "timeZone": span.timezone},
+            {"dateTime": span.end.isoformat(), "timeZone": span.timezone},
+        )
+    if isinstance(span, AllDaySpan):
+        return (
+            {"date": span.start_date.isoformat()},
+            {"date": span.end_exclusive.isoformat()},  # Google's end.date is exclusive
+        )
+    raise ValueError("unsupported span representation")
+
+
+def create_event_body(args: CalendarCreateEventArguments) -> dict[str, Any]:
+    start, end = span_payload(args.span)
+    body: dict[str, Any] = {
+        "summary": args.title,
+        "start": start,
+        "end": end,
+    }
+    if args.description is not None:
+        body["description"] = args.description
+    if args.location is not None:
+        body["location"] = args.location
+    if args.attendees:
+        # Approved canonical addresses only; the executor never re-adds or
+        # reclassifies attendees here (Participant.internal stays non-authorization).
+        body["attendees"] = [
+            {"email": a.email, **({"displayName": a.name} if a.name else {})}
+            for a in args.attendees
+        ]
+    return body
+
+
+def render_agenda_section(markdown: str) -> str:
+    return f"{EVA_AGENDA_START}\n{markdown.strip(chr(10))}\n{EVA_AGENDA_END}"
+
+
+def _find_agenda_section(description: str) -> tuple[int, int] | None:
+    """Locate the EVA section (begin..end inclusive). Returns None when no
+    well-formed section exists; a stray END before any BEGIN is treated as
+    no section (never user text we did not write)."""
+    begin = description.find(EVA_AGENDA_START)
+    if begin == -1:
+        return None
+    end = description.find(EVA_AGENDA_END, begin)
+    if end == -1:
+        return None
+    return begin, end + len(EVA_AGENDA_END)
+
+
+def apply_agenda_update(
+    description: str | None, markdown: str, mode: AgendaSectionMode
+) -> str:
+    """Deterministic EVA-section merge; unrelated text is byte-preserved.
+
+    ADD: appends exactly one section; if a section already exists the
+    description is returned UNCHANGED (idempotent - never duplicates).
+    UPDATE: replaces only the existing EVA section, preserving everything
+    before/after it exactly; with no existing section it adds one."""
+    section = render_agenda_section(markdown)
+    base = description or ""
+    span = _find_agenda_section(base)
+    if mode == AgendaSectionMode.ADD:
+        if span is not None:
+            return base  # idempotent: never a second EVA section
+        return f"{base}\n\n{section}" if base else section
+    # UPDATE
+    if span is None:
+        return f"{base}\n\n{section}" if base else section
+    begin, end = span
+    return base[:begin] + section + base[end:]
