@@ -685,3 +685,95 @@ def test_credential_persistence_logs_no_token_values(tmp_path, caplog) -> None:
     text = caplog.text
     assert "rotated-log-marker" not in text
     assert ACCESS_TOKEN not in text and REFRESH_TOKEN not in text
+
+
+# ---------------------------------------------------------------------------
+# CORE FINAL AUTH RACE FIX - OAuth callback commit vs clear_credentials()
+# ---------------------------------------------------------------------------
+
+
+def test_callback_cannot_resurrect_credentials_after_clear(tmp_path, caplog) -> None:
+    import threading
+
+    auth = _connected_auth(tmp_path)               # connected; epoch baseline
+    assert _credentials_file(tmp_path).exists()
+
+    exchange_entered = threading.Event()
+    release_exchange = threading.Event()
+
+    def blocking_exchanger(code):                  # network stand-in, blocks mid-flight
+        exchange_entered.set()
+        assert release_exchange.wait(5)
+        return {
+            "access_token": ACCESS_TOKEN,
+            "refresh_token": REFRESH_TOKEN,
+            "scope": " ".join(REQUIRED_SCOPES),
+            "expires_in": 3600,
+        }
+
+    auth._exchange = blocking_exchanger            # epoch already snapshotted by now
+    state = auth.state_store.issue()
+    box: dict[str, object] = {}
+
+    def run() -> None:
+        box["r"] = auth.handle_callback({"code": "c-late", "state": state})
+
+    worker = threading.Thread(target=run)
+    with caplog.at_level("DEBUG"):
+        worker.start()
+        assert exchange_entered.wait(5)            # callback in flight (past snapshot)
+        auth.clear_credentials()                   # disconnect lands mid-exchange
+        release_exchange.set()                     # callback now tries to commit
+        worker.join(timeout=30)
+
+    result = box["r"]
+    assert result.outcome is not OAuthOutcome.CONNECTED
+    assert "no longer current" in result.detail.lower()
+    # The stale grant was NOT written: the later disconnect stays authoritative.
+    assert not _credentials_file(tmp_path).exists()
+    # No token material leaks into logs on the superseded path.
+    assert ACCESS_TOKEN not in caplog.text and REFRESH_TOKEN not in caplog.text
+
+
+def test_callback_started_after_clear_connects_normally(tmp_path) -> None:
+    auth = _connected_auth(tmp_path)
+    auth.clear_credentials()                       # epoch advances, file gone
+    assert not _credentials_file(tmp_path).exists()
+
+    state = auth.state_store.issue()               # a NEW flow begun after the clear
+    result = auth.handle_callback({"code": "c-after-clear", "state": state})
+    assert result.outcome is OAuthOutcome.CONNECTED  # starts at the current epoch -> stores
+    assert _credentials_file(tmp_path).exists()
+
+
+def test_stale_callback_reports_sanitized_detail_without_generation(tmp_path) -> None:
+    import threading
+
+    auth = _connected_auth(tmp_path)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocking_exchanger(code):
+        entered.set()
+        assert release.wait(5)
+        return {
+            "access_token": ACCESS_TOKEN, "refresh_token": REFRESH_TOKEN,
+            "scope": " ".join(REQUIRED_SCOPES), "expires_in": 3600,
+        }
+
+    auth._exchange = blocking_exchanger
+    state = auth.state_store.issue()
+    box: dict[str, object] = {}
+    worker = threading.Thread(
+        target=lambda: box.setdefault("r", auth.handle_callback({"code": "x", "state": state}))
+    )
+    worker.start()
+    assert entered.wait(5)
+    auth.clear_credentials()
+    release.set()
+    worker.join(timeout=30)
+
+    detail = str(box["r"].detail).lower()
+    # Detail must not expose the internal epoch counter, file paths or tokens.
+    assert "epoch" not in detail and "generation" not in detail
+    assert str(tmp_path) not in detail and ACCESS_TOKEN not in detail

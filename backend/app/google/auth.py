@@ -193,6 +193,12 @@ class GoogleAuth:
         # concurrent expired-token requests perform AT MOST one refresh (the
         # second caller re-reads the freshly persisted state under the lock).
         self._refresh_lock = threading.Lock()
+        # Same-instance credential lifecycle generation. clear_credentials()
+        # increments it UNDER _refresh_lock; an OAuth callback snapshots it
+        # before the network exchange and rechecks it at the persistence
+        # boundary, so a disconnect that lands mid-exchange invalidates that
+        # callback instead of letting it resurrect credentials afterwards.
+        self._credential_epoch = 0
         self._exchange = (
             token_exchanger
             if token_exchanger is not None
@@ -260,6 +266,11 @@ class GoogleAuth:
         if not code:
             return CallbackResult(OAuthOutcome.EXCHANGE_FAILED, "callback carried no authorization code")
 
+        # Snapshot the credential lifecycle generation BEFORE the network
+        # exchange. A clear_credentials() that lands while this exchange is in
+        # flight increments the epoch under the shared lock, and the commit
+        # below refuses to write a grant older than that disconnect.
+        epoch_at_start = self._credential_epoch
         try:
             info = self._exchange(code)
         except GoogleAuthError as exc:
@@ -275,12 +286,25 @@ class GoogleAuth:
                 missing_scopes=missing,
             )
 
+        # Final credential commit is serialized with authorized_session() and
+        # clear_credentials() under the SAME lifecycle lock (never held during
+        # the exchange). If a newer disconnect bumped the epoch, this callback
+        # is stale: store nothing and report a sanitized non-connected result.
         try:
-            self._store_credentials(info, granted)
+            with self._refresh_lock:
+                if self._credential_epoch != epoch_at_start:
+                    logger.warning(
+                        "oauth callback superseded by a newer credential change; nothing stored"
+                    )
+                    return CallbackResult(
+                        OAuthOutcome.EXCHANGE_FAILED,
+                        "authorization is no longer current; start the flow again",
+                    )
+                self._store_credentials(info, granted)
+                self._reauth_required = False
+                self._last_refresh_error = None
         except GoogleAuthError as exc:
             return CallbackResult(OAuthOutcome.EXCHANGE_FAILED, str(exc))
-        self._reauth_required = False
-        self._last_refresh_error = None
         return CallbackResult(OAuthOutcome.CONNECTED, "account connected with required scopes")
 
     # -- credential storage ------------------------------------------------------
@@ -411,6 +435,10 @@ class GoogleAuth:
                 raise GoogleAuthError("could not remove stored credentials") from exc
             self._reauth_required = False
             self._last_refresh_error = None
+            # Invalidate any OAuth callback whose exchange started before this
+            # disconnect: its commit rechecks the epoch under this same lock
+            # and refuses to resurrect credentials.
+            self._credential_epoch += 1
 
     # -- authorized access ---------------------------------------------------------
 
