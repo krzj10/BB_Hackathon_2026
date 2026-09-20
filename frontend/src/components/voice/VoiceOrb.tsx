@@ -163,7 +163,9 @@ export function VoiceOrb({
         <span
           className={cn(
             "absolute -top-16 right-0 whitespace-nowrap rounded-full bg-card px-2.5 py-1 text-[11px] font-medium text-muted-foreground shadow-panel ring-1 ring-inset ring-border/70",
-            state === "idle" ? "opacity-100" : "opacity-0"
+            // Visible while idle ("Hold to talk") AND while listening
+            // ("Release to transcribe"); processing/error states hide it.
+            state === "idle" || state === "listening" ? "opacity-100" : "opacity-0"
           )}
         >
           {state === "listening" ? "Release to transcribe" : instructional}

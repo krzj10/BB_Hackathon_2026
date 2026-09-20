@@ -1,8 +1,17 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { getEvaSessionId, newRequestId } from "../lib/session";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  getEvaSessionId,
+  newRequestId,
+  resetEvaSessionIdForTests,
+} from "../lib/session";
+
+beforeEach(() => {
+  resetEvaSessionIdForTests();
+});
 
 afterEach(() => {
   window.sessionStorage.clear();
+  resetEvaSessionIdForTests();
   vi.restoreAllMocks();
 });
 
@@ -21,10 +30,47 @@ describe("EVA session identity", () => {
 
   it("a fresh session context produces a different id", () => {
     const first = getEvaSessionId();
+    resetEvaSessionIdForTests();
     window.sessionStorage.clear();
     const second = getEvaSessionId();
     expect(second).toBeTruthy();
     expect(second).not.toBe(first);
+  });
+
+  it("keeps one stable id across calls when sessionStorage throws on get and set", () => {
+    const original = window.sessionStorage;
+    const throwingStorage = {
+      getItem: vi.fn(() => {
+        throw new DOMException("storage blocked", "SecurityError");
+      }),
+      setItem: vi.fn(() => {
+        throw new DOMException("storage blocked", "SecurityError");
+      }),
+    };
+    Object.defineProperty(window, "sessionStorage", {
+      configurable: true,
+      value: throwingStorage,
+    });
+    try {
+      const first = getEvaSessionId();
+      const second = getEvaSessionId();
+      const third = getEvaSessionId();
+      expect(first).toBeTruthy();
+      expect(second).toBe(first);
+      expect(third).toBe(first);
+    } finally {
+      Object.defineProperty(window, "sessionStorage", {
+        configurable: true,
+        value: original,
+      });
+    }
+  });
+
+  it("reuses the in-memory fallback when the persisted id disappears mid-session", () => {
+    const first = getEvaSessionId();
+    window.sessionStorage.clear(); // storage emptied but still working
+    const second = getEvaSessionId();
+    expect(second).toBe(first); // memory fallback survives the empty store
   });
 
   it("never touches localStorage and never builds a secret", () => {

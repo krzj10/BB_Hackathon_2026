@@ -9,6 +9,11 @@
  */
 const SESSION_KEY = "eva-session-id";
 
+// Module-memory fallback: when sessionStorage is unavailable (privacy mode,
+// blocked storage) the identifier would otherwise change on every call,
+// breaking future B03 session continuity.
+let memorySessionId: string | null = null;
+
 function randomUuid(): string {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
     return crypto.randomUUID();
@@ -28,16 +33,30 @@ export function getEvaSessionId(): string {
   try {
     stored = window.sessionStorage.getItem(SESSION_KEY);
   } catch {
-    // storage unavailable (privacy mode) — regenerate per call context
+    // storage unavailable (privacy mode) — fall back to module memory
   }
-  if (stored) return stored;
+  if (stored) {
+    // Synchronize the in-memory fallback with the persisted value.
+    memorySessionId = stored;
+    return stored;
+  }
+  if (memorySessionId) return memorySessionId;
   const id = randomUuid();
+  memorySessionId = id;
   try {
     window.sessionStorage.setItem(SESSION_KEY, id);
   } catch {
-    // non-fatal: identity stays in memory for this call
+    // non-fatal: identity stays in module memory for the page lifetime
   }
   return id;
+}
+
+/**
+ * Test-only: clears the in-memory fallback so a test can simulate a fresh
+ * context. Never called by production code.
+ */
+export function resetEvaSessionIdForTests(): void {
+  memorySessionId = null;
 }
 
 /** Unique per-request identifier (every transcription attempt gets one). */

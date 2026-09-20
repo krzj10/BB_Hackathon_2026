@@ -16,6 +16,11 @@ import { getEvaSessionId, newRequestId } from "../lib/session";
  * `thinking` is NEVER entered: there is no assistant call in this slice
  * (B03). No assistant reply is synthesized. PTT/STT never manufactures
  * `awaiting_approval`.
+ *
+ * The canonical VoiceState is distinct from the INTERNAL capture lifecycle
+ * below (VoiceCapturePhase), which models the browser-side microphone and
+ * recorder machinery — including the permission-prompt window during which
+ * no canonical state change has happened yet.
  */
 
 /** Server hard limit is 30 s; stop at 29 s to leave a margin. */
@@ -47,7 +52,36 @@ export function pickRecordingMime(
   return null;
 }
 
-export type VoiceCapturePhase = "idle" | "listening" | "transcribing";
+/**
+ * INTERNAL browser capture lifecycle — not a canonical state machine.
+ *
+ * - `acquiring`: getUserMedia is pending (permission prompt may be open).
+ *   A second acquisition can never start, and a release/cancel during this
+ *   window invalidates the acquisition so nothing records afterwards.
+ * - `stopping`: the recorder is flushing its final dataavailable/onstop.
+ *   A new capture MAY start during this interval; the stale finalize
+ *   detects the generation change and discards itself without uploading.
+ */
+export type VoiceCapturePhase =
+  | "idle"
+  | "acquiring"
+  | "listening"
+  | "stopping"
+  | "transcribing";
+
+/**
+ * Capture-local recording state. Every MediaRecorder generation owns its
+ * own chunks/MIME/stream so a late `dataavailable`/`onstop` from recording
+ * A can never append into, clear, or upload recording B's audio.
+ */
+interface ActiveCapture {
+  generation: number;
+  stream: MediaStream;
+  recorder: MediaRecorder | null;
+  mime: string;
+  chunks: Blob[];
+  discarded: boolean;
+}
 
 export interface VoiceSessionErrorContext {
   status?: number;
@@ -164,7 +198,7 @@ export interface VoiceSession {
   isCapturing: boolean;
   /** Elapsed recording time in ms (0 while not recording). */
   recordingMs: number;
-  /** Request id of the in-flight/latest transcription attempt. */
+  /** Request id of the in-flight transcription attempt. */
   requestId: string | null;
   startListening: () => void;
   stopListening: () => void;
@@ -190,10 +224,8 @@ export function useVoiceSession(options: UseVoiceSessionOptions = {}): VoiceSess
   // async continuation re-checks its generation before touching state.
   const generationRef = React.useRef(0);
   const phaseRef = React.useRef<VoiceCapturePhase>("idle");
-  const streamRef = React.useRef<MediaStream | null>(null);
-  const recorderRef = React.useRef<MediaRecorder | null>(null);
-  const chunksRef = React.useRef<Blob[]>([]);
-  const mimeRef = React.useRef<string>("");
+  // The capture that owns the current recording; null while acquiring.
+  const captureRef = React.useRef<ActiveCapture | null>(null);
   const abortRef = React.useRef<AbortController | null>(null);
   const activeRequestIdRef = React.useRef<string | null>(null);
   const languageHintRef = React.useRef<string | undefined>(undefined);
@@ -201,8 +233,12 @@ export function useVoiceSession(options: UseVoiceSessionOptions = {}): VoiceSess
   const tickerRef = React.useRef<number | null>(null);
   const autoStopRef = React.useRef<number | null>(null);
   const idleReturnRef = React.useRef<number | null>(null);
+  // Mirror of the canonical state so timeouts can route transitions through
+  // applyState without stale-closure reads.
+  const stateRef = React.useRef<VoiceState>("idle");
 
   const applyState = React.useCallback((next: VoiceState) => {
+    stateRef.current = next;
     setState(next);
     onStateChangeRef.current?.(next);
   }, []);
@@ -218,14 +254,6 @@ export function useVoiceSession(options: UseVoiceSessionOptions = {}): VoiceSess
     }
   }, []);
 
-  const releaseCapture = React.useCallback(() => {
-    stopStreamTracks(streamRef.current);
-    streamRef.current = null;
-    recorderRef.current = null;
-    clearTimers();
-    setRecordingMs(0);
-  }, [clearTimers]);
-
   const supersedeInFlight = React.useCallback(() => {
     // Invalidate any older transcription so its late response is ignored.
     generationRef.current += 1;
@@ -234,49 +262,23 @@ export function useVoiceSession(options: UseVoiceSessionOptions = {}): VoiceSess
   }, []);
 
   const cleanupForCancel = React.useCallback(() => {
-    const recorder = recorderRef.current;
-    if (recorder && recorder.state === "recording") {
-      // Discard chunks: cancelled audio is never transcribed or persisted.
-      recorder.ondataavailable = null;
-      recorder.onstop = null;
-      recorder.stop();
-    }
-    chunksRef.current = [];
-    releaseCapture();
-  }, [releaseCapture]);
-
-  const finishCapture = React.useCallback(
-    (mode: CleanupMode, generation: number, stoppedAtMax: boolean) => {
-      const recorder = recorderRef.current;
-      const stream = streamRef.current;
-      recorderRef.current = null;
-      streamRef.current = null;
-      clearTimers();
-
-      const finalize = () => {
-        // Release every MediaStreamTrack on every path before upload.
-        stopStreamTracks(stream);
-        setRecordingMs(0);
-        if (mode === "discard") {
-          chunksRef.current = [];
-          return;
-        }
-        const mime = mimeRef.current;
-        const blob = new Blob(chunksRef.current, { type: mime || "audio/webm" });
-        chunksRef.current = [];
-        void runTranscription(blob, generation, stoppedAtMax);
-      };
-
+    const capture = captureRef.current;
+    if (capture) {
+      const recorder = capture.recorder;
       if (recorder && recorder.state === "recording") {
-        recorder.onstop = finalize;
+        // Discard chunks: cancelled audio is never transcribed or persisted.
+        recorder.ondataavailable = null;
+        recorder.onstop = null;
         recorder.stop();
-      } else {
-        finalize();
       }
-    },
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [clearTimers]
-  );
+      capture.chunks = [];
+      capture.discarded = true;
+      stopStreamTracks(capture.stream);
+      if (captureRef.current === capture) captureRef.current = null;
+    }
+    clearTimers();
+    setRecordingMs(0);
+  }, [clearTimers]);
 
   const runTranscription = React.useCallback(
     async (
@@ -335,6 +337,8 @@ export function useVoiceSession(options: UseVoiceSessionOptions = {}): VoiceSess
         languageHintRef.current = response.transcript.language;
         setTranscript(response.transcript);
         setError(null);
+        // The max-duration notice must not linger under the transcript card.
+        setNotice(null);
         // Truthful idle: no assistant reasoning exists in this slice, so
         // `thinking` must NOT be entered merely because STT completed.
         phaseRef.current = "idle";
@@ -347,15 +351,66 @@ export function useVoiceSession(options: UseVoiceSessionOptions = {}): VoiceSess
         activeRequestIdRef.current = null;
         applyState("error");
         setError(mapTranscribeError(err));
+      } finally {
+        // A settled request no longer owns the abort controller — but the
+        // identity check can never clear a newer generation's controller.
+        if (abortRef.current === controller) abortRef.current = null;
+        if (activeRequestIdRef.current === requestId) {
+          activeRequestIdRef.current = null;
+        }
       }
     },
     [applyState, client, maxSeconds]
   );
 
+  const finishCapture = React.useCallback(
+    (capture: ActiveCapture, mode: CleanupMode, stoppedAtMax: boolean) => {
+      clearTimers();
+      let finalized = false;
+      const finalize = () => {
+        if (finalized) return;
+        finalized = true;
+        capture.discarded = true;
+        // Release every MediaStreamTrack on every path (idempotent).
+        stopStreamTracks(capture.stream);
+        setRecordingMs(0);
+        if (captureRef.current === capture) captureRef.current = null;
+        if (mode === "discard") {
+          capture.chunks = [];
+          return;
+        }
+        // A superseded capture must never be uploaded: this check runs in
+        // the recorder's final onstop path BEFORE any await, so a recording
+        // whose generation was replaced is discarded outright.
+        if (capture.generation !== generationRef.current) {
+          capture.chunks = [];
+          return;
+        }
+        const blob = new Blob(capture.chunks, { type: capture.mime || "audio/webm" });
+        capture.chunks = [];
+        void runTranscription(blob, capture.generation, stoppedAtMax);
+      };
+
+      const recorder = capture.recorder;
+      if (recorder && recorder.state === "recording") {
+        recorder.onstop = finalize;
+        recorder.stop();
+      } else {
+        finalize();
+      }
+      // The microphone is released immediately, regardless of when the
+      // recorder's asynchronous final flush lands.
+      stopStreamTracks(capture.stream);
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [clearTimers]
+  );
+
   const startListening = React.useCallback(() => {
-    // Double-start guard: repeated pointer/key events never create a second
-    // recorder while one interaction is already capturing.
-    if (phaseRef.current === "listening") return;
+    // Double-start guard covering BOTH the listening phase and the
+    // acquisition window: repeated pointer/key events while getUserMedia is
+    // still pending must never create a second microphone request.
+    if (phaseRef.current === "acquiring" || phaseRef.current === "listening") return;
 
     // Starting a new PTT while an older transcription is in progress:
     // invalidate the old request, ignore any late response, start cleanly.
@@ -363,12 +418,19 @@ export function useVoiceSession(options: UseVoiceSessionOptions = {}): VoiceSess
       supersedeInFlight();
       phaseRef.current = "idle";
     }
+    // phase "stopping" falls through deliberately: the previous recorder is
+    // only flushing. Its stale finalize detects the generation change below
+    // and discards itself without uploading (capture-local chunk ownership).
 
     const generation = ++generationRef.current;
+    phaseRef.current = "acquiring";
     setError(null);
     setNotice(null);
 
     void (async () => {
+      // Retain the local stream so every failure after acquisition still
+      // stops the microphone (no leak on constructor/start errors).
+      let stream: MediaStream | null = null;
       try {
         if (
           typeof navigator === "undefined" ||
@@ -377,35 +439,48 @@ export function useVoiceSession(options: UseVoiceSessionOptions = {}): VoiceSess
         ) {
           throw new DOMException("unsupported", "UnsupportedError");
         }
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        if (generation !== generationRef.current) {
-          // Superseded while awaiting the permission prompt.
+        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        if (generation !== generationRef.current || phaseRef.current !== "acquiring") {
+          // Released/cancelled while the permission prompt was pending:
+          // no recording may begin after the press has already ended.
           stopStreamTracks(stream);
           return;
         }
+
+        // Own the stream in capture state BEFORE anything below can throw.
+        const capture: ActiveCapture = {
+          generation,
+          stream,
+          recorder: null,
+          mime: "",
+          chunks: [],
+          discarded: false,
+        };
+        captureRef.current = capture;
+
         const mime = pickRecordingMime((candidate) => MediaRecorder.isTypeSupported(candidate));
         if (!mime) {
-          stopStreamTracks(stream);
           throw new DOMException("unsupported recording format", "NotSupportedError");
         }
-
         const recorder = new MediaRecorder(stream, { mimeType: mime });
-        chunksRef.current = [];
-        mimeRef.current = mime;
+        capture.recorder = recorder;
+        capture.mime = mime;
+
+        // Bound to THIS capture's own chunks — never a shared array.
         recorder.ondataavailable = (event) => {
-          if (event.data && event.data.size > 0) chunksRef.current.push(event.data);
+          if (capture.discarded) return;
+          if (event.data && event.data.size > 0) capture.chunks.push(event.data);
         };
         recorder.onerror = () => {
-          if (generation !== generationRef.current) return;
+          if (capture.generation !== generationRef.current) return;
+          if (phaseRef.current !== "listening") return;
           phaseRef.current = "idle";
-          finishCapture("discard", generation, false);
+          finishCapture(capture, "discard", false);
           applyState("error");
           setError("Recording failed. Try again.");
         };
 
         recorder.start();
-        streamRef.current = stream;
-        recorderRef.current = recorder;
         phaseRef.current = "listening";
         startTsRef.current = Date.now();
         setRecordingMs(0);
@@ -423,12 +498,19 @@ export function useVoiceSession(options: UseVoiceSessionOptions = {}): VoiceSess
       } catch (err) {
         if (generation !== generationRef.current) return;
         phaseRef.current = "idle";
-        releaseCapture();
+        // Every error path after getUserMedia resolved still stops the mic.
+        stopStreamTracks(stream);
+        const capture = captureRef.current;
+        if (capture && capture.generation === generation) {
+          capture.chunks = [];
+          capture.discarded = true;
+          if (captureRef.current === capture) captureRef.current = null;
+        }
         applyState("error");
         setError(mapMediaError(err));
       }
     })();
-  }, [applyState, finishCapture, maxSeconds, releaseCapture, supersedeInFlight]);
+  }, [applyState, finishCapture, maxSeconds, supersedeInFlight]);
 
   const stopListeningRef = React.useRef<(stoppedAtMax: boolean) => void>(() => {});
 
@@ -446,14 +528,28 @@ export function useVoiceSession(options: UseVoiceSessionOptions = {}): VoiceSess
     if (idleReturnRef.current !== null) window.clearTimeout(idleReturnRef.current);
     idleReturnRef.current = window.setTimeout(() => {
       idleReturnRef.current = null;
-      setState((current) => (current === "interrupted" ? "idle" : current));
+      // Route through the same transition helper so onStateChange also
+      // observes the canonical interrupted -> idle transition.
+      if (stateRef.current === "interrupted") applyState("idle");
     }, 1500);
   }, [applyState, cleanupForCancel, supersedeInFlight]);
 
   stopListeningRef.current = (stoppedAtMax: boolean) => {
+    if (phaseRef.current === "acquiring") {
+      // Released before the permission prompt resolved: invalidate the
+      // acquisition so no recording can start after the press has ended.
+      supersedeInFlight();
+      phaseRef.current = "idle";
+      return;
+    }
     if (phaseRef.current !== "listening") return;
-    phaseRef.current = "idle";
-    finishCapture("transcribe", generationRef.current, stoppedAtMax);
+    const capture = captureRef.current;
+    if (!capture) {
+      phaseRef.current = "idle";
+      return;
+    }
+    phaseRef.current = "stopping";
+    finishCapture(capture, "transcribe", stoppedAtMax);
   };
 
   // Unmount: abort the fetch, stop every track, release every timer.
@@ -461,15 +557,20 @@ export function useVoiceSession(options: UseVoiceSessionOptions = {}): VoiceSess
     return () => {
       generationRef.current += 1;
       abortRef.current?.abort();
-      const recorder = recorderRef.current;
-      if (recorder && recorder.state === "recording") {
-        recorder.ondataavailable = null;
-        recorder.onstop = null;
-        recorder.stop();
+      abortRef.current = null;
+      const capture = captureRef.current;
+      if (capture) {
+        const recorder = capture.recorder;
+        if (recorder && recorder.state === "recording") {
+          recorder.ondataavailable = null;
+          recorder.onstop = null;
+          recorder.stop();
+        }
+        capture.chunks = [];
+        capture.discarded = true;
+        stopStreamTracks(capture.stream);
       }
-      stopStreamTracks(streamRef.current);
-      streamRef.current = null;
-      recorderRef.current = null;
+      captureRef.current = null;
       clearTimers();
       if (idleReturnRef.current !== null) window.clearTimeout(idleReturnRef.current);
     };

@@ -36,6 +36,24 @@ class FakeRecorder {
   }
 }
 
+/**
+ * Recorder fake whose final dataavailable/onstop are ASYNC and test-
+ * controlled, modelling the real MediaRecorder flush race.
+ */
+class DelayedRecorder extends FakeRecorder {
+  released = false;
+  stop = vi.fn(() => {
+    // Real MediaRecorder is inactive immediately; the final flush lands later.
+    this.state = "inactive";
+  });
+  release() {
+    if (this.released) return;
+    this.released = true;
+    this.ondataavailable?.({ data: new Blob(["late"], { type: "audio/webm" }) });
+    this.onstop?.();
+  }
+}
+
 function deferred<T>() {
   let resolve!: (value: T) => void;
   let reject!: (reason?: unknown) => void;
@@ -414,6 +432,254 @@ describe("useVoiceSession races and stale responses", () => {
 
     fireEvent.click(screen.getByTestId("cancel"));
     expect(capturedSignal?.aborted).toBe(true);
+  });
+});
+
+describe("useVoiceSession acquisition-window races", () => {
+  it("release while getUserMedia is pending never starts a recorder or a transcription", async () => {
+    const { track, stream } = makeStream();
+    const pending = deferred<MediaStream>();
+    setupEnvironment(vi.fn(() => pending.promise));
+    const transcribe = vi.fn(() => deferred<TranscribeResponse>().promise);
+    render(<VoiceHarness client={voiceClient(transcribe)} />);
+
+    fireEvent.click(screen.getByTestId("start"));
+    await flush();
+    // Permission dialog still open: canonical state has not moved on a lie.
+    expect(screen.getByTestId("state")).toHaveTextContent("idle");
+
+    // Release BEFORE getUserMedia resolves.
+    fireEvent.click(screen.getByTestId("stop"));
+    pending.resolve(stream);
+    await flush();
+
+    expect(track.stop).toHaveBeenCalled();
+    expect(FakeRecorder.instances).toHaveLength(0);
+    expect(transcribe).not.toHaveBeenCalled();
+    expect(screen.getByTestId("state")).toHaveTextContent("idle");
+  });
+
+  it("cancel while getUserMedia is pending stops the resolved stream and returns safely to idle", async () => {
+    vi.useFakeTimers();
+    const { track, stream } = makeStream();
+    const pending = deferred<MediaStream>();
+    setupEnvironment(vi.fn(() => pending.promise));
+    const transcribe = vi.fn(() => deferred<TranscribeResponse>().promise);
+    render(<VoiceHarness client={voiceClient(transcribe)} />);
+
+    fireEvent.click(screen.getByTestId("start"));
+    await flush();
+    fireEvent.click(screen.getByTestId("cancel"));
+    expect(screen.getByTestId("state")).toHaveTextContent("interrupted");
+
+    pending.resolve(stream);
+    await flush();
+
+    expect(track.stop).toHaveBeenCalled();
+    expect(FakeRecorder.instances).toHaveLength(0);
+    expect(transcribe).not.toHaveBeenCalled();
+    act(() => {
+      vi.advanceTimersByTime(1600);
+    });
+    expect(screen.getByTestId("state")).toHaveTextContent("idle");
+  });
+
+  it("a repeated start while getUserMedia is pending creates exactly one acquisition", async () => {
+    const { stream } = makeStream();
+    const pending = deferred<MediaStream>();
+    const getUserMedia = setupEnvironment(vi.fn(() => pending.promise));
+    const client = voiceClient(() => deferred<TranscribeResponse>().promise);
+    render(<VoiceHarness client={client} />);
+
+    fireEvent.click(screen.getByTestId("start"));
+    await flush();
+    fireEvent.click(screen.getByTestId("start")); // repeated while acquiring
+    fireEvent.click(screen.getByTestId("start"));
+    await flush();
+
+    expect(getUserMedia).toHaveBeenCalledTimes(1);
+    pending.resolve(stream);
+    await flush();
+    expect(getUserMedia).toHaveBeenCalledTimes(1);
+    expect(FakeRecorder.instances).toHaveLength(1); // only one recorder may exist
+    expect(screen.getByTestId("state")).toHaveTextContent("listening");
+  });
+
+  it("stops acquired tracks when the MediaRecorder constructor throws", async () => {
+    const { track, stream } = makeStream();
+    setupEnvironment(vi.fn(() => Promise.resolve(stream)));
+    class ThrowingRecorder {
+      static isTypeSupported = vi.fn((mime: string) => mime.startsWith("audio/webm"));
+      constructor() {
+        throw new DOMException("constructor exploded", "NotSupportedError");
+      }
+    }
+    vi.stubGlobal("MediaRecorder", ThrowingRecorder);
+    const transcribe = vi.fn(() => deferred<TranscribeResponse>().promise);
+    render(<VoiceHarness client={voiceClient(transcribe)} />);
+
+    fireEvent.click(screen.getByTestId("start"));
+    await flush();
+
+    expect(track.stop).toHaveBeenCalled();
+    expect(transcribe).not.toHaveBeenCalled();
+    expect(screen.getByTestId("state")).toHaveTextContent("error");
+    expect(screen.getByTestId("error")).toHaveTextContent(
+      "This browser cannot record audio in a format EVA accepts."
+    );
+  });
+
+  it("stops acquired tracks when recorder.start() throws", async () => {
+    const { track, stream } = makeStream();
+    setupEnvironment(vi.fn(() => Promise.resolve(stream)));
+    class StartThrowRecorder extends FakeRecorder {
+      start = vi.fn(() => {
+        throw new DOMException("device busy", "NotSupportedError");
+      });
+    }
+    vi.stubGlobal("MediaRecorder", StartThrowRecorder);
+    const transcribe = vi.fn(() => deferred<TranscribeResponse>().promise);
+    render(<VoiceHarness client={voiceClient(transcribe)} />);
+
+    fireEvent.click(screen.getByTestId("start"));
+    await flush();
+
+    expect(track.stop).toHaveBeenCalled();
+    expect(transcribe).not.toHaveBeenCalled();
+    expect(screen.getByTestId("state")).toHaveTextContent("error");
+  });
+});
+
+describe("useVoiceSession capture-local recorder ownership", () => {
+  it("a delayed onstop from recording A cannot corrupt recording B or publish A's audio", async () => {
+    const first = makeStream();
+    const second = makeStream();
+    let call = 0;
+    const getUserMedia = setupEnvironment(
+      vi.fn(() => Promise.resolve(call++ === 0 ? first.stream : second.stream))
+    );
+    vi.stubGlobal("MediaRecorder", DelayedRecorder);
+
+    const uploadedTexts: string[] = [];
+    const blobs: Blob[] = [];
+    const clientWithBlob: EvaClient = {
+      transcribeAudio: (request: TranscribeAudioRequest) => {
+        blobs.push(request.audio);
+        uploadedTexts.push(request.requestId);
+        return Promise.resolve(transcriptResponse(request.requestId, "B transcript"));
+      },
+    } as unknown as EvaClient;
+
+    render(<VoiceHarness client={clientWithBlob} />);
+
+    // Recording A: start, then release while the recorder is still flushing.
+    fireEvent.click(screen.getByTestId("start"));
+    await flush();
+    const recorderA = FakeRecorder.instances[0] as DelayedRecorder;
+    recorderA.ondataavailable?.({ data: new Blob(["A-data"], { type: "audio/webm" }) });
+    fireEvent.click(screen.getByTestId("stop"));
+    await flush();
+    expect(recorderA.released).toBe(false); // onstop has NOT fired yet
+
+    // Recording B starts while A is still stopping: captures stay isolated.
+    fireEvent.click(screen.getByTestId("start"));
+    await flush();
+    expect(getUserMedia).toHaveBeenCalledTimes(2);
+    const recorderB = FakeRecorder.instances[1] as DelayedRecorder;
+    expect(recorderB).not.toBe(recorderA);
+    expect(recorderB.state).toBe("recording");
+
+    // A's LATE final dataavailable + onstop land during B's lifetime.
+    act(() => {
+      recorderA.release();
+    });
+    await flush();
+    // A's stale finalize must never start an STT upload.
+    expect(blobs).toHaveLength(0);
+    expect(first.track.stop).toHaveBeenCalled();
+
+    // B records and uploads only its own capture-local chunks.
+    recorderB.ondataavailable?.({ data: new Blob(["B-data"], { type: "audio/webm" }) });
+    fireEvent.click(screen.getByTestId("stop"));
+    await flush();
+    // B's own asynchronous final flush must deliver only B's capture data.
+    act(() => {
+      recorderB.release();
+    });
+    await flush();
+
+    expect(blobs).toHaveLength(1);
+    const uploaded = await new Promise<string>((resolve) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result));
+      reader.readAsText(blobs[0]);
+    });
+    // B's own capture data (including B's own async final flush) ...
+    expect(uploaded).toContain("B-data");
+    // ... but NEVER recording A's data.
+    expect(uploaded).not.toContain("A-data");
+    expect(screen.getByTestId("transcript")).toHaveTextContent("B transcript");
+    expect(screen.getByTestId("state")).toHaveTextContent("idle");
+    expect(uploadedTexts).toHaveLength(1);
+    expect(second.track.stop).toHaveBeenCalled();
+  });
+
+  it("a stale recorder finalize after cancel never starts an STT upload", async () => {
+    vi.useFakeTimers();
+    const { track, stream } = makeStream();
+    setupEnvironment(vi.fn(() => Promise.resolve(stream)));
+    vi.stubGlobal("MediaRecorder", DelayedRecorder);
+    const transcribe = vi.fn(() => deferred<TranscribeResponse>().promise);
+    render(<VoiceHarness client={voiceClient(transcribe)} />);
+
+    fireEvent.click(screen.getByTestId("start"));
+    await flush();
+    const recorderA = FakeRecorder.instances[0] as DelayedRecorder;
+    recorderA.ondataavailable?.({ data: new Blob(["A-data"], { type: "audio/webm" }) });
+    fireEvent.click(screen.getByTestId("stop"));
+    await flush();
+    expect(screen.getByTestId("state")).toHaveTextContent("listening");
+
+    // Cancel while A is still flushing, then let A's late onstop land.
+    fireEvent.click(screen.getByTestId("cancel"));
+    expect(screen.getByTestId("state")).toHaveTextContent("interrupted");
+    act(() => {
+      recorderA.release();
+    });
+    await flush();
+
+    expect(transcribe).not.toHaveBeenCalled();
+    expect(track.stop).toHaveBeenCalled();
+    act(() => {
+      vi.advanceTimersByTime(1600);
+    });
+    expect(screen.getByTestId("state")).toHaveTextContent("idle");
+  });
+
+  it("recorder.onerror stops the mic, uploads nothing, and allows a fresh PTT attempt", async () => {
+    const { track, stream } = makeStream();
+    setupEnvironment(vi.fn(() => Promise.resolve(stream)));
+    const transcribe = vi.fn(() => deferred<TranscribeResponse>().promise);
+    render(<VoiceHarness client={voiceClient(transcribe)} />);
+
+    fireEvent.click(screen.getByTestId("start"));
+    await flush();
+    const recorder = FakeRecorder.instances[0];
+    recorder.ondataavailable?.({ data: new Blob(["noisy"], { type: "audio/webm" }) });
+    act(() => {
+      recorder.onerror?.();
+    });
+
+    expect(track.stop).toHaveBeenCalled();
+    expect(transcribe).not.toHaveBeenCalled();
+    expect(screen.getByTestId("state")).toHaveTextContent("error");
+    expect(screen.getByTestId("error")).toHaveTextContent("Recording failed. Try again.");
+
+    // A new PTT attempt works afterwards.
+    fireEvent.click(screen.getByTestId("start"));
+    await flush();
+    expect(FakeRecorder.instances).toHaveLength(2);
+    expect(screen.getByTestId("state")).toHaveTextContent("listening");
   });
 });
 

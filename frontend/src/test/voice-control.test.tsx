@@ -1,6 +1,7 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { VoiceControl } from "../components/voice/VoiceControl";
+import { VoiceOrb } from "../components/voice/VoiceOrb";
 import { ActionApproval } from "../components/approvals/ActionApproval";
 import type { ProposedAction, TranscribeResponse } from "../api/types.generated";
 
@@ -113,6 +114,8 @@ describe("VoiceControl PTT + approval isolation", () => {
     render(<VoiceControl />);
 
     expect(screen.getByText("Hold to talk")).toBeInTheDocument();
+    // Class/visibility behavior: the idle instruction is visually ENABLED.
+    expect(screen.getByText("Hold to talk")).toHaveClass("opacity-100");
     expect(screen.getByRole("status")).toHaveTextContent("EVA is idle");
 
     const orb = screen.getByRole("button", { name: /EVA voice orb/i });
@@ -120,6 +123,9 @@ describe("VoiceControl PTT + approval isolation", () => {
     await flush();
     expect(screen.getByRole("status")).toHaveTextContent("Listening");
     expect(screen.getByText("Release to transcribe")).toBeInTheDocument();
+    // While listening, the release instruction is visually ENABLED.
+    expect(screen.getByText("Release to transcribe")).toHaveClass("opacity-100");
+    expect(screen.getByText("Release to transcribe")).not.toHaveClass("opacity-0");
 
     const recorder = FakeRecorder.instances[0];
     recorder.ondataavailable?.({ data: new Blob(["speech"], { type: "audio/webm" }) });
@@ -184,5 +190,38 @@ describe("VoiceControl PTT + approval isolation", () => {
     await flush();
 
     expect(onConfirm).not.toHaveBeenCalled();
+  });
+});
+
+describe("VoiceOrb PTT instruction visibility", () => {
+  const pttProps = {
+    instructional: "Hold to talk",
+    onPressStart: () => {},
+    onPressEnd: () => {},
+    onPressCancel: () => {},
+  };
+
+  it("shows Hold to talk enabled while idle", () => {
+    const { unmount } = render(<VoiceOrb state="idle" {...pttProps} />);
+    const instruction = screen.getByText("Hold to talk");
+    expect(instruction).toHaveClass("opacity-100");
+    expect(instruction).not.toHaveClass("opacity-0");
+    unmount();
+  });
+
+  it("switches to Release to transcribe, visually enabled, while listening", () => {
+    const { unmount } = render(<VoiceOrb state="listening" {...pttProps} />);
+    const instruction = screen.getByText("Release to transcribe");
+    expect(instruction).toHaveClass("opacity-100");
+    expect(instruction).not.toHaveClass("opacity-0");
+    unmount();
+  });
+
+  it("hides the instruction while processing (transcribing)", () => {
+    const { unmount } = render(<VoiceOrb state="transcribing" {...pttProps} />);
+    const instruction = screen.getByText("Hold to talk");
+    expect(instruction).toHaveClass("opacity-0");
+    expect(instruction).not.toHaveClass("opacity-100");
+    unmount();
   });
 });
