@@ -235,6 +235,7 @@ pytest-cache-files-*/
 *.sqlite3
 *.sqlite3-*
 credentials*.json
+.credentials-*.tmp
 client_secret*.json
 token*.json
 secrets/

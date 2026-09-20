@@ -23,6 +23,7 @@ from .api.actions import router as actions_router
 from .api.auth_google import router as auth_google_router
 from .api.calendar import router as calendar_router
 from .api.health import router as health_router
+from .api.ingress import VoiceIngressLimiter
 from .api.voice import router as voice_router
 from .approvals.engine import ActionApprovalEngine
 from .approvals.policy import load_policy
@@ -258,6 +259,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(calendar_router)
     app.include_router(actions_router)
     app.include_router(voice_router)
+
+    # Voice upload ingress cap runs BEFORE multipart parsing (added last, so
+    # it is the outermost ASGI layer): a huge request is rejected on the raw
+    # body stream without Starlette ever spooling/parsing the multipart form.
+    app.add_middleware(VoiceIngressLimiter)
     return app
 
 

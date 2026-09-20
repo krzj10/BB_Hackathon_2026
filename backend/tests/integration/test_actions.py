@@ -60,6 +60,7 @@ class FakeGoogleHttp:
         self.patch_bodies: list[dict] = []
         self.patch_headers: list[dict] = []
         self.shape_violations: list[str] = []  # REST-shape regressions (PART 27)
+        self.get_error_after_mutation: GoogleErrorCategory | None = None
         self._etag_seq = 0
         self.post_hook = None  # callable(body, params); may raise after applying
         self.post_response_id_override = None  # provider returns a DIFFERENT id
@@ -77,6 +78,17 @@ class FakeGoogleHttp:
     # -- transport surface ----------------------------------------------------
     def get_json(self, url, params):
         self.calls.append(("GET", url))
+        if (
+            self.get_error_after_mutation is not None
+            and self.mutations
+            and not url.endswith("/events")
+        ):
+            # Core FIX 1 double: the mutation applied, but the verification
+            # read-back now fails (403 / rate limit / transport).
+            category = self.get_error_after_mutation
+            status = {GoogleErrorCategory.FORBIDDEN: 403,
+                      GoogleErrorCategory.RATE_LIMITED: 429}.get(category)
+            raise GoogleApiError(category, status_code=status, endpoint_kind="events")
         if url.endswith("/events"):
             items = list(self.events.values())
             time_min = (params or {}).get("timeMin")
@@ -1339,3 +1351,122 @@ def test_create_identity_freeze_unverifiable_mismatch_stays_unknown(env) -> None
     outcome = env.executor.execute(action["id"])
     assert outcome.action.status is ProposedActionStatus.UNKNOWN
     assert len([c for c in env.fake.calls if c[0] == "POST"]) == posts_before
+
+
+# =========================================================================== #
+# CORE FIX 1 - post-write verification failure must never become FAILED
+# =========================================================================== #
+
+
+def test_create_applied_but_verification_403_is_unknown_not_failed(env) -> None:
+    env.fake.get_error_after_mutation = GoogleErrorCategory.FORBIDDEN
+    action, confirmation = propose_and_approve(env, create_body("Applied unseen"))
+    assert confirmation.status_code == 200, confirmation.text
+    assert confirmation.json()["result"]["status"] == "unknown"
+    assert confirmation.json()["action"]["status"] == "unknown"
+    assert any(c[0] == "POST" for c in env.fake.mutations)   # write really applied
+
+
+def test_reschedule_applied_but_verification_403_is_unknown(env) -> None:
+    seed_event(env)
+    env.fake.get_error_after_mutation = GoogleErrorCategory.FORBIDDEN
+    action, confirmation = propose_and_approve(env, reschedule_body())
+    assert confirmation.json()["result"]["status"] == "unknown"
+    assert confirmation.json()["action"]["status"] == "unknown"
+    assert any(c[0] == "PATCH" for c in env.fake.mutations)
+
+
+def test_agenda_patch_applied_but_verification_transport_is_unknown(env) -> None:
+    seed_event(env)
+    env.fake.get_error_after_mutation = GoogleErrorCategory.TRANSPORT
+    action, confirmation = propose_and_approve(env, agenda_body())
+    assert confirmation.json()["result"]["status"] == "unknown"
+    assert confirmation.json()["action"]["status"] == "unknown"
+
+
+def test_post_definitively_rejected_still_fails_action(env) -> None:
+    def reject(body, params, apply):  # never applies - provider rejection
+        raise GoogleApiError(GoogleErrorCategory.BAD_REQUEST, status_code=400,
+                             endpoint_kind="events")
+
+    env.fake.post_hook = reject
+    action, confirmation = propose_and_approve(env, create_body("Never applied"))
+    assert confirmation.json()["result"]["status"] == "error"
+    assert confirmation.json()["action"]["status"] == "failed"
+
+
+def test_unknown_action_is_not_replayed_by_second_execute(env) -> None:
+    env.fake.get_error_after_mutation = GoogleErrorCategory.FORBIDDEN
+    action, _ = propose_and_approve(env, create_body("Frozen unknown"))
+    calls_before = list(env.fake.calls)
+    outcome = env.executor.execute(action["id"])
+    assert outcome.result is not None
+    assert outcome.result.status.value == "unknown"
+    assert env.fake.calls == calls_before          # ZERO provider activity
+
+
+# =========================================================================== #
+# CORE FIX 6 - confirm retries after execution return durable state
+# =========================================================================== #
+
+
+def _confirm_with_token(env, action: dict, token: str, *, revision=None, digest=None):
+    return env.client.post(
+        f"/api/actions/{action['id']}/confirm",
+        json={
+            "action_id": action["id"],
+            "revision": revision if revision is not None else action["revision"],
+            "arguments_digest": digest if digest is not None else action["arguments_digest"],
+            "choice": "approve", "challenge": token,
+        },
+        headers=headers(SESSION, None),
+    )
+
+
+def test_confirm_retry_after_success_returns_durable_state(env) -> None:
+    proposal = propose(env, create_body("Payroll sync"))
+    assert proposal.status_code == 200, proposal.text
+    action = proposal.json()["action"]
+    token = challenge(env, action["id"]).json()["challenge"]
+
+    first = _confirm_with_token(env, action, token)
+    assert first.status_code == 200 and first.json()["action"]["status"] == "succeeded"
+    mutations_after_first = len(env.fake.mutations)
+
+    retry = _confirm_with_token(env, action, token)      # lost HTTP response replay
+    assert retry.status_code == 200, retry.text
+    body = retry.json()
+    assert body["action"]["status"] == "succeeded"
+    assert body["receipt"]["id"] == first.json()["receipt"]["id"]   # no second receipt
+    assert body["result"] == first.json()["result"]                  # durable outcome
+    assert len(env.fake.mutations) == mutations_after_first          # no second mutation
+
+
+def test_confirm_retry_after_unknown_returns_unknown_without_replay(env) -> None:
+    env.fake.get_error_after_mutation = GoogleErrorCategory.FORBIDDEN
+    proposal = propose(env, create_body("Unknown recovery"))
+    action = proposal.json()["action"]
+    token = challenge(env, action["id"]).json()["challenge"]
+    first = _confirm_with_token(env, action, token)
+    assert first.json()["action"]["status"] == "unknown"
+    calls_before = list(env.fake.calls)
+
+    retry = _confirm_with_token(env, action, token)
+    assert retry.status_code == 200, retry.text
+    assert retry.json()["action"]["status"] == "unknown"
+    assert retry.json()["result"]["status"] == "unknown"
+    assert env.fake.calls == calls_before                # never blindly replayed
+
+
+def test_confirm_retry_with_mismatched_bindings_still_rejected(env) -> None:
+    proposal = propose(env, create_body("Binding check"))
+    action = proposal.json()["action"]
+    token = challenge(env, action["id"]).json()["challenge"]
+    assert _confirm_with_token(env, action, token).json()["action"]["status"] == "succeeded"
+
+    wrong_revision = _confirm_with_token(env, action, token, revision=action["revision"] + 1)
+    assert wrong_revision.status_code == 409
+    assert "revision_mismatch" in wrong_revision.text
+    wrong_digest = _confirm_with_token(env, action, token, digest="0" * 64)
+    assert wrong_digest.status_code == 409
+    assert "digest_mismatch" in wrong_digest.text

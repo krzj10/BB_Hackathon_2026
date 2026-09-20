@@ -480,3 +480,300 @@ def test_route_integrations_reports_google_status_without_secrets(tmp_path) -> N
     assert '"google"' in body
     for secret in (ACCESS_TOKEN, REFRESH_TOKEN, CLIENT_SECRET):
         assert secret not in body
+
+
+# ---------------------------------------------------------------------------
+# CORE FIX 5 - serialized refresh + atomic credential persistence
+# ---------------------------------------------------------------------------
+
+
+def _connected_auth(tmp_path, refresher=None):
+    auth = make_auth(tmp_path, refresher=refresher)
+    state = auth.state_store.issue()
+    result = auth.handle_callback({"code": "synthetic-code", "state": state})
+    assert result.outcome is OAuthOutcome.CONNECTED
+    return auth
+
+
+def _credentials_file(tmp_path) -> Path:
+    return tmp_path / "google_credentials.json"
+
+
+def _force_expired(tmp_path) -> None:
+    path = _credentials_file(tmp_path)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["expiry"] = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+
+def test_concurrent_expired_requests_trigger_exactly_one_refresh(tmp_path) -> None:
+    import threading
+    import time as _time
+
+    refresh_calls: list[int] = []
+
+    def slow_refresher(credentials) -> None:
+        refresh_calls.append(1)
+        _time.sleep(0.25)                      # widen the race window without a lock
+        credentials.token = "rotated-access"
+        credentials.expiry = datetime.now(timezone.utc) + timedelta(hours=1)
+
+    auth = _connected_auth(tmp_path, refresher=slow_refresher)
+    _force_expired(tmp_path)
+
+    barrier = threading.Barrier(2)
+    sessions: list[object] = []
+
+    def call() -> None:
+        barrier.wait()                         # deterministic simultaneous start
+        sessions.append(auth.authorized_session())
+
+    threads = [threading.Thread(target=call) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    assert len(refresh_calls) == 1             # re-read under lock skipped the second
+    assert len(sessions) == 2                  # both callers got a usable session
+    tokens = {s.credentials.token for s in sessions}
+    assert tokens == {"rotated-access"}
+
+
+def test_interrupted_credential_write_never_truncates(tmp_path, monkeypatch) -> None:
+    import os as _os
+
+    import app.google.auth as auth_module
+
+    auth = _connected_auth(tmp_path)
+    original_text = _credentials_file(tmp_path).read_text(encoding="utf-8")
+
+    def boom(src, dst):  # simulate an interrupted atomic move
+        raise OSError("interrupted write")
+
+    monkeypatch.setattr(auth_module.os, "replace", boom)
+    with pytest.raises(GoogleAuthError):
+        auth._write_credentials({"access_token": "brand-new-payload"})
+
+    # The previously stored credentials survive byte-identical (never truncated)
+    assert _credentials_file(tmp_path).read_text(encoding="utf-8") == original_text
+    # ...and the temporary file is cleaned up, leaving no partial artifacts.
+    leftovers = [p.name for p in tmp_path.iterdir() if p.name.startswith(".credentials-")]
+    assert leftovers == []
+
+
+def test_credential_write_is_atomic_and_restricted(tmp_path) -> None:
+    auth = _connected_auth(tmp_path)
+    payload = json.loads(_credentials_file(tmp_path).read_text(encoding="utf-8"))
+    payload["access_token"] = "second-write"
+    auth._write_credentials(payload)
+    stored = json.loads(_credentials_file(tmp_path).read_text(encoding="utf-8"))
+    assert stored["access_token"] == "second-write"
+    assert [p.name for p in tmp_path.iterdir() if p.name.startswith(".credentials-")] == []
+
+
+# ---------------------------------------------------------------------------
+# CORE MICRO-HARDENING - parent-directory durability + disconnect serialization
+# ---------------------------------------------------------------------------
+
+
+def test_parent_directory_is_synced_after_atomic_replace(tmp_path, monkeypatch) -> None:
+    import os as _os
+
+    import app.google.auth as auth_module
+
+    auth = _connected_auth(tmp_path)
+    real_open, real_fsync, real_close = _os.open, _os.fsync, _os.close
+    opened: list[tuple[str, int]] = []
+    synced: list[int] = []
+
+    def spy_open(path, flags, *args, **kwargs):
+        fd = real_open(path, flags, *args, **kwargs)
+        opened.append((str(path), fd))
+        return fd
+
+    def spy_fsync(fd):
+        synced.append(fd)
+        real_fsync(fd)
+
+    monkeypatch.setattr(auth_module.os, "open", spy_open)
+    monkeypatch.setattr(auth_module.os, "fsync", spy_fsync)
+
+    payload = json.loads(_credentials_file(tmp_path).read_text(encoding="utf-8"))
+    payload["access_token"] = "dir-synced-write"
+    auth._write_credentials(payload)
+
+    if getattr(_os, "O_DIRECTORY", None) is not None:      # POSIX-like harness
+        dir_opens = [fd for (path, fd) in opened if path == str(tmp_path)]
+        assert dir_opens and all(fd in synced for fd in dir_opens)
+    else:                                                   # Windows: silent no-op
+        assert json.loads(_credentials_file(tmp_path).read_text(encoding="utf-8"))[
+            "access_token"
+        ] == "dir-synced-write"
+
+
+def test_unsupported_or_failing_directory_fsync_never_breaks_the_write(
+    tmp_path, monkeypatch
+) -> None:
+    import os as _os
+
+    import app.google.auth as auth_module
+
+    auth = _connected_auth(tmp_path)
+    real_open, real_fsync = _os.open, _os.fsync
+    dir_fds: set[int] = set()
+
+    def spy_open(path, flags, *args, **kwargs):
+        fd = real_open(path, flags, *args, **kwargs)
+        if str(path) == str(tmp_path):        # the parent-directory open
+            dir_fds.add(fd)
+        return fd
+
+    def selective_fsync(fd):                  # ONLY directory sync "fails"
+        if fd in dir_fds:
+            raise OSError("directory fsync unsupported")
+        real_fsync(fd)                        # file fsync keeps working
+
+    monkeypatch.setattr(auth_module.os, "open", spy_open)
+    monkeypatch.setattr(auth_module.os, "fsync", selective_fsync)
+
+    payload = json.loads(_credentials_file(tmp_path).read_text(encoding="utf-8"))
+    payload["access_token"] = "still-persisted"
+    auth._write_credentials(payload)          # a refused DIR fsync is harmless
+
+    stored = json.loads(_credentials_file(tmp_path).read_text(encoding="utf-8"))
+    assert stored["access_token"] == "still-persisted"
+    assert [p.name for p in tmp_path.iterdir() if p.name.startswith(".credentials-")] == []
+
+
+def test_clear_credentials_serialized_against_inflight_refresh(tmp_path) -> None:
+    import threading
+    import time as _time
+
+    refresh_started = threading.Event()
+
+    def slow_refresher(credentials) -> None:
+        refresh_started.set()
+        _time.sleep(0.3)                    # hold the refresh lock mid-flight
+        credentials.token = "rotated-access"
+        credentials.expiry = datetime.now(timezone.utc) + timedelta(hours=1)
+
+    auth = _connected_auth(tmp_path, refresher=slow_refresher)
+    _force_expired(tmp_path)
+
+    worker = threading.Thread(target=lambda: auth.authorized_session())
+    worker.start()
+    assert refresh_started.wait(5)          # refresh in progress (lock held)
+    auth.clear_credentials()                # disconnect waits at the lock...
+    worker.join(timeout=30)
+
+    # ...so the LAST writer is clear_credentials: no resurrected credentials.
+    assert not _credentials_file(tmp_path).exists()
+    with pytest.raises(GoogleAuthError):
+        auth.authorized_session()
+
+
+def test_credential_persistence_logs_no_token_values(tmp_path, caplog) -> None:
+    def refresher(credentials) -> None:
+        credentials.token = "rotated-log-marker"
+        credentials.expiry = datetime.now(timezone.utc) + timedelta(hours=1)
+
+    auth = _connected_auth(tmp_path, refresher=refresher)
+    _force_expired(tmp_path)
+    with caplog.at_level("DEBUG"):
+        auth.authorized_session()
+    text = caplog.text
+    assert "rotated-log-marker" not in text
+    assert ACCESS_TOKEN not in text and REFRESH_TOKEN not in text
+
+
+# ---------------------------------------------------------------------------
+# CORE FINAL AUTH RACE FIX - OAuth callback commit vs clear_credentials()
+# ---------------------------------------------------------------------------
+
+
+def test_callback_cannot_resurrect_credentials_after_clear(tmp_path, caplog) -> None:
+    import threading
+
+    auth = _connected_auth(tmp_path)               # connected; epoch baseline
+    assert _credentials_file(tmp_path).exists()
+
+    exchange_entered = threading.Event()
+    release_exchange = threading.Event()
+
+    def blocking_exchanger(code):                  # network stand-in, blocks mid-flight
+        exchange_entered.set()
+        assert release_exchange.wait(5)
+        return {
+            "access_token": ACCESS_TOKEN,
+            "refresh_token": REFRESH_TOKEN,
+            "scope": " ".join(REQUIRED_SCOPES),
+            "expires_in": 3600,
+        }
+
+    auth._exchange = blocking_exchanger            # epoch already snapshotted by now
+    state = auth.state_store.issue()
+    box: dict[str, object] = {}
+
+    def run() -> None:
+        box["r"] = auth.handle_callback({"code": "c-late", "state": state})
+
+    worker = threading.Thread(target=run)
+    with caplog.at_level("DEBUG"):
+        worker.start()
+        assert exchange_entered.wait(5)            # callback in flight (past snapshot)
+        auth.clear_credentials()                   # disconnect lands mid-exchange
+        release_exchange.set()                     # callback now tries to commit
+        worker.join(timeout=30)
+
+    result = box["r"]
+    assert result.outcome is not OAuthOutcome.CONNECTED
+    assert "no longer current" in result.detail.lower()
+    # The stale grant was NOT written: the later disconnect stays authoritative.
+    assert not _credentials_file(tmp_path).exists()
+    # No token material leaks into logs on the superseded path.
+    assert ACCESS_TOKEN not in caplog.text and REFRESH_TOKEN not in caplog.text
+
+
+def test_callback_started_after_clear_connects_normally(tmp_path) -> None:
+    auth = _connected_auth(tmp_path)
+    auth.clear_credentials()                       # epoch advances, file gone
+    assert not _credentials_file(tmp_path).exists()
+
+    state = auth.state_store.issue()               # a NEW flow begun after the clear
+    result = auth.handle_callback({"code": "c-after-clear", "state": state})
+    assert result.outcome is OAuthOutcome.CONNECTED  # starts at the current epoch -> stores
+    assert _credentials_file(tmp_path).exists()
+
+
+def test_stale_callback_reports_sanitized_detail_without_generation(tmp_path) -> None:
+    import threading
+
+    auth = _connected_auth(tmp_path)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocking_exchanger(code):
+        entered.set()
+        assert release.wait(5)
+        return {
+            "access_token": ACCESS_TOKEN, "refresh_token": REFRESH_TOKEN,
+            "scope": " ".join(REQUIRED_SCOPES), "expires_in": 3600,
+        }
+
+    auth._exchange = blocking_exchanger
+    state = auth.state_store.issue()
+    box: dict[str, object] = {}
+    worker = threading.Thread(
+        target=lambda: box.setdefault("r", auth.handle_callback({"code": "x", "state": state}))
+    )
+    worker.start()
+    assert entered.wait(5)
+    auth.clear_credentials()
+    release.set()
+    worker.join(timeout=30)
+
+    detail = str(box["r"].detail).lower()
+    # Detail must not expose the internal epoch counter, file paths or tokens.
+    assert "epoch" not in detail and "generation" not in detail
+    assert str(tmp_path) not in detail and ACCESS_TOKEN not in detail

@@ -554,12 +554,25 @@ def test_health_exposes_actual_provider_and_model_structurally() -> None:
 
 def test_optional_fallback_absence_does_not_fail_overall_readiness() -> None:
     settings = _configured_settings(GOOGLE_CLIENT_ID="client-id", GOOGLE_CLIENT_SECRET="secret")
-    payload = api.HealthResponse.model_validate(TestClient(create_app(settings)).get("/api/health").json())
+    app = create_app(settings)
+
+    class _ReadyStt:
+        """Isolate the fallback-optionality assertion from real STT model
+        availability (A05 health is now runtime-truthful, see test_voice)."""
+
+        async def health(self):
+            from app.contracts.domain import HealthStatus as DomainHealth
+            from app.contracts.providers import ProviderHealth
+
+            return ProviderHealth(status=DomainHealth.READY, provider="faster-whisper")
+
+    app.state.stt_service = _ReadyStt()
+    payload = api.HealthResponse.model_validate(TestClient(app).get("/api/health").json())
     # Optional fallback is truthfully unavailable...
     assert payload.components["llm_fallback"].status == api.HealthStatus.UNAVAILABLE
     # ...but overall readiness reflects required components only (degraded here
-    # because A01/A05 adapters are pending, never unavailable for the optional
-    # fallback alone).
+    # because the database/google adapters are not probed, never unavailable
+    # for the optional fallback alone).
     assert payload.status == api.HealthStatus.DEGRADED
 
 

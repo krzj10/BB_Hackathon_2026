@@ -611,7 +611,9 @@ def test_en_and_pl_orchestration(env) -> None:
 
 
 def test_duration_ms_measured_with_monotonic_clock() -> None:
-    ticks = iter([100.0, 100.5])
+    # Four reads per attempt now: request start, queue-deadline check (zero
+    # wait here), inference start, inference end - duration stays INFERENCE-ONLY.
+    ticks = iter([100.0, 100.0, 100.0, 100.5])
     provider = FakeSttProvider("faster-whisper")
     service = TranscriptionService(
         primary=provider, timeout_seconds=5.0, clock=lambda: next(ticks)
@@ -909,3 +911,385 @@ def test_empty_primary_recognition_falls_back_once_to_nonempty(env) -> None:
     payload = response.json()["transcript"]
     assert payload["provider"] == "whisper.cpp"
     assert payload["text"] == "Fallback transcript"
+
+
+# =========================================================================== #
+# CORE FIX 2 - ASGI ingress cap BEFORE multipart parsing
+# =========================================================================== #
+
+from app.api.ingress import (  # noqa: E402
+    MAX_MULTIPART_REQUEST_BYTES,
+    MULTIPART_OVERHEAD_BYTES,
+    VoiceIngressLimiter,
+)
+
+
+def make_silent_wav(frame_bytes: int) -> bytes:
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wav:
+        wav.setnchannels(1); wav.setsampwidth(2); wav.setframerate(16000)
+        wav.writeframes(b"\x00" * frame_bytes)
+    return buffer.getvalue()
+
+
+def multipart_body(audio: bytes, boundary: str = "XbNd9", request_id: str = "req-1") -> bytes:
+    head = (
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"request_id\"\r\n\r\n"
+        f"{request_id}\r\n"
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"audio\"; "
+        f"filename=\"take.webm\"\r\nContent-Type: audio/webm\r\n\r\n"
+    ).encode()
+    return head + audio + f"\r\n--{boundary}--\r\n".encode()
+
+
+def test_oversized_declared_request_rejected_before_handler(env) -> None:
+    huge = make_silent_wav(MAX_UPLOAD_BYTES + MULTIPART_OVERHEAD_BYTES + 4096)
+    response = post_transcribe(env, data=huge)
+    assert response.status_code == 413
+    assert response.json()["detail"] == "request_body_too_large"   # limiter, not handler
+    assert env.primary.calls == [] and env.runner.commands == []   # never reached pipeline
+
+
+def test_chunked_stream_over_cap_rejected_without_content_length(env) -> None:
+    body = multipart_body(make_silent_wav(MAX_MULTIPART_REQUEST_BYTES + 50_000))
+    chunks = (body[i:i + 1 << 20] for i in range(0, len(body), 1 << 20))
+    response = env.client.post(
+        "/api/voice/transcribe",
+        content=chunks,
+        headers={
+            "Content-Type": "multipart/form-data; boundary=XbNd9",
+            "X-EVA-Session-ID": SESSION,
+        },
+    )
+    assert response.status_code == 413
+    assert response.json()["detail"] == "request_body_too_large"
+    assert env.primary.calls == []
+
+
+def test_valid_request_near_audio_cap_still_reaches_handler(env) -> None:
+    audio = make_silent_wav(MAX_UPLOAD_BYTES - 32 * 1024)     # request stays under cap
+    response = post_transcribe(env, data=audio)
+    assert response.status_code == 200, response.text          # parsed and transcribed
+    assert len(env.primary.calls) == 1
+
+
+def test_audio_over_exact_cap_still_rejected_by_file_limit(env) -> None:
+    audio = make_silent_wav(MAX_UPLOAD_BYTES + 8 * 1024)       # under ingress cap...
+    response = post_transcribe(env, data=audio)                # ...handler enforces exactly
+    assert response.status_code == 413
+    assert "audio_too_large" in response.json()["detail"]
+
+
+def test_ingress_rejection_never_logs_body_bytes(env, caplog) -> None:
+    marker = b"MARKER-AUDIO-BYTES-DO-NOT-LOG"
+    huge = marker + make_silent_wav(MAX_MULTIPART_REQUEST_BYTES + 4096)
+    with caplog.at_level("INFO"):
+        response = post_transcribe(env, data=huge)
+    assert response.status_code == 413
+    assert "MARKER-AUDIO-BYTES" not in caplog.text
+    assert "MARKER-AUDIO-BYTES" not in response.text
+
+
+# ---- streaming pass-through proof (raw ASGI; no HTTP client involved) ----- #
+
+
+class _RecordingDownstream:
+    """Minimal ASGI app that records every body chunk it is handed."""
+
+    def __init__(self, *, respond_after_first_chunk=False):
+        self.chunks: list[bytes] = []
+        self.message_types: list[str] = []
+        self.respond_after_first_chunk = respond_after_first_chunk
+        self.started = False
+
+    async def __call__(self, scope, receive, send):
+        while True:
+            message = await receive()
+            self.message_types.append(message["type"])
+            if message["type"] == "http.disconnect":
+                return
+            self.chunks.append(message.get("body") or b"")
+            if self.respond_after_first_chunk and not self.started:
+                self.started = True
+                await send({"type": "http.response.start", "status": 200, "headers": []})
+                await send({"type": "http.response.body", "body": b"", "more_body": True})
+            if not message.get("more_body", False):
+                if not self.started:
+                    await send({"type": "http.response.start", "status": 200, "headers": []})
+                    await send({"type": "http.response.body", "body": b"ok"})
+                return
+
+
+def _voice_scope(headers=None) -> dict:
+    return {
+        "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
+        "method": "POST", "path": "/api/voice/transcribe", "raw_path": b"/api/voice/transcribe",
+        "query_string": b"", "headers": headers or [], "client": ("test", 1), "server": ("test", 80),
+        "scheme": "http",
+    }
+
+
+def _req_chunks(parts):
+    msgs = []
+    for i, part in enumerate(parts):
+        msgs.append({"type": "http.request", "body": part,
+                     "more_body": i < len(parts) - 1})
+    return msgs
+
+
+def test_valid_streamed_request_forwards_each_chunk_unchanged() -> None:
+    # Three chunks totalling well under the cap must reach downstream as THREE
+    # separate http.request messages - proof the limiter does not concatenate.
+    parts = [b"A" * 1000, b"B" * 1000, b"C" * 500]
+
+    async def run():
+        spy = _RecordingDownstream()
+        mw = VoiceIngressLimiter(spy)
+        incoming = _req_chunks(parts)
+        sent = []
+
+        async def receive():
+            return incoming.pop(0) if incoming else {"type": "http.disconnect"}
+
+        async def send(m):
+            sent.append(m)
+
+        await mw(_voice_scope(), receive, send)
+        return spy, sent
+
+    spy, sent = asyncio.run(run())
+    assert spy.chunks == parts                    # each chunk forwarded verbatim
+    assert spy.message_types == ["http.request", "http.request", "http.request"]
+    assert sent[0]["status"] == 200
+
+
+def test_streaming_over_cap_aborts_with_single_413_no_double_start() -> None:
+    # Chunked stream with NO content-length crosses the cap mid-flight.
+    big = b"X" * (MAX_MULTIPART_REQUEST_BYTES + 1)
+
+    async def run():
+        spy = _RecordingDownstream()
+        mw = VoiceIngressLimiter(spy)
+        incoming = _req_chunks([big[: len(big) // 2], big[len(big) // 2:]])
+        sent: list[dict] = []
+
+        async def receive():
+            return incoming.pop(0) if incoming else {"type": "http.disconnect"}
+
+        async def send(m):
+            sent.append(m)
+
+        await mw(_voice_scope(), receive, send)   # downstream must NOT raise here
+        return spy, sent
+
+    spy, sent = asyncio.run(run())
+    starts = [m for m in sent if m["type"] == "http.response.start"]
+    assert len(starts) == 1 and starts[0]["status"] == 413   # exactly one response
+
+
+def test_disconnect_before_cap_passes_through_without_response() -> None:
+    async def run():
+        spy = _RecordingDownstream()
+        mw = VoiceIngressLimiter(spy)
+        incoming = [{"type": "http.request", "body": b"partial", "more_body": True},
+                    {"type": "http.disconnect"}]
+        sent: list[dict] = []
+
+        async def receive():
+            return incoming.pop(0) if incoming else {"type": "http.disconnect"}
+
+        async def send(m):
+            sent.append(m)
+
+        await mw(_voice_scope(), receive, send)
+        return spy, sent
+
+    spy, sent = asyncio.run(run())
+    assert [m for m in sent if m["type"] == "http.response.start"] == []  # nothing answered
+
+
+def test_non_voice_or_get_scopes_are_not_counted() -> None:
+    get_scope = _voice_scope()
+    get_scope["method"] = "GET"
+
+    async def run():
+        spy = _RecordingDownstream()
+        mw = VoiceIngressLimiter(spy)
+        big = b"Y" * (MAX_MULTIPART_REQUEST_BYTES + 10_000)   # would trip a POST cap
+        incoming = _req_chunks([big])
+        sent: list[dict] = []
+
+        async def receive():
+            return incoming.pop(0) if incoming else {"type": "http.disconnect"}
+
+        async def send(m):
+            sent.append(m)
+
+        await mw(get_scope, receive, send)         # GET is passed through untouched
+        return spy, sent
+
+    spy, sent = asyncio.run(run())                 # no 413 for a non-POST scope
+    assert spy.chunks == [b"Y" * (MAX_MULTIPART_REQUEST_BYTES + 10_000)]
+    starts = [m for m in sent if m["type"] == "http.response.start"]
+    assert all(m["status"] != 413 for m in starts)  # untouched: downstream's own answer
+
+
+def test_over_cap_after_downstream_started_sends_no_second_response() -> None:
+    # Downstream emits response.start on the first chunk, then keeps reading;
+    # a later chunk crosses the cap. The limiter must NOT invent a second
+    # http.response.start (ASGI forbids it) - it fails closed silently.
+    big = b"Q" * (MAX_MULTIPART_REQUEST_BYTES + 1)
+
+    async def run():
+        spy = _RecordingDownstream(respond_after_first_chunk=True)
+        mw = VoiceIngressLimiter(spy)
+        incoming = _req_chunks([b"head", big])
+        sent: list[dict] = []
+
+        async def receive():
+            return incoming.pop(0) if incoming else {"type": "http.disconnect"}
+
+        async def send(m):
+            sent.append(m)
+
+        await mw(_voice_scope(), receive, send)   # must not raise to the caller
+        return spy, sent
+
+    spy, sent = asyncio.run(run())
+    starts = [m for m in sent if m["type"] == "http.response.start"]
+    assert len(starts) == 1 and starts[0]["status"] == 200   # downstream's own start
+
+
+def test_malformed_or_negative_content_length_still_stream_counted() -> None:
+    for bad_len in (b"not-a-number", b"-5"):
+        scope = _voice_scope(headers=[(b"content-length", bad_len)])
+
+        async def run(scope=scope):
+            spy = _RecordingDownstream()
+            mw = VoiceIngressLimiter(spy)
+            incoming = _req_chunks([b"Z" * (MAX_MULTIPART_REQUEST_BYTES + 1)])
+            sent: list[dict] = []
+
+            async def receive():
+                return incoming.pop(0) if incoming else {"type": "http.disconnect"}
+
+            async def send(m):
+                sent.append(m)
+
+            await mw(scope, receive, send)
+            return spy, sent
+
+        spy, sent = asyncio.run(run())             # bad header must NOT bypass counting
+        starts = [m for m in sent if m["type"] == "http.response.start"]
+        assert len(starts) == 1 and starts[0]["status"] == 413
+
+
+# =========================================================================== #
+# CORE FIX 3 - bounded queue-wait deadline (no unbounded semaphore hang)
+# =========================================================================== #
+
+
+class EventGatedProvider:
+    """Holds the inference permit on a threading.Event until released."""
+
+    def __init__(self, name: str = "faster-whisper") -> None:
+        self.name = name
+        self.event = threading.Event()
+        self.calls = 0
+
+    async def transcribe(self, audio, language=None):
+        self.calls += 1
+        await asyncio.to_thread(self.event.wait)
+        return Transcript(text="done", language="en", language_confidence=0.9,
+                          duration_ms=0, provider=self.name)
+
+    async def health(self):
+        from app.contracts.providers import ProviderHealth
+
+        return ProviderHealth(status=HealthStatus.READY, provider=self.name)
+
+
+def test_second_request_times_out_boundedly_while_permit_held() -> None:
+    provider = EventGatedProvider()
+    service = TranscriptionService(primary=provider, max_concurrency=1, timeout_seconds=0.25)
+
+    async def scenario():
+        first = asyncio.create_task(service.transcribe(AudioInput(wav_bytes=make_wav(0.1))))
+        await asyncio.sleep(0.05)                       # first holds the only permit
+        with pytest.raises(TranscriptionTimeoutError):  # request 1 times out
+            await first
+        start = time.monotonic()                        # native worker STILL running
+        with pytest.raises(TranscriptionTimeoutError):  # request 2: bounded, no hang
+            await service.transcribe(AudioInput(wav_bytes=make_wav(0.1)))
+        waited = time.monotonic() - start
+        assert waited < 1.5                             # not indefinite
+        assert provider.calls == 1                      # NO second provider task started
+        provider.event.set()                            # native worker exits -> permit freed
+        transcript = await asyncio.wait_for(
+            service.transcribe(AudioInput(wav_bytes=make_wav(0.1))), timeout=2.0
+        )
+        assert transcript.text == "done"
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_queue_wait_neither_leaks_nor_double_releases_permit() -> None:
+    provider = EventGatedProvider()
+    service = TranscriptionService(primary=provider, max_concurrency=1, timeout_seconds=5.0)
+
+    async def scenario():
+        holder = asyncio.create_task(service.transcribe(AudioInput(wav_bytes=make_wav(0.1))))
+        await asyncio.sleep(0.05)
+        waiter = asyncio.create_task(service.transcribe(AudioInput(wav_bytes=make_wav(0.1))))
+        await asyncio.sleep(0.05)                       # waiter queued on the semaphore
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        provider.event.set()                            # holder finishes, releases lease
+        await holder
+        transcript = await asyncio.wait_for(             # permit exactly one - still usable
+            service.transcribe(AudioInput(wav_bytes=make_wav(0.1))), timeout=2.0
+        )
+        assert transcript.text == "done"
+
+    asyncio.run(scenario())
+
+
+# =========================================================================== #
+# CORE FIX 4 - health reports actual A05/STT readiness
+# =========================================================================== #
+
+
+def test_health_stt_ready_when_primary_ready(env) -> None:
+    body = env.client.get("/api/health").json()
+    stt = body["components"]["stt"]
+    assert stt["status"] == "ready"
+    assert stt["provider"] == "faster-whisper"
+    assert "adapter pending (A05)" not in str(body)      # stale wording gone
+
+
+def test_health_stt_degraded_when_only_fallback_ready(env) -> None:
+    env.primary.fail = "unavailable"
+    stt = env.client.get("/api/health").json()["components"]["stt"]
+    assert stt["status"] == "degraded"
+    assert stt["detail"] == "primary unavailable; local fallback ready"
+
+
+def test_health_stt_unavailable_when_neither_provider_ready(env) -> None:
+    env.primary.fail = "unavailable"
+    env.fallback.fail = "unavailable"
+    body = env.client.get("/api/health").json()
+    assert body["components"]["stt"]["status"] == "unavailable"
+
+
+def test_health_stt_sanitizes_broken_provider_probe(env) -> None:
+    class BrokenHealthProvider(FakeSttProvider):
+        async def health(self):
+            raise RuntimeError("private path C:\\Users\\secret\\model.bin")
+
+    env.app.state.stt_service = TranscriptionService(
+        primary=BrokenHealthProvider("faster-whisper"), max_concurrency=1, timeout_seconds=5.0
+    )
+    body = env.client.get("/api/health").json()
+    assert body["components"]["stt"]["status"] == "unavailable"
+    assert "private path" not in str(body)               # no local/private leakage

@@ -34,7 +34,9 @@ def _worst(statuses: list[HealthStatus]) -> HealthStatus:
     return HealthStatus.READY
 
 
-def build_component_health(settings: Settings) -> dict[str, ProviderHealth]:
+def build_component_health(
+    settings: Settings, stt_component: ProviderHealth | None = None
+) -> dict[str, ProviderHealth]:
     components: dict[str, ProviderHealth] = {}
 
     components["database"] = ProviderHealth(
@@ -86,18 +88,30 @@ def build_component_health(settings: Settings) -> dict[str, ProviderHealth]:
             detail="Google OAuth client id/secret not configured",
         )
 
-    components["stt"] = ProviderHealth(
-        status=HealthStatus.DEGRADED,
-        detail=f"provider {settings.eva_stt_provider!r} adapter pending (A05)",
+    # Real A05 runtime readiness (no external network probes; the service
+    # aggregates primary/fallback honestly and sanitizes provider detail).
+    components["stt"] = stt_component or ProviderHealth(
+        status=HealthStatus.UNAVAILABLE,
+        detail="speech-to-text service not initialized",
     )
 
     return components
 
 
 @router.get("/health", response_model=HealthResponse)
-def health(request: Request) -> HealthResponse:
+async def health(request: Request) -> HealthResponse:
     settings: Settings = request.app.state.settings
-    components = build_component_health(settings)
+    stt_component: ProviderHealth | None = None
+    service = getattr(request.app.state, "stt_service", None)
+    if service is not None:
+        try:
+            stt_component = await service.health()
+        except Exception:  # a broken probe stays honest and sanitized
+            stt_component = ProviderHealth(
+                status=HealthStatus.UNAVAILABLE,
+                detail="speech-to-text readiness unavailable",
+            )
+    components = build_component_health(settings, stt_component)
     required_statuses = [
         component.status
         for name, component in components.items()

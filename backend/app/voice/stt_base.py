@@ -152,8 +152,28 @@ class TranscriptionService:
         even across timeouts, where cancelling asyncio plumbing does NOT stop
         native inference threads.
 
-        Providers always receive ``language=None``: automatic detection."""
-        await self._semaphore.acquire()
+        Providers always receive ``language=None``: automatic detection.
+
+        Request deadline (Core fix): ``timeout_seconds`` bounds the WHOLE
+        attempt - queue wait plus inference. Waiting for a permit is itself
+        time-boxed; if the queue deadline expires the request fails with a
+        stable TranscriptionTimeoutError BEFORE any provider task starts (no
+        permit consumed, none leaked). A native worker that timed out earlier
+        still keeps its lease until it genuinely exits - the HTTP caller's
+        impatience never releases someone else's permit."""
+        request_start = self._clock()
+        try:
+            await asyncio.wait_for(self._semaphore.acquire(), timeout=self._timeout)
+        except asyncio.TimeoutError as exc:
+            # A cancelled acquire consumes no permit - nothing to release.
+            logger.error("stt queue deadline exceeded")
+            raise TranscriptionTimeoutError("speech-to-text queue is saturated") from exc
+        remaining = self._timeout - (self._clock() - request_start)
+        if remaining <= 0:
+            # Deadline reached exactly at acquisition: release OUR OWN fresh
+            # permit (no native work was ever started) and time out honestly.
+            self._semaphore.release()
+            raise TranscriptionTimeoutError("speech-to-text queue is saturated")
         task = asyncio.create_task(provider.transcribe(audio, None))
         released = False
 
@@ -171,7 +191,8 @@ class TranscriptionService:
         task.add_done_callback(_release)
         started = self._clock()
         try:
-            transcript = await asyncio.wait_for(asyncio.shield(task), timeout=self._timeout)
+            # Inference gets only the REMAINING budget of this request.
+            transcript = await asyncio.wait_for(asyncio.shield(task), timeout=remaining)
         except asyncio.TimeoutError as exc:
             # Permit intentionally stays held until the native worker exits.
             raise TranscriptionTimeoutError() from exc
