@@ -3,7 +3,7 @@ import { Badge } from "../components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card";
 import { Separator } from "../components/ui/separator";
 import { getEvaClient } from "../api/client";
-import type { Claim, SourceRef } from "../api/types.generated";
+import type { Claim, SourceRef, BriefingRequest } from "../api/types.generated";
 import { useEvaQuery } from "../hooks/useEvaQuery";
 import { formatDay, formatTimeInWarsaw } from "../lib/format";
 
@@ -146,13 +146,14 @@ function BriefingLoading() {
 export default function Briefings() {
   const [reloadKey, setReloadKey] = React.useState(0);
   const client = getEvaClient();
-  const briefing = useEvaQuery(`briefing:${reloadKey}`, (c) => c.getBriefing({ calendar_id: "primary", event_id: "evt-demo-acme-contract-review-001" }), client);
+  const briefingRequest: BriefingRequest = { meeting_ref: { calendar_id: "primary", event_id: "evt-demo-acme-contract-review-001" }, language: "pl" };
+  const briefing = useEvaQuery(`briefing:${reloadKey}`, (c) => c.getBriefing(briefingRequest), client);
   const retry = () => setReloadKey((n) => n + 1);
 
   if (briefing.status === "loading") return <BriefingLoading />;
   if (briefing.status === "error") return <BriefingError onRetry={retry} />;
 
-  const data = briefing.data;
+  const data = briefing.data.briefing;
   const sources = data.sources ?? [];
 
   return (

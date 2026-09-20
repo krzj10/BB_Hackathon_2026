@@ -1,8 +1,17 @@
 import * as React from "react";
 import { Badge } from "../components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card";
+import { ActionApproval } from "../components/approvals/ActionApproval";
 import { getEvaClient } from "../api/client";
-import type { Decision, DecisionResponse } from "../api/types.generated";
+import type {
+  Decision,
+  ProposedAction,
+  ProposedActionResponse,
+  ActionConfirmResponse,
+  ApprovalChallengeResponse,
+  ApprovalRequest,
+  DecisionOutcomeProposalRequest,
+} from "../api/types.generated";
 import { useEvaQuery } from "../hooks/useEvaQuery";
 import { formatDeadline, formatMoney, formatTimeInWarsaw } from "../lib/format";
 
@@ -22,9 +31,9 @@ function formatStatus(status: Decision["status"]): { label: string; className: s
     case "needs_review":
       return { label: "Needs review", className: "bg-primary/10 text-primary border-primary/30" };
     case "deferred":
-      return { label: "Deferred", className: "bg-amber/10 text-amber-600 dark:text-amber-400 border-amber/30" };
+      return { label: "Deferred", className: "bg-warning/10 text-warning border-warning/30" };
     case "resolved":
-      return { label: "Resolved", className: "bg-green/10 text-green-600 dark:text-green-400 border-green/30" };
+      return { label: "Resolved", className: "bg-success/10 text-success border-success/30" };
     case "dismissed":
       return { label: "Dismissed", className: "bg-muted text-muted-foreground border-border/60" };
     default:
@@ -32,16 +41,78 @@ function formatStatus(status: Decision["status"]): { label: string; className: s
   }
 }
 
-function DecisionDetail({ decision, onClose, onRecordOutcome, onDefer }: {
+type DecisionDetailState =
+  | { phase: "detail"; decision: Decision }
+  | { phase: "proposing"; decision: Decision; outcome: "accept" | "reject" }
+  | { phase: "approval"; decision: Decision; proposedAction: ProposedAction; challenge: ApprovalChallengeResponse; loadingChallenge: boolean }
+  | { phase: "confirming"; decision: Decision; proposedAction: ProposedAction; challenge: ApprovalChallengeResponse; choice: "approve" | "reject"; loading: boolean }
+  | { phase: "result"; decision: Decision; confirmResponse: ActionConfirmResponse };
+
+interface DecisionDetailContainerProps {
   decision: Decision;
   onClose: () => void;
-  onRecordOutcome: (outcome: "accept" | "reject") => void;
-  onDefer: () => void;
-}) {
+  setReloadKey: React.Dispatch<React.SetStateAction<number>>;
+}
+
+function DecisionDetailContainer({ decision, onClose, setReloadKey }: DecisionDetailContainerProps) {
+  const client = getEvaClient();
+  const [state, setState] = React.useState<DecisionDetailState>({ phase: "detail", decision });
+
+  const handleRecordOutcome = async (outcome: "accept" | "reject") => {
+    setState({ phase: "proposing", decision, outcome });
+    try {
+      const request: DecisionOutcomeProposalRequest = {
+        outcome,
+        session_id: "sess-demo-001",
+        request_id: `req-${Date.now()}`,
+      };
+      const response: ProposedActionResponse = await client.proposeDecisionOutcome(decision.id, request);
+      const proposedAction = response.action;
+
+      const challenge = await client.getApprovalChallenge(proposedAction.id);
+      setState({ phase: "approval", decision, proposedAction, challenge, loadingChallenge: false });
+    } catch (error) {
+      console.error("Failed to propose decision outcome:", error);
+      setState({ phase: "detail", decision });
+    }
+  };
+
+  const handleDefer = async () => {
+    try {
+      await client.deferDecision(decision.id);
+      setReloadKey((n) => n + 1);
+      onClose();
+    } catch (error) {
+      console.error("Failed to defer decision:", error);
+    }
+  };
+
+  const handleConfirmChoice = async (choice: "approve" | "reject") => {
+    if (state.phase !== "approval") return;
+    const { proposedAction, challenge, decision: currentDecision } = state;
+    setState({ phase: "confirming", decision: currentDecision, proposedAction, challenge, choice, loading: true });
+
+    try {
+      const confirmRequest: ApprovalRequest = {
+        action_id: proposedAction.id,
+        revision: proposedAction.revision,
+        arguments_digest: proposedAction.arguments_digest,
+        choice,
+        challenge: challenge.challenge,
+      };
+
+      const confirmResponse: ActionConfirmResponse = await client.confirmAction(proposedAction.id, confirmRequest);
+      setState({ phase: "result", decision: currentDecision, confirmResponse });
+    } catch (error) {
+      console.error("Failed to confirm action:", error);
+      setState({ phase: "detail", decision: currentDecision });
+    }
+  };
+
   const riskStyle = formatRisk(decision.risk);
   const statusStyle = formatStatus(decision.status);
 
-  return (
+  const renderDetail = () => (
     <div className="mx-auto w-full max-w-3xl px-6 py-8" role="dialog" aria-labelledby="decision-detail-title" aria-modal="true">
       <button
         type="button"
@@ -174,8 +245,7 @@ function DecisionDetail({ decision, onClose, onRecordOutcome, onDefer }: {
           </Card>
         )}
 
-        {/* Outcome recording controls */}
-        {decision.status === "needs_review" && (
+        {state.phase === "detail" && decision.status === "needs_review" && (
           <Card className="border-primary/30">
             <CardHeader>
               <CardTitle className="text-[14px] flex items-center gap-2">
@@ -192,21 +262,21 @@ function DecisionDetail({ decision, onClose, onRecordOutcome, onDefer }: {
               <div className="flex flex-wrap gap-3">
                 <button
                   type="button"
-                  onClick={() => onRecordOutcome("accept")}
-                  className="rounded-control bg-green-600 px-4 py-2 text-[13.5px] font-medium text-white transition-colors hover:bg-green-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-green-500"
+                  onClick={() => handleRecordOutcome("accept")}
+                  className="rounded-control bg-success px-4 py-2 text-[13.5px] font-medium text-white transition-colors hover:bg-green-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-success"
                 >
                   RECORD ACCEPT
                 </button>
                 <button
                   type="button"
-                  onClick={() => onRecordOutcome("reject")}
-                  className="rounded-control bg-red-600 px-4 py-2 text-[13.5px] font-medium text-white transition-colors hover:bg-red-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500"
+                  onClick={() => handleRecordOutcome("reject")}
+                  className="rounded-control bg-danger px-4 py-2 text-[13.5px] font-medium text-white transition-colors hover:bg-red-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-danger"
                 >
                   RECORD REJECT
                 </button>
                 <button
                   type="button"
-                  onClick={onDefer}
+                  onClick={handleDefer}
                   className="rounded-control border border-border-strong px-4 py-2 text-[13.5px] font-medium text-foreground transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                 >
                   DEFER
@@ -219,8 +289,91 @@ function DecisionDetail({ decision, onClose, onRecordOutcome, onDefer }: {
           </Card>
         )}
 
-        {decision.status === "resolved" && decision.outcome && (
-          <Card className="border-green/30 bg-green-50/30 dark:bg-green-950/10">
+        {state.phase === "detail" && (
+          <button
+            type="button"
+            disabled
+            className="rounded-control border border-border-strong px-4 py-2 text-[13.5px] font-medium text-muted-foreground transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            title="Preview — assistant integration not connected"
+          >
+            ASK EVA
+          </button>
+        )}
+
+        {state.phase === "proposing" && (
+          <Card className="border-primary/30 bg-primary/5 dark:bg-primary/10">
+            <CardHeader>
+              <CardTitle className="text-[13px] flex items-center gap-2">
+                <span className="text-primary motion-safe:animate-pulse">⏳</span>
+                Proposing outcome…
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              <p className="text-[13px] text-muted-foreground">Creating outcome proposal and obtaining approval challenge…</p>
+            </CardContent>
+          </Card>
+        )}
+
+        {state.phase === "approval" && (
+          <ActionApproval
+            action={state.proposedAction}
+            onConfirm={handleConfirmChoice}
+            onClose={onClose}
+          />
+        )}
+
+        {state.phase === "confirming" && (
+          <Card className="border-primary/30 bg-primary/5 dark:bg-primary/10">
+            <CardHeader>
+              <CardTitle className="text-[13px] flex items-center gap-2">
+                <span className="text-primary motion-safe:animate-pulse">⏳</span>
+                {state.choice === "approve" ? "Confirming approval…" : "Confirming rejection…"}
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              <p className="text-[13px] text-muted-foreground">Submitting approval confirmation…</p>
+            </CardContent>
+          </Card>
+        )}
+
+        {state.phase === "result" && (
+          <Card className={state.confirmResponse.action.status === "approved" ? "border-success/30 bg-success/5 dark:bg-success/10" : "border-danger/30 bg-danger/5 dark:bg-danger/10"}>
+            <CardHeader>
+              <CardTitle className="text-[13px] flex items-center gap-2">
+                <span>{state.confirmResponse.action.status === "approved" ? "✅" : "🚫"}</span>
+                {state.confirmResponse.action.status === "approved" ? "Approved & Executed" : "Rejected"}
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-2">
+              <p className={`text-[13px] font-medium ${state.confirmResponse.action.status === "approved" ? "text-success" : "text-danger"}`}>
+                Action {state.confirmResponse.action.status === "approved" ? "approved and executed" : "rejected"}.
+              </p>
+              {state.confirmResponse.receipt && (
+                <p className="text-[12px] text-muted-foreground">
+                  Approval receipt: {state.confirmResponse.receipt.id} via {state.confirmResponse.receipt.channel} at {formatTimeInWarsaw(state.confirmResponse.receipt.approved_at)}
+                </p>
+              )}
+              {state.confirmResponse.result && (
+                <details className="mt-2">
+                  <summary className="cursor-pointer text-[12.5px] text-primary">Tool result details</summary>
+                  <pre className="mt-2 text-[11px] text-muted-foreground bg-muted p-2 rounded border border-border/60 overflow-auto max-h-32">
+                    {JSON.stringify(state.confirmResponse.result, null, 2)}
+                  </pre>
+                </details>
+              )}
+              <button
+                type="button"
+                onClick={onClose}
+                className="mt-3 rounded-control border border-border-strong px-4 py-2 text-[13.5px] font-medium text-foreground transition-colors hover:bg-accent"
+              >
+                Close
+              </button>
+            </CardContent>
+          </Card>
+        )}
+
+        {decision.status === "resolved" && decision.outcome && state.phase === "detail" && (
+          <Card className="border-success/30 bg-success/5 dark:bg-success/10">
             <CardHeader>
               <CardTitle className="text-[14px] flex items-center gap-2">
                 <span className="text-muted-foreground">✅</span>
@@ -228,7 +381,7 @@ function DecisionDetail({ decision, onClose, onRecordOutcome, onDefer }: {
               </CardTitle>
             </CardHeader>
             <CardContent className="space-y-1">
-              <p className="text-[13px] font-medium text-green-700 dark:text-green-300">
+              <p className="text-[13px] font-medium text-success">
                 Outcome: {decision.outcome.toUpperCase()}
               </p>
               {decision.outcome_recorded_at && (
@@ -245,8 +398,8 @@ function DecisionDetail({ decision, onClose, onRecordOutcome, onDefer }: {
           </Card>
         )}
 
-        {decision.status === "deferred" && (
-          <Card className="border-amber/30 bg-amber-50/30 dark:bg-amber-950/10">
+        {decision.status === "deferred" && state.phase === "detail" && (
+          <Card className="border-warning/30 bg-warning/5 dark:bg-warning/10">
             <CardHeader>
               <CardTitle className="text-[14px] flex items-center gap-2">
                 <span className="text-muted-foreground">⏸️</span>
@@ -254,14 +407,14 @@ function DecisionDetail({ decision, onClose, onRecordOutcome, onDefer }: {
               </CardTitle>
             </CardHeader>
             <CardContent>
-              <p className="text-[13px] text-amber-700 dark:text-amber-300">
+              <p className="text-[13px] text-warning">
                 This decision has been deferred. It will remain in your queue until reviewed.
               </p>
             </CardContent>
           </Card>
         )}
 
-        {decision.status === "dismissed" && (
+        {decision.status === "dismissed" && state.phase === "detail" && (
           <Card className="border-muted bg-muted/30">
             <CardHeader>
               <CardTitle className="text-[14px] flex items-center gap-2">
@@ -283,6 +436,8 @@ function DecisionDetail({ decision, onClose, onRecordOutcome, onDefer }: {
       </div>
     </div>
   );
+
+  return <>{renderDetail()}</>;
 }
 
 function DecisionRow({ decision, onClick }: { decision: Decision; onClick: () => void }) {
@@ -343,10 +498,10 @@ function DecisionError({ onRetry }: { onRetry: () => void }) {
 function DecisionLoading() {
   return (
     <div className="mx-auto w-full max-w-3xl px-6 py-8" aria-busy="true" aria-live="polite">
-      <div className="h-4 w-48 animate-pulse rounded-full bg-muted" />
+      <div className="h-4 w-48 motion-safe:animate-pulse rounded-full bg-muted" />
       <div className="mt-6 space-y-3">
         {[...Array(5)].map((_, i) => (
-          <div key={i} className="h-14 animate-pulse rounded-card bg-muted" />
+          <div key={i} className="h-14 motion-safe:animate-pulse rounded-card bg-muted" />
         ))}
       </div>
       <p className="mt-6 text-[12.5px] text-muted-foreground">Loading decisions…</p>
@@ -381,73 +536,6 @@ export default function Decisions() {
 
   const items = decisions.data.items;
 
-  if (selectedDecision) {
-    const [detail, setDetail] = React.useState<DecisionResponse | null>(null);
-    const [detailStatus, setDetailStatus] = React.useState<"loading" | "ready" | "error">("loading");
-
-    React.useEffect(() => {
-      let cancelled = false;
-      setDetailStatus("loading");
-      client
-        .getDecision(selectedDecision.id)
-        .then((data) => {
-          if (!cancelled) {
-            setDetail(data);
-            setDetailStatus("ready");
-          }
-        })
-        .catch(() => {
-          if (!cancelled) setDetailStatus("error");
-        });
-      return () => {
-        cancelled = true;
-      };
-    }, [selectedDecision.id, client]);
-
-    if (detailStatus === "loading") {
-      return (
-        <div className="mx-auto w-full max-w-3xl px-6 py-8" aria-busy="true" aria-live="polite">
-          <div className="h-4 w-64 animate-pulse rounded-full bg-muted" />
-          <p className="mt-6 text-[12.5px] text-muted-foreground">Loading decision detail…</p>
-        </div>
-      );
-    }
-
-    if (detailStatus === "error" || !detail) {
-      return (
-        <div className="mx-auto w-full max-w-3xl px-6 py-8 text-center">
-          <h2 className="text-[17px] font-semibold tracking-tight">Decision detail unavailable</h2>
-          <button
-            type="button"
-            onClick={() => setSelectedDecision(null)}
-            className="mt-4 rounded-control border border-border-strong px-4 py-2 text-[13.5px] font-medium text-foreground transition-colors hover:bg-accent"
-          >
-            Back to inbox
-          </button>
-        </div>
-      );
-    }
-
-    return (
-      <DecisionDetail
-        decision={detail.decision}
-        onClose={() => setSelectedDecision(null)}
-        onRecordOutcome={(outcome) => {
-          client.recordDecisionOutcome(detail.decision.id, outcome).then(() => {
-            setReloadKey((n) => n + 1);
-            setSelectedDecision(null);
-          });
-        }}
-        onDefer={() => {
-          client.deferDecision(detail.decision.id).then(() => {
-            setReloadKey((n) => n + 1);
-            setSelectedDecision(null);
-          });
-        }}
-      />
-    );
-  }
-
   return (
     <div className="mx-auto w-full max-w-3xl px-6 py-8 lg:px-8 lg:py-10">
       <header className="mb-6">
@@ -462,6 +550,14 @@ export default function Decisions() {
           <DecisionRow key={decision.id} decision={decision} onClick={() => setSelectedDecision(decision)} />
         ))}
       </ul>
+
+      {selectedDecision && (
+        <DecisionDetailContainer
+          decision={selectedDecision}
+          onClose={() => setSelectedDecision(null)}
+          setReloadKey={setReloadKey}
+        />
+      )}
 
       <p className="mt-6 text-center text-[12px] text-subtle-foreground">
         Data from canonical fixtures: decision_finance_pln_needs_review.json / decision_finance_pln_resolved.json

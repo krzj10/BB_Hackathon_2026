@@ -10,11 +10,11 @@ function formatStatus(status: ActionStatus): { label: string; className: string 
     case "pending":
       return { label: "Pending approval", className: "bg-primary/10 text-primary border-primary/30" };
     case "approved":
-      return { label: "Approved", className: "bg-green/10 text-green-600 dark:text-green-400 border-green/30" };
+      return { label: "Approved", className: "bg-success/10 text-success border-success/30" };
     case "executing":
-      return { label: "Executing…", className: "bg-amber/10 text-amber-600 dark:text-amber-400 border-amber/30 animate-pulse" };
+      return { label: "Executing…", className: "bg-warning/10 text-warning border-warning/30 motion-safe:animate-pulse" };
     case "succeeded":
-      return { label: "Succeeded", className: "bg-green/10 text-green-600 dark:text-green-400 border-green/30" };
+      return { label: "Succeeded", className: "bg-success/10 text-success border-success/30" };
     case "failed":
       return { label: "Failed", className: "bg-danger/10 text-danger border-danger/30" };
     case "unknown":
@@ -45,7 +45,7 @@ interface ActionApprovalProps {
   action: ProposedAction;
   result?: ToolResult | null;
   receipt?: ApprovalReceipt | null;
-  onConfirm?: (choice: "approve" | "reject", challenge: string) => void;
+  onConfirm?: (choice: "approve" | "reject") => void;
   onClose?: () => void;
 }
 
@@ -61,6 +61,7 @@ export function ActionApproval({
   const isHighRisk = action.risk === "high";
   const isPending = action.status === "pending";
   const isExecuting = action.status === "executing";
+  const requiresApproval = action.requires_approval;
 
   return (
     <div className="mx-auto w-full max-w-2xl px-4 py-6" role="dialog" aria-labelledby="action-approval-title" aria-modal="true">
@@ -154,33 +155,40 @@ export function ActionApproval({
           </Card>
         )}
 
-        {isHighRisk && isPending && onConfirm && (
-          <Card className="border-danger/30 bg-danger-50/30 dark:bg-danger-950/10">
+        {requiresApproval && isPending && onConfirm && (
+          <Card className="border-danger/30 bg-danger/5 dark:bg-danger/10">
             <CardHeader>
               <CardTitle className="text-[13px] flex items-center gap-2">
                 <span className="text-danger">⚠️</span>
-                High Risk — Explicit Confirmation Required
+                {isHighRisk ? "High Risk — Explicit Confirmation Required" : "Approval Required"}
               </CardTitle>
             </CardHeader>
             <CardContent className="space-y-3">
-              <p className="text-[13px] text-danger">
-                This action carries <strong>HIGH</strong> risk. Voice or casual confirmation is <strong>not sufficient</strong>.
-                You must explicitly confirm or reject using the controls below.
-              </p>
+              {isHighRisk && (
+                <p className="text-[13px] text-danger">
+                  This action carries <strong>HIGH</strong> risk. Voice or casual confirmation is <strong>not sufficient</strong>.
+                  You must explicitly confirm or reject using the controls below.
+                </p>
+              )}
+              {!isHighRisk && (
+                <p className="text-[13px] text-muted-foreground">
+                  This action requires approval. Voice confirmation {action.voice_approval_allowed ? "is" : "is not"} allowed.
+                </p>
+              )}
               <p className="text-[12px] text-muted-foreground">
-                A one-time challenge will be required. The action expires at {action.expires_at ? formatTimeInWarsaw(action.expires_at) : "the configured time"}.
+                A one-time challenge will be obtained before confirmation. The action expires at {action.expires_at ? formatTimeInWarsaw(action.expires_at) : "the configured time"}.
               </p>
               <div className="flex flex-wrap gap-3">
                 <button
                   type="button"
-                  onClick={() => onConfirm("approve", "demo-one-time-challenge-0001")}
-                  className="rounded-control bg-danger px-4 py-2 text-[13.5px] font-medium text-white transition-colors hover:bg-red-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500"
+                  onClick={() => onConfirm("approve")}
+                  className="rounded-control bg-primary px-4 py-2 text-[13.5px] font-medium text-primary-foreground transition-colors hover:bg-primary/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                 >
-                  Confirm (Approve)
+                  {isHighRisk ? "Confirm (Approve)" : "Approve"}
                 </button>
                 <button
                   type="button"
-                  onClick={() => onConfirm("reject", "demo-one-time-challenge-0001")}
+                  onClick={() => onConfirm("reject")}
                   className="rounded-control border border-border-strong px-4 py-2 text-[13.5px] font-medium text-foreground transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                 >
                   Reject
@@ -190,50 +198,32 @@ export function ActionApproval({
           </Card>
         )}
 
-        {!isHighRisk && isPending && (
+        {!requiresApproval && isPending && (
           <Card className="border-primary/30">
             <CardHeader>
               <CardTitle className="text-[13px] flex items-center gap-2">
-                <span className="text-muted-foreground">✅</span>
-                Pending Approval
+                <span className="text-muted-foreground">⏳</span>
+                Pending (No Approval Required)
               </CardTitle>
             </CardHeader>
-            <CardContent className="space-y-2">
+            <CardContent>
               <p className="text-[13px] text-muted-foreground">
-                This action is awaiting approval. Voice confirmation {action.voice_approval_allowed ? "is" : "is not"} allowed.
+                This action is pending but does not require explicit approval. It will proceed automatically.
               </p>
-              <div className="flex flex-wrap gap-3">
-                <button
-                  type="button"
-                  onClick={() => onConfirm?.("approve", "demo-one-time-challenge-0001")}
-                  className="rounded-control bg-primary px-4 py-2 text-[13.5px] font-medium text-primary-foreground transition-colors hover:bg-primary/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                  disabled={!onConfirm}
-                >
-                  Approve
-                </button>
-                <button
-                  type="button"
-                  onClick={() => onConfirm?.("reject", "demo-one-time-challenge-0001")}
-                  className="rounded-control border border-border-strong px-4 py-2 text-[13.5px] font-medium text-foreground transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                  disabled={!onConfirm}
-                >
-                  Reject
-                </button>
-              </div>
             </CardContent>
           </Card>
         )}
 
         {isExecuting && (
-          <Card className="border-amber/30 bg-amber-50/30 dark:bg-amber-950/10">
+          <Card className="border-warning/30 bg-warning/5 dark:bg-warning/10">
             <CardHeader>
               <CardTitle className="text-[13px] flex items-center gap-2">
-                <span className="text-muted-foreground">⚙️</span>
+                <span className="text-warning">⚙️</span>
                 Executing…
               </CardTitle>
             </CardHeader>
             <CardContent>
-              <p className="text-[13px] text-amber-700 dark:text-amber-300">
+              <p className="text-[13px] text-warning">
                 The action is being executed. Please wait for the result.
               </p>
             </CardContent>
@@ -241,15 +231,15 @@ export function ActionApproval({
         )}
 
         {action.status === "succeeded" && (
-          <Card className="border-green/30 bg-green-50/30 dark:bg-green-950/10">
+          <Card className="border-success/30 bg-success/5 dark:bg-success/10">
             <CardHeader>
               <CardTitle className="text-[13px] flex items-center gap-2">
-                <span className="text-green-600 dark:text-green-400">✅</span>
+                <span className="text-success">✅</span>
                 Succeeded
               </CardTitle>
             </CardHeader>
             <CardContent className="space-y-2">
-              <p className="text-[13px] text-green-700 dark:text-green-300 font-medium">Action completed successfully.</p>
+              <p className="text-[13px] text-success font-medium">Action completed successfully.</p>
               {receipt && (
                 <p className="text-[12px] text-muted-foreground">
                   Approval receipt: {receipt.id} via {receipt.channel} at {formatTimeInWarsaw(receipt.approved_at)}
@@ -268,7 +258,7 @@ export function ActionApproval({
         )}
 
         {action.status === "failed" && (
-          <Card className="border-danger/30 bg-danger-50/30 dark:bg-danger-950/10">
+          <Card className="border-danger/30 bg-danger/5 dark:bg-danger/10">
             <CardHeader>
               <CardTitle className="text-[13px] flex items-center gap-2">
                 <span className="text-danger">❌</span>
@@ -318,7 +308,7 @@ export function ActionApproval({
         )}
 
         {action.status === "rejected" && (
-          <Card className="border-danger/30 bg-danger-50/30 dark:bg-danger-950/10">
+          <Card className="border-danger/30 bg-danger/5 dark:bg-danger/10">
             <CardHeader>
               <CardTitle className="text-[13px] flex items-center gap-2">
                 <span className="text-danger">🚫</span>

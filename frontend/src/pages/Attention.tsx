@@ -3,16 +3,70 @@ import { Badge } from "../components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card";
 import { Separator } from "../components/ui/separator";
 import { getEvaClient } from "../api/client";
-import type { AttentionItem, AttentionExplanationResponse, Reason, SourceRef } from "../api/types.generated";
+import type { AttentionItem, Reason, SourceRef } from "../api/types.generated";
 import { useEvaQuery } from "../hooks/useEvaQuery";
 import { formatDeadline, formatTimeInWarsaw } from "../lib/format";
 
-type AttentionDetailProps = {
-  item: AttentionItem;
-  explanation: AttentionExplanationResponse;
-};
+function ReasonList({ reasons }: { reasons: Reason[] }) {
+  return (
+    <ul className="space-y-2 pl-4 list-disc">
+      {reasons.map((reason, idx) => (
+        <li key={`${reason.code}-${idx}`} className="text-[13px] leading-relaxed">
+          <span className="font-medium text-foreground">{reason.text}</span>
+          <span className="ml-2 text-[11.5px] text-muted-foreground">({reason.origin})</span>
+          {reason.source_ids && reason.source_ids.length > 0 && (
+            <span className="ml-2 text-[11.5px] text-muted-foreground">Sources: {reason.source_ids.join(", ")}</span>
+          )}
+        </li>
+      ))}
+    </ul>
+  );
+}
 
-function AttentionDetail({ item, explanation }: AttentionDetailProps) {
+function SourceList({ sources }: { sources: SourceRef[] }) {
+  return (
+    <ul className="space-y-1 pl-4 list-disc text-[12.5px] text-muted-foreground">
+      {sources.map((src) => (
+        <li key={src.id}>{src.title} ({src.kind.replace("_", " ")})</li>
+      ))}
+    </ul>
+  );
+}
+
+interface AttentionDetailContainerProps {
+  item: AttentionItem;
+  onClose: () => void;
+}
+
+function AttentionDetailContainer({ item, onClose }: AttentionDetailContainerProps) {
+  const client = getEvaClient();
+  const explanation = useEvaQuery(`attention-explanation:${item.id}`, (c) => c.getAttentionExplanation(item.id), client);
+
+  if (explanation.status === "loading") {
+    return (
+      <div className="mx-auto w-full max-w-3xl px-6 py-8" aria-busy="true" aria-live="polite" role="dialog" aria-labelledby="attention-detail-title" aria-modal="true">
+        <div className="h-4 w-64 animate-pulse rounded-full bg-muted" />
+        <p className="mt-6 text-[12.5px] text-muted-foreground">Loading explanation…</p>
+      </div>
+    );
+  }
+
+  if (explanation.status === "error" || !explanation.data) {
+    return (
+      <div className="mx-auto w-full max-w-3xl px-6 py-8 text-center" role="dialog" aria-labelledby="attention-detail-title" aria-modal="true">
+        <h2 className="text-[17px] font-semibold tracking-tight">Explanation unavailable</h2>
+        <button
+          type="button"
+          onClick={onClose}
+          className="mt-4 rounded-control border border-border-strong px-4 py-2 text-[13.5px] font-medium text-foreground transition-colors hover:bg-accent"
+        >
+          Back to queue
+        </button>
+      </div>
+    );
+  }
+
+  const exp = explanation.data;
   const priorityStyles: Record<AttentionItem["priority"], string> = {
     high: "bg-danger/10 text-danger border-danger/30",
     medium: "bg-primary/10 text-primary border-primary/30",
@@ -24,7 +78,7 @@ function AttentionDetail({ item, explanation }: AttentionDetailProps) {
       <button
         type="button"
         className="absolute right-6 top-6 rounded-full p-1 text-muted-foreground hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-        onClick={() => window.history.back()}
+        onClick={onClose}
         aria-label="Close detail"
       >
         ✕
@@ -73,31 +127,31 @@ function AttentionDetail({ item, explanation }: AttentionDetailProps) {
             </CardTitle>
           </CardHeader>
           <CardContent className="space-y-4">
-            {explanation.priority_reasons && explanation.priority_reasons.length > 0 && (
+            {exp.priority_reasons && exp.priority_reasons.length > 0 && (
               <section>
                 <h3 className="text-[12px] font-medium uppercase tracking-[0.08em] text-subtle-foreground mb-2">
                   Priority & Classification Reasons
                 </h3>
-                <ReasonList reasons={explanation.priority_reasons} />
+                <ReasonList reasons={exp.priority_reasons} />
               </section>
             )}
-            {explanation.delivery_reasons && explanation.delivery_reasons.length > 0 && (
+            {exp.delivery_reasons && exp.delivery_reasons.length > 0 && (
               <section>
                 <h3 className="text-[12px] font-medium uppercase tracking-[0.08em] text-subtle-foreground mb-2">
                   Delivery & Focus Reasons
                 </h3>
-                <ReasonList reasons={explanation.delivery_reasons} />
+                <ReasonList reasons={exp.delivery_reasons} />
               </section>
             )}
-            {!explanation.priority_reasons?.length && !explanation.delivery_reasons?.length && (
+            {!exp.priority_reasons?.length && !exp.delivery_reasons?.length && (
               <p className="text-[13px] text-muted-foreground">No stored reasons available for this item.</p>
             )}
-            {explanation.sources && explanation.sources.length > 0 && (
+            {exp.sources && exp.sources.length > 0 && (
               <section>
                 <h3 className="text-[12px] font-medium uppercase tracking-[0.08em] text-subtle-foreground mb-2">
                   Sources
                 </h3>
-                <SourceList sources={explanation.sources} />
+                <SourceList sources={exp.sources} />
               </section>
             )}
           </CardContent>
@@ -126,32 +180,6 @@ function AttentionDetail({ item, explanation }: AttentionDetailProps) {
         </p>
       </div>
     </div>
-  );
-}
-
-function ReasonList({ reasons }: { reasons: Reason[] }) {
-  return (
-    <ul className="space-y-2 pl-4 list-disc">
-      {reasons.map((reason, idx) => (
-        <li key={`${reason.code}-${idx}`} className="text-[13px] leading-relaxed">
-          <span className="font-medium text-foreground">{reason.text}</span>
-          <span className="ml-2 text-[11.5px] text-muted-foreground">({reason.origin})</span>
-          {reason.source_ids && reason.source_ids.length > 0 && (
-            <span className="ml-2 text-[11.5px] text-muted-foreground">Sources: {reason.source_ids.join(", ")}</span>
-          )}
-        </li>
-      ))}
-    </ul>
-  );
-}
-
-function SourceList({ sources }: { sources: SourceRef[] }) {
-  return (
-    <ul className="space-y-1 pl-4 list-disc text-[12.5px] text-muted-foreground">
-      {sources.map((src) => (
-        <li key={src.id}>{src.title} ({src.kind.replace("_", " ")})</li>
-      ))}
-    </ul>
   );
 }
 
@@ -220,10 +248,10 @@ function AttentionError({ onRetry }: { onRetry: () => void }) {
 function AttentionLoading() {
   return (
     <div className="mx-auto w-full max-w-3xl px-6 py-8" aria-busy="true" aria-live="polite">
-      <div className="h-4 w-48 animate-pulse rounded-full bg-muted" />
+      <div className="h-4 w-48 motion-safe:animate-pulse rounded-full bg-muted" />
       <div className="mt-6 space-y-3">
         {[...Array(5)].map((_, i) => (
-          <div key={i} className="h-14 animate-pulse rounded-card bg-muted" />
+          <div key={i} className="h-14 motion-safe:animate-pulse rounded-card bg-muted" />
         ))}
       </div>
       <p className="mt-6 text-[12.5px] text-muted-foreground">Loading attention queue…</p>
@@ -258,56 +286,6 @@ export default function Attention() {
 
   const items = attention.data.items;
 
-  if (selectedItem) {
-    const [explanation, setExplanation] = React.useState<AttentionExplanationResponse | null>(null);
-    const [expStatus, setExpStatus] = React.useState<"loading" | "ready" | "error">("loading");
-
-    React.useEffect(() => {
-      let cancelled = false;
-      setExpStatus("loading");
-      client
-        .getAttentionExplanation(selectedItem.id)
-        .then((data) => {
-          if (!cancelled) {
-            setExplanation(data);
-            setExpStatus("ready");
-          }
-        })
-        .catch(() => {
-          if (!cancelled) setExpStatus("error");
-        });
-      return () => {
-        cancelled = true;
-      };
-    }, [selectedItem.id, client]);
-
-    if (expStatus === "loading") {
-      return (
-        <div className="mx-auto w-full max-w-3xl px-6 py-8" aria-busy="true" aria-live="polite">
-          <div className="h-4 w-64 animate-pulse rounded-full bg-muted" />
-          <p className="mt-6 text-[12.5px] text-muted-foreground">Loading explanation…</p>
-        </div>
-      );
-    }
-
-    if (expStatus === "error" || !explanation) {
-      return (
-        <div className="mx-auto w-full max-w-3xl px-6 py-8 text-center">
-          <h2 className="text-[17px] font-semibold tracking-tight">Explanation unavailable</h2>
-          <button
-            type="button"
-            onClick={() => setSelectedItem(null)}
-            className="mt-4 rounded-control border border-border-strong px-4 py-2 text-[13.5px] font-medium text-foreground transition-colors hover:bg-accent"
-          >
-            Back to queue
-          </button>
-        </div>
-      );
-    }
-
-    return <AttentionDetail item={selectedItem} explanation={explanation} />;
-  }
-
   return (
     <div className="mx-auto w-full max-w-3xl px-6 py-8 lg:px-8 lg:py-10">
       <header className="mb-6">
@@ -322,6 +300,8 @@ export default function Attention() {
           <AttentionRow key={item.id} item={item} onClick={() => setSelectedItem(item)} />
         ))}
       </ul>
+
+      {selectedItem && <AttentionDetailContainer item={selectedItem} onClose={() => setSelectedItem(null)} />}
 
       <p className="mt-6 text-center text-[12px] text-subtle-foreground">
         Data from canonical fixture: attention_finance_decision.json

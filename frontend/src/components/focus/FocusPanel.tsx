@@ -2,17 +2,20 @@ import * as React from "react";
 import { Badge } from "../../components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "../../components/ui/card";
 import { getEvaClient } from "../../api/client";
-import type { FocusSession, FocusCompletionSummary, FocusStopResponse } from "../../api/types.generated";
+import type {
+  FocusSession,
+  FocusStopResponse,
+  AttentionPriority,
+  FocusStartRequest,
+} from "../../api/types.generated";
 import { useEvaQuery } from "../../hooks/useEvaQuery";
 import { formatTimeInWarsaw } from "../../lib/format";
-
-type FocusThreshold = "high" | "medium" | "low";
 
 interface FocusPanelProps {
   onSessionChange?: (session: FocusSession | null) => void;
 }
 
-function formatThreshold(threshold: FocusThreshold): { label: string; className: string } {
+function formatThreshold(threshold: AttentionPriority): { label: string; className: string } {
   switch (threshold) {
     case "high":
       return { label: "High only", className: "bg-danger/10 text-danger border-danger/30" };
@@ -23,9 +26,9 @@ function formatThreshold(threshold: FocusThreshold): { label: string; className:
   }
 }
 
-function FocusStartForm({ onStart }: { onStart: (duration: number, threshold: FocusThreshold, senderOverrides: string[]) => Promise<void> }) {
+function FocusStartForm({ onStart }: { onStart: (request: FocusStartRequest) => Promise<void> }) {
   const [duration, setDuration] = React.useState(60);
-  const [threshold, setThreshold] = React.useState<FocusThreshold>("medium");
+  const [threshold, setThreshold] = React.useState<AttentionPriority>("medium");
   const [senderOverrides, setSenderOverrides] = React.useState("");
   const [isLoading, setIsLoading] = React.useState(false);
 
@@ -37,7 +40,12 @@ function FocusStartForm({ onStart }: { onStart: (duration: number, threshold: Fo
         .split(",")
         .map((s) => s.trim())
         .filter(Boolean);
-      await onStart(duration, threshold, overrides);
+      const request: FocusStartRequest = {
+        duration_minutes: duration,
+        threshold,
+        sender_overrides: overrides.length > 0 ? overrides : undefined,
+      };
+      await onStart(request);
     } finally {
       setIsLoading(false);
     }
@@ -68,7 +76,7 @@ function FocusStartForm({ onStart }: { onStart: (duration: number, threshold: Fo
         <select
           id="focus-threshold"
           value={threshold}
-          onChange={(e) => setThreshold(e.target.value as FocusThreshold)}
+          onChange={(e) => setThreshold(e.target.value as AttentionPriority)}
           className="w-full rounded-control border border-border-strong bg-background px-3 py-2 text-[13.5px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
         >
           <option value="high">High only</option>
@@ -108,13 +116,11 @@ function FocusStartForm({ onStart }: { onStart: (duration: number, threshold: Fo
 function ActiveFocusDisplay({ session, onStop }: { session: FocusSession; onStop: () => Promise<FocusStopResponse> }) {
   const thresholdStyle = formatThreshold(session.threshold);
   const [isStopping, setIsStopping] = React.useState(false);
-  const [stopResult, setStopResult] = React.useState<FocusStopResponse | null>(null);
 
   const handleStop = async () => {
     setIsStopping(true);
     try {
-      const result = await onStop();
-      setStopResult(result);
+      await onStop();
     } finally {
       setIsStopping(false);
     }
@@ -122,47 +128,37 @@ function ActiveFocusDisplay({ session, onStop }: { session: FocusSession; onStop
 
   return (
     <div className="space-y-4">
-      {stopResult && (
-        <FocusCompletionSummaryDisplay summary={stopResult.summary} onClose={() => setStopResult(null)} />
-      )}
-
-      {!stopResult && (
-        <>
-          <div className="flex items-center gap-2">
-            <span className="inline-flex items-center size-2 rounded-full bg-green-500" aria-hidden />
-            <span className="text-[13.5px] font-medium">Focus active</span>
-            <Badge variant="outline" className={thresholdStyle.className}>
-              {thresholdStyle.label}
-            </Badge>
-          </div>
-          <div className="space-y-2 text-[13px] text-muted-foreground">
-            <p>Until {formatTimeInWarsaw(session.ends_at)}</p>
-            {session.sender_overrides && session.sender_overrides.length > 0 && (
-              <p>
-                Sender overrides: {session.sender_overrides.join(", ")}
-              </p>
-            )}
-          </div>
-          <button
-            type="button"
-            onClick={handleStop}
-            disabled={isStopping}
-            className="w-full rounded-control border border-danger text-danger px-4 py-2 text-[13.5px] font-medium transition-colors hover:bg-danger/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-danger disabled:opacity-50"
-          >
-            {isStopping ? "Stopping…" : "Stop Focus"}
-          </button>
-        </>
-      )}
+      <div className="flex items-center gap-2">
+        <span className="inline-flex items-center size-2 rounded-full bg-success" aria-hidden />
+        <span className="text-[13.5px] font-medium">Focus active</span>
+        <Badge variant="outline" className={thresholdStyle.className}>
+          {thresholdStyle.label}
+        </Badge>
+      </div>
+      <div className="space-y-2 text-[13px] text-muted-foreground">
+        <p>Until {formatTimeInWarsaw(session.ends_at)}</p>
+        {session.sender_overrides && session.sender_overrides.length > 0 && (
+          <p>Sender overrides: {session.sender_overrides.join(", ")}</p>
+        )}
+      </div>
+      <button
+        type="button"
+        onClick={handleStop}
+        disabled={isStopping}
+        className="w-full rounded-control border border-danger text-danger px-4 py-2 text-[13.5px] font-medium transition-colors hover:bg-danger/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-danger disabled:opacity-50"
+      >
+        {isStopping ? "Stopping…" : "Stop Focus"}
+      </button>
     </div>
   );
 }
 
-function FocusCompletionSummaryDisplay({ summary, onClose }: { summary: FocusCompletionSummary; onClose: () => void }) {
+function FocusCompletionSummaryDisplay({ summary, onClose }: { summary: FocusStopResponse["summary"]; onClose: () => void }) {
   return (
-    <Card className="border-green/30 bg-green-50/30 dark:bg-green-950/10">
+    <Card className="border-success/30 bg-success/5 dark:bg-success/10">
       <CardHeader className="flex items-center justify-between">
         <CardTitle className="text-[14px] flex items-center gap-2">
-          <span className="text-green-600 dark:text-green-400">✅</span>
+          <span className="text-success">✅</span>
           Focus Completed
         </CardTitle>
         <button
@@ -206,7 +202,7 @@ function Stat({ label, value }: { label: string; value: number }) {
   );
 }
 
-function FocusOff({ onStart }: { onStart: (duration: number, threshold: FocusThreshold, senderOverrides: string[]) => Promise<void> }) {
+function FocusOff({ onStart }: { onStart: (request: FocusStartRequest) => Promise<void> }) {
   return (
     <div className="space-y-4">
       <div className="flex items-center gap-2">
@@ -223,11 +219,13 @@ function FocusOff({ onStart }: { onStart: (duration: number, threshold: FocusThr
 
 export function FocusPanel({ onSessionChange }: FocusPanelProps) {
   const [reloadKey, setReloadKey] = React.useState(0);
+  const [stopResult, setStopResult] = React.useState<FocusStopResponse | null>(null);
   const client = getEvaClient();
   const focus = useEvaQuery(`focus:${reloadKey}`, (c) => c.getCurrentFocus(), client);
 
-  const handleStart = async (duration: number, threshold: FocusThreshold, senderOverrides: string[]) => {
-    const response = await client.startFocus(duration, threshold, senderOverrides);
+  const handleStart = async (request: FocusStartRequest) => {
+    const response = await client.startFocus(request);
+    setStopResult(null);
     setReloadKey((n) => n + 1);
     if (response.session && onSessionChange) {
       onSessionChange(response.session);
@@ -236,9 +234,10 @@ export function FocusPanel({ onSessionChange }: FocusPanelProps) {
 
   const handleStop = async () => {
     const response = await client.stopFocus();
+    setStopResult(response);
     setReloadKey((n) => n + 1);
     if (onSessionChange) {
-      onSessionChange(response.session ?? null);
+      onSessionChange(null);
     }
     return response;
   };
@@ -281,8 +280,8 @@ export function FocusPanel({ onSessionChange }: FocusPanelProps) {
           >
             Retry
           </button>
-        </CardContent      >
-    </Card>
+        </CardContent>
+      </Card>
     );
   }
 
@@ -297,6 +296,8 @@ export function FocusPanel({ onSessionChange }: FocusPanelProps) {
       <CardContent>
         {session ? (
           <ActiveFocusDisplay session={session} onStop={handleStop} />
+        ) : stopResult ? (
+          <FocusCompletionSummaryDisplay summary={stopResult.summary} onClose={() => setStopResult(null)} />
         ) : (
           <FocusOff onStart={handleStart} />
         )}
