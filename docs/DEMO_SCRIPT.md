@@ -115,7 +115,10 @@ Invoke-RestMethod -Method Post http://localhost:5173/api/demo/inject -Headers $h
 **Krok 7 — Knowledge (20 s).** Zakładka **Knowledge**: ludzie, konta, projekty
 i zasady pracy, na których Eva opiera klasyfikację — każda pozycja ma podane
 źródło, a licznik „w Attention” jest liczony na żywo z bieżącej klasyfikacji.
-Pokaż wyszukiwarkę (np. `ACME`) i filtr kategorii.
+Pokaż wyszukiwarkę (np. `ACME`) i filtr kategorii. W prawym górnym rogu stoi
+nieaktywny **Connect with Obsidian** — zapowiedź eksportu wiedzy do vaulta;
+świadomie nic za nim nie działa, więc pokaz nie obiecuje integracji, której nie
+ma.
 
 ## 5. Co powiedzieć o bezpieczeństwie (30 s)
 

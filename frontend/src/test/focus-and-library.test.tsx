@@ -295,4 +295,20 @@ describe("knowledge page", () => {
     expect(screen.queryByText("ACME", { selector: "h3" })).not.toBeInTheDocument();
     expect(screen.queryByText("Eva nie wysyła e-maili")).not.toBeInTheDocument();
   });
+
+  it("offers Connect with Obsidian as an inert, planned option", async () => {
+    const client = { getAttention: async () => ({ items: [] }) } as unknown as EvaClient;
+    const { default: KnowledgePage } = await importWithClient<typeof import("../pages/Knowledge")>(
+      "../pages/Knowledge",
+      client,
+    );
+    render(<KnowledgePage />);
+
+    const connect = await screen.findByRole("button", { name: "Connect with Obsidian" });
+    expect(connect).toBeDisabled();
+    expect(connect).toHaveAttribute("aria-disabled", "true");
+    // Inert means inert: clicking does nothing at all.
+    fireEvent.click(connect);
+    expect(screen.getByText("Wkrótce")).toBeInTheDocument();
+  });
 });

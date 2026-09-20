@@ -1,5 +1,5 @@
 import * as React from "react";
-import { Library, Search } from "lucide-react";
+import { Library, Link2, Search } from "lucide-react";
 import { Badge } from "../components/ui/badge";
 import { Card, CardContent } from "../components/ui/card";
 import { getEvaClient } from "../api/client";
@@ -107,14 +107,39 @@ export default function Knowledge() {
   return (
     <div className="mx-auto w-full max-w-5xl px-4 py-8 sm:px-6 lg:px-8">
       <header className="mb-6">
-        <div className="flex items-center gap-2.5">
-          <Library className="size-5 text-muted-foreground" strokeWidth={1.75} aria-hidden />
-          <h1 className="text-[22px] font-semibold tracking-[-0.02em]">Knowledge</h1>
+        <div className="flex flex-wrap items-start justify-between gap-4">
+          <div className="min-w-0">
+            <div className="flex items-center gap-2.5">
+              <Library className="size-5 text-muted-foreground" strokeWidth={1.75} aria-hidden />
+              <h1 className="text-[22px] font-semibold tracking-[-0.02em]">Knowledge</h1>
+            </div>
+            <p className="mt-1.5 max-w-2xl text-[13.5px] leading-relaxed text-muted-foreground">
+              Trwałe notatki, na których Eva opiera decyzje: ludzie, konta, projekty i zasady pracy.
+              Każda pozycja ma źródło — jeśli źródło znika, notatka nadaje się do sprostowania.
+            </p>
+          </div>
+
+          {/* Planned integration, kept visibly inert: no handler and no request
+              behind it, so the demo can never pretend the vault is connected. */}
+          <div className="shrink-0">
+            <button
+              type="button"
+              disabled
+              aria-disabled="true"
+              title="Połączenie z Obsidianem — opcja na potem. EVA nie łączy się teraz z żadnym vaultem."
+              className="inline-flex cursor-not-allowed items-center gap-2 rounded-control border border-border/70 px-3 py-2 text-[13px] font-medium text-subtle-foreground opacity-60"
+            >
+              <Link2 className="size-4" strokeWidth={1.75} aria-hidden />
+              Connect with Obsidian
+            </button>
+            <p className="mt-1.5 flex items-center justify-end gap-1.5 text-[11.5px] text-subtle-foreground">
+              <Badge variant="outline" className="text-[10px]">
+                Wkrótce
+              </Badge>
+              zapis wiedzy do Twojego vaulta
+            </p>
+          </div>
         </div>
-        <p className="mt-1.5 max-w-2xl text-[13.5px] leading-relaxed text-muted-foreground">
-          Trwałe notatki, na których Eva opiera decyzje: ludzie, konta, projekty i zasady pracy.
-          Każda pozycja ma źródło — jeśli źródło znika, notatka nadaje się do sprostowania.
-        </p>
       </header>
 
       <div className="mb-6 space-y-3">
