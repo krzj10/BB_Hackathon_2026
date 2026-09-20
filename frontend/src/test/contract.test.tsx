@@ -58,6 +58,7 @@ function stubEvaClient(): Pick<
   | "testLlmConnection"
   | "detectLlmModels"
   | "transcribeAudio"
+  | "askAssistant"
 > {
   return {
     getBriefing: async () => ({ briefing: { id: "stub" } as unknown as ExecutiveBriefing }),
@@ -76,6 +77,13 @@ function stubEvaClient(): Pick<
     testLlmConnection: async () => ({ health: { status: "unavailable" } }),
     detectLlmModels: async () => ({ models: [] }),
     transcribeAudio: async () => ({ request_id: "stub", transcript: {} as unknown as Transcript }),
+    askAssistant: async () => ({
+      request_id: "stub",
+      session_id: "stub",
+      reply_text: "",
+      language: "pl" as const,
+      tool_results: [],
+    }),
   };
 }
 

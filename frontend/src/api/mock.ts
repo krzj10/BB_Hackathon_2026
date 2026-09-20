@@ -1,4 +1,4 @@
-import { ApiError, type EvaClient, type TranscribeAudioRequest } from "./client";
+import { ApiError, type AssistantAskRequest, type EvaClient, type TranscribeAudioRequest } from "./client";
 import type {
   AttentionItem,
   AttentionListResponse,
@@ -34,6 +34,7 @@ import type {
   DetectModelsResponse,
   Transcript,
   TranscribeResponse,
+  AssistantMessageResponse,
 } from "./types.generated";
 import acmeFixture from "../../../contracts/fixtures/meeting_acme_high.json";
 import teamSyncFixture from "../../../contracts/fixtures/meeting_team_sync_medium.json";
@@ -690,6 +691,28 @@ export function createMockClient(options: MockClientOptions = {}): EvaClient {
       const response: TranscribeResponse = {
         request_id: request.requestId,
         transcript: { ...transcriptPl },
+      };
+      return Promise.resolve(response);
+    },
+
+    askAssistant: (request: AssistantAskRequest) => {
+      // Mock transport only: a fixed reply that echoes the request identity.
+      // Real reasoning lives behind POST /api/assistant/message (REST mode).
+      if (mode === "pending") {
+        return new Promise<AssistantMessageResponse>(() => {});
+      }
+      if (mode === "error") {
+        return Promise.reject(
+          new ApiError("POST", 503, "/api/assistant/message", "inference unavailable: no configured self-hosted route")
+        );
+      }
+      const response: AssistantMessageResponse = {
+        request_id: request.requestId,
+        session_id: request.sessionId,
+        reply_text:
+          "To odpowiedź transportu mock (bez inferencji). W demonstracyjnej skrzynce czekają dwie decyzje: faktura do zatwierdzenia oraz wybór dostawcy stacji roboczych.",
+        language: (request.language ?? "pl") as AssistantMessageResponse["language"],
+        tool_results: [],
       };
       return Promise.resolve(response);
     },

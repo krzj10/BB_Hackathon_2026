@@ -48,6 +48,7 @@ import type {
   LlmTestConnectionResponse,
   DetectModelsResponse,
   TranscribeResponse,
+  AssistantMessageResponse,
 } from "./types.generated";
 
 /**
@@ -89,6 +90,22 @@ export interface EvaClient {
   testLlmConnection(): Promise<LlmTestConnectionResponse>;
   detectLlmModels(): Promise<DetectModelsResponse>;
   transcribeAudio(request: TranscribeAudioRequest): Promise<TranscribeResponse>;
+  askAssistant(request: AssistantAskRequest): Promise<AssistantMessageResponse>;
+}
+
+/**
+ * Frontend-only transport input for POST /api/assistant/message (B03). The
+ * canonical response stays the generated AssistantMessageResponse; `language`
+ * is the reply language request and `activeContext` carries the screen the
+ * user is looking at, exactly as the contract defines it.
+ */
+export interface AssistantAskRequest {
+  text: string;
+  requestId: string;
+  sessionId: string;
+  language?: string;
+  activeContext?: Record<string, unknown> | null;
+  signal?: AbortSignal;
 }
 
 export class ApiError extends Error {
@@ -185,6 +202,23 @@ export function createRestClient(): EvaClient {
         headers: { "X-EVA-Session-ID": request.sessionId },
         ...(request.signal ? { signal: request.signal } : {}),
       }) as Promise<TranscribeResponse>;
+    },
+
+    askAssistant: (request: AssistantAskRequest) => {
+      // B03 assistant turn. The claimed body session MUST equal the trusted
+      // header (the backend rejects a mismatch with 403), so both carry the
+      // exact same per-tab id; no reasoning happens client-side.
+      return requestJson("POST", "/api/assistant/message", {
+        body: JSON.stringify({
+          request_id: request.requestId,
+          session_id: request.sessionId,
+          text: request.text,
+          language: request.language ?? "pl",
+          ...(request.activeContext ? { active_context: request.activeContext } : {}),
+        }),
+        headers: { "X-EVA-Session-ID": request.sessionId },
+        ...(request.signal ? { signal: request.signal } : {}),
+      }) as Promise<AssistantMessageResponse>;
     },
   };
 }
