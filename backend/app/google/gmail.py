@@ -26,7 +26,7 @@ import html as html_module
 import logging
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.utils import parseaddr, parsedate_to_datetime
 from typing import Any
 
@@ -48,6 +48,10 @@ MAX_BODY_CHARS = 20_000
 SEARCH_MAX_RESULTS = 25
 DEFAULT_SEARCH_LIMIT = 10
 MAX_SEARCH_PAGES = 5
+#: Hard budgets for the continuation-aware WINDOW search used by A06 polling
+#: (exhausts a bounded TIME window, never the mailbox; remediation PART 17-19).
+MAX_WINDOW_THREADS = 100
+MAX_WINDOW_PAGES = 8
 
 _SCRIPT_STYLE_RE = re.compile(r"<(script|style)\b.*?</\1>", re.IGNORECASE | re.DOTALL)
 _TAG_RE = re.compile(r"<[^>]+>")
@@ -154,6 +158,31 @@ def _parse_received(value: str | None, retrieved_at: datetime) -> tuple[datetime
     return retrieved_at, notes
 
 
+def parse_internal_date(raw: dict[str, Any]) -> tuple[datetime | None, str | None]:
+    """Parse Gmail ``Message.internalDate`` (epoch-milliseconds string) into an
+    aware UTC datetime: (parsed, None), or (None, sanitized note).
+
+    internalDate is the PROVIDER arrival time and owns ingestion-window
+    membership; the RFC Date header is sender-controlled and must never be a
+    fallback for it. Missing/non-numeric/negative/overflow values are flagged
+    honestly - never guessed from the host timezone. Notes carry ids only."""
+    message_id = raw.get("id") or "?"
+    value = raw.get("internalDate")
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None, f"message {message_id}: missing internalDate"
+    try:
+        millis = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None, f"message {message_id}: non-numeric internalDate"
+    if millis < 0:
+        return None, f"message {message_id}: negative internalDate"
+    try:
+        moment = datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(milliseconds=millis)
+    except (OverflowError, OSError, ValueError):
+        return None, f"message {message_id}: internalDate out of range"
+    return moment, None
+
+
 @dataclass
 class ThreadSummary:
     thread_id: str
@@ -168,6 +197,22 @@ class ThreadEvidence:
     messages: list[NormalizedSourceEvent]
     retrieval_status: RetrievalStatus
     notes: list[str] = field(default_factory=list)
+    #: INTERNAL ingestion metadata (not a canonical contract): Gmail
+    #: internalDate per message id, aware UTC. A message absent from this map
+    #: has no trustworthy provider timestamp and is NOT window-qualified.
+    internal_dates: dict[str, datetime] = field(default_factory=dict)
+    #: INTERNAL cursor-safety signal (not a canonical contract), distinct from
+    #: ``retrieval_status``:
+    #: - retrieval_status = EVIDENCE FIDELITY of the normalized read (HTML
+    #:   fallback, skipped attachment, bounded body, missing RFC Date...);
+    #: - ingestion_complete = whether A06 may safely advance its cursor past
+    #:   this thread, i.e. NO potential message was structurally lost: a
+    #:   missing/invalid provider internalDate (window membership unknown),
+    #:   a non-object entry, or a raw message that could not be normalized
+    #:   into a canonical NormalizedSourceEvent sets this False. Benign
+    #:   fidelity notes never do - permanent content limits must not trap
+    #:   the polling cursor forever.
+    ingestion_complete: bool = True
 
 
 class GmailService:
@@ -220,6 +265,66 @@ class GmailService:
             )
         return summaries, status, notes
 
+    def search_window(
+        self,
+        query: str,
+        *,
+        max_threads: int = MAX_WINDOW_THREADS,
+        max_pages: int = MAX_WINDOW_PAGES,
+    ) -> tuple[list[ThreadSummary], RetrievalStatus, list[str]]:
+        """INTERNAL (A06 polling): exhaust a bounded TIME window, not the
+        mailbox. Follows Gmail continuation tokens within the hard budget so a
+        busy poll window is fully consumed in one run instead of repeatedly
+        returning the same first page. COMPLETE means the token chain ended
+        inside the budget; PARTIAL means the budget was exhausted with data
+        potentially remaining (the caller must NOT advance its cursor).
+        Page tokens never leave this method. The public ``search``/
+        ``get_thread`` boundary is unchanged for all other consumers."""
+        summaries: list[ThreadSummary] = []
+        notes: list[str] = []
+        status = RetrievalStatus.COMPLETE
+        token: str | None = None
+        for _ in range(max(1, max_pages)):
+            params: dict[str, Any] = {
+                "q": query,
+                "maxResults": SEARCH_MAX_RESULTS,
+                "includeSpamTrash": "false",
+            }
+            if token:
+                params["pageToken"] = token
+            payload = self._http.get_json(f"{GMAIL_BASE}/users/me/threads", params)
+            for raw in payload.get("threads") or []:
+                summary = self._summarize(raw)
+                if summary is not None:
+                    summaries.append(summary)
+            token = payload.get("nextPageToken")
+            if len(summaries) > max_threads:
+                # A fetched page exceeded the hard budget: truncate and stay
+                # honestly PARTIAL - remaining matches are never skipped.
+                notes.append(
+                    f"window search truncated at the {max_threads}-thread "
+                    "budget while Gmail returned more results"
+                )
+                return summaries[:max_threads], RetrievalStatus.PARTIAL, notes
+            if token is not None and len(summaries) == max_threads:
+                # Budget reached AND continuation exists -> PARTIAL. But a
+                # chain that ENDS exactly at the budget (token None) is a
+                # proven-complete result set and stays COMPLETE.
+                notes.append(
+                    f"window search stopped at the {max_threads}-thread budget "
+                    "while nextPageToken existed"
+                )
+                return summaries, RetrievalStatus.PARTIAL, notes
+            if token is None:
+                break
+        if token is not None:
+            status = RetrievalStatus.PARTIAL
+            notes.append(
+                f"window search stopped at the {max_pages}-page budget while "
+                "nextPageToken existed"
+            )
+        return summaries, status, notes
+
     def _summarize(self, raw: dict[str, Any]) -> ThreadSummary | None:
         thread_id = raw.get("id")
         if not thread_id:
@@ -245,11 +350,29 @@ class GmailService:
             thread_id=thread_id, messages=[], retrieval_status=RetrievalStatus.COMPLETE
         )
         for raw in payload.get("messages") or []:
+            if not isinstance(raw, dict):
+                # A potential Gmail message was structurally lost.
+                evidence.notes.append("skipped non-object message entry")
+                evidence.ingestion_complete = False
+                continue
+            # Provider arrival time first: it owns ingestion-window
+            # membership. Missing/invalid values flag the thread PARTIAL and
+            # cursor-unsafe; they are NEVER backfilled from the
+            # sender-controlled Date header.
+            internal_at, internal_note = parse_internal_date(raw)
+            if internal_at is not None and raw.get("id"):
+                evidence.internal_dates[raw["id"]] = internal_at
+            elif internal_note is not None:
+                evidence.notes.append(internal_note)
+                evidence.ingestion_complete = False  # membership unknown
             try:
                 message = self._normalize_message(raw, retrieved_at, evidence.notes)
             except ValueError as exc:  # malformed message: honest partial result
                 evidence.notes.append(f"skipped malformed message: {exc}")
                 logger.warning("gmail: skipped malformed message in thread %s", thread_id)
+                # A raw message that cannot become a canonical event is a
+                # structural loss - the cursor must not pass it blindly.
+                evidence.ingestion_complete = False
                 continue
             if message is not None:
                 evidence.messages.append(message)

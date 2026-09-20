@@ -900,6 +900,23 @@ class AttentionRepository:
             ).fetchone()
         return domain.AttentionItem.model_validate_json(row["payload_json"]) if row else None
 
+    def list_received_between(
+        self, start: datetime, end: datetime
+    ) -> list[domain.AttentionItem]:
+        """Deduplicated stored Attention items with received_at in [start, end)
+        in stable order (received_at, then source_id). Supports B04 Focus
+        completion counts from REAL stored rows - no LLM-generated counts."""
+        if start.tzinfo is None or end.tzinfo is None:
+            raise ValueError("naive datetimes are rejected; contracts require aware values")
+        with self._db.connect() as conn:
+            rows = conn.execute(
+                "SELECT payload_json FROM attention_items"
+                " WHERE received_at >= ? AND received_at < ?"
+                " ORDER BY received_at ASC, source_id ASC",
+                (to_db(start), to_db(end)),
+            ).fetchall()
+        return [domain.AttentionItem.model_validate_json(row["payload_json"]) for row in rows]
+
 
 class DecisionRepository:
     """Canonical storage boundary for Decisions (B04 owns the inbox flow).
@@ -1023,6 +1040,15 @@ class CursorRepository:
                 (source, source_id, to_db(now)),
             )
             return cur.rowcount == 1
+
+    def is_seen(self, source: str, source_id: str) -> bool:
+        """Durable seen-ledger check (A06 dedup authority; read-only)."""
+        with self._db.connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM seen_sources WHERE source = ? AND source_id = ?",
+                (source, source_id),
+            ).fetchone()
+        return row is not None
 
 
 class OutboxRepository:
