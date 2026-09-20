@@ -48,6 +48,10 @@ MAX_BODY_CHARS = 20_000
 SEARCH_MAX_RESULTS = 25
 DEFAULT_SEARCH_LIMIT = 10
 MAX_SEARCH_PAGES = 5
+#: Hard budgets for the continuation-aware WINDOW search used by A06 polling
+#: (exhausts a bounded TIME window, never the mailbox; remediation PART 17-19).
+MAX_WINDOW_THREADS = 100
+MAX_WINDOW_PAGES = 8
 
 _SCRIPT_STYLE_RE = re.compile(r"<(script|style)\b.*?</\1>", re.IGNORECASE | re.DOTALL)
 _TAG_RE = re.compile(r"<[^>]+>")
@@ -217,6 +221,58 @@ class GmailService:
             notes.append(
                 "search stopped at the result/page bound while nextPageToken "
                 "existed; more matches exist"
+            )
+        return summaries, status, notes
+
+    def search_window(
+        self,
+        query: str,
+        *,
+        max_threads: int = MAX_WINDOW_THREADS,
+        max_pages: int = MAX_WINDOW_PAGES,
+    ) -> tuple[list[ThreadSummary], RetrievalStatus, list[str]]:
+        """INTERNAL (A06 polling): exhaust a bounded TIME window, not the
+        mailbox. Follows Gmail continuation tokens within the hard budget so a
+        busy poll window is fully consumed in one run instead of repeatedly
+        returning the same first page. COMPLETE means the token chain ended
+        inside the budget; PARTIAL means the budget was exhausted with data
+        potentially remaining (the caller must NOT advance its cursor).
+        Page tokens never leave this method. The public ``search``/
+        ``get_thread`` boundary is unchanged for all other consumers."""
+        summaries: list[ThreadSummary] = []
+        notes: list[str] = []
+        status = RetrievalStatus.COMPLETE
+        token: str | None = None
+        for _ in range(max(1, max_pages)):
+            params: dict[str, Any] = {
+                "q": query,
+                "maxResults": SEARCH_MAX_RESULTS,
+                "includeSpamTrash": "false",
+            }
+            if token:
+                params["pageToken"] = token
+            payload = self._http.get_json(f"{GMAIL_BASE}/users/me/threads", params)
+            for raw in payload.get("threads") or []:
+                summary = self._summarize(raw)
+                if summary is not None:
+                    summaries.append(summary)
+            token = payload.get("nextPageToken")
+            if len(summaries) >= max_threads:
+                # Hard thread budget reached; remaining matches (if any) stay
+                # unclaimed - honestly PARTIAL, never silently skipped.
+                status = RetrievalStatus.PARTIAL
+                notes.append(
+                    f"window search stopped at the {max_threads}-thread budget "
+                    "while more may remain"
+                )
+                return summaries[:max_threads], status, notes
+            if token is None:
+                break
+        if token is not None:
+            status = RetrievalStatus.PARTIAL
+            notes.append(
+                f"window search stopped at the {max_pages}-page budget while "
+                "nextPageToken existed"
             )
         return summaries, status, notes
 

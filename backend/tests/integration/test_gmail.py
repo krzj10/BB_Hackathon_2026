@@ -127,6 +127,46 @@ def test_search_sends_bounded_params() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Continuation-aware window search (A06 polling helper; internal surface)
+# ---------------------------------------------------------------------------
+
+
+def test_search_window_exhausts_continuation_chain() -> None:
+    pages = [
+        {"threads": [{"id": "t1"}], "nextPageToken": "p2"},
+        {"threads": [{"id": "t2"}], "nextPageToken": "p3"},
+        {"threads": [{"id": "t3"}]},
+    ]
+    service = GmailService(FakeHttp(pages))
+    summaries, status, _notes = service.search_window("q", max_threads=100, max_pages=5)
+    assert [s.thread_id for s in summaries] == ["t1", "t2", "t3"]
+    assert status is RetrievalStatus.COMPLETE  # token chain ended within budget
+
+
+def test_search_window_thread_budget_reports_partial() -> None:
+    page = {
+        "threads": [{"id": f"t{index}"} for index in range(4)],
+        "nextPageToken": "more",
+    }
+    service = GmailService(FakeHttp([page]))
+    summaries, status, notes = service.search_window("q", max_threads=2)
+    assert len(summaries) == 2
+    assert status is RetrievalStatus.PARTIAL   # budget hit: never claims complete
+    assert any("budget" in note for note in notes)
+
+
+def test_search_window_page_budget_reports_partial() -> None:
+    pages = [
+        {"threads": [{"id": f"t{index}"}], "nextPageToken": f"p{index + 1}"}
+        for index in range(5)
+    ]
+    service = GmailService(FakeHttp(pages))
+    summaries, status, _notes = service.search_window("q", max_threads=100, max_pages=2)
+    assert len(summaries) == 2
+    assert status is RetrievalStatus.PARTIAL
+
+
+# ---------------------------------------------------------------------------
 # Thread content: MIME handling
 # ---------------------------------------------------------------------------
 

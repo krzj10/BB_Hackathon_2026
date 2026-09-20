@@ -364,3 +364,137 @@ def test_llm_may_strengthen() -> None:
     # URGENT is a boolean, never an accepted type proposal:
     _, att_type = clamp_to_rule_floor(floor, AttentionPriority.MEDIUM, AttentionType.URGENT)
     assert att_type is AttentionType.DECISION_REQUIRED
+
+
+# =========================================================================== #
+# REMEDIATION - subject current/history classification (PART 2-5)
+# =========================================================================== #
+
+
+def test_reply_subject_with_financial_history_and_neutral_body_is_not_high() -> None:
+    rules = make_rules()
+    result = rules.evaluate(
+        event("Thanks, received.", subject="Re: Please approve 12,400 PLN")
+    )
+    assert result.money is None
+    assert result.priority_floor is AttentionPriority.LOW
+    assert all(r.code != CODE_FINANCIAL_HIGH for r in result.reasons)
+
+
+def test_reply_subject_new_current_amount_wins() -> None:
+    rules = make_rules()
+    result = rules.evaluate(
+        event("Please approve 15,000 PLN.", subject="Re: Previous estimate 12,400 PLN")
+    )
+    assert result.money is not None and result.money.amount_minor_units == 1_500_000
+    assert result.priority_floor is AttentionPriority.HIGH
+
+
+def test_reply_subject_current_intent_without_amount_is_not_financial_high() -> None:
+    rules = make_rules()
+    result = rules.evaluate(
+        event("Please approve this.", subject="Re: 12,400 PLN approval")
+    )
+    assert result.attention_type is AttentionType.DECISION_REQUIRED
+    assert result.priority_floor is AttentionPriority.MEDIUM
+    assert result.money is None
+
+
+def test_genuinely_new_financial_subject_is_current_evidence() -> None:
+    rules = make_rules()
+    result = rules.evaluate(event("See attached details.", subject="Please approve 12,400 PLN"))
+    assert result.priority_floor is AttentionPriority.HIGH
+    assert result.money is not None and result.money.amount_minor_units == 1_240_000
+
+
+@pytest.mark.parametrize(
+    "subject",
+    [
+        "Re: Re: Fwd: Please approve 12,400 PLN",     # repeated EN prefixes
+        "Fwd: RE: Zamówienie",
+        "Odp: Proszę zatwierdzić 12 400 PLN",          # Polish reply
+        "PD: Faktura do akceptacji",                   # Polish forward
+        "Przek: Pilne przelew",                        # Polish forward variant
+        "  re: fwd: odp: Please approve 12,400 PLN",   # mixed case + spacing
+    ],
+)
+def test_reply_forward_prefix_variants_are_history(subject: str) -> None:
+    rules = make_rules()
+    result = rules.evaluate(event("OK.", subject=subject))
+    assert result.money is None
+    assert result.priority_floor is AttentionPriority.LOW
+
+
+@pytest.mark.parametrize("subject", ["Please approve 12,400 PLN", "Fwd report? no prefix here"])
+def test_non_reply_subjects_stay_current(subject: str) -> None:
+    rules = make_rules()
+    if "approve" in subject:
+        result = rules.evaluate(event("Details attached.", subject=subject))
+        assert result.priority_floor is AttentionPriority.HIGH
+
+
+def test_sender_floor_independent_of_history_subject() -> None:
+    rules = make_rules()
+    result = rules.evaluate(
+        event("Quick note.", subject="Re: Re: old thread", sender="cfo@example.com")
+    )
+    assert result.priority_floor is AttentionPriority.MEDIUM   # sender rule intact
+    assert any(r.code == CODE_IMPORTANT_SENDER for r in result.reasons)
+
+
+# =========================================================================== #
+# REMEDIATION - inline HTML-normalized history separators (PART 6-9)
+# =========================================================================== #
+
+
+def test_inline_english_html_reply_quote_is_truncated() -> None:
+    rules = make_rules()
+    body = (
+        "Thanks, received. On Mon, Sep 21, 2026 at 10:00 AM Boss <b@example.com> "
+        "wrote: Please approve 12,400 PLN."
+    )
+    assert current_message_text(body) == "Thanks, received."
+    result = rules.evaluate(event(body, subject="Re: approval"))
+    assert result.money is None
+    assert result.priority_floor is AttentionPriority.LOW
+
+
+def test_inline_polish_html_reply_quote_is_truncated() -> None:
+    rules = make_rules()
+    body = (
+        "Dzięki. W dniu 21.09.2026 o 10:00 Jan napisał: "
+        "Proszę o akceptację 12 400 PLN."
+    )
+    assert current_message_text(body) == "Dzięki."
+    result = rules.evaluate(event(body, subject="Odp: faktura"))
+    assert result.money is None
+    assert result.priority_floor is AttentionPriority.LOW
+
+
+def test_current_amount_before_inline_quote_still_counts() -> None:
+    rules = make_rules()
+    body = (
+        "Please approve 15,000 PLN. On Mon, Sep 20, 2026 at 09:00 AM "
+        "boss@example.com wrote: Previous amount 12,400 PLN."
+    )
+    result = rules.evaluate(event(body, subject="Invoice follow-up"))
+    assert result.money is not None and result.money.amount_minor_units == 1_500_000
+    assert result.priority_floor is AttentionPriority.HIGH
+
+
+def test_inline_header_and_original_message_separators() -> None:
+    assert current_message_text(
+        "Agreed. From: boss@example.com Sent: Monday 12,400 PLN pending"
+    ) == "Agreed."
+    assert current_message_text(
+        "OK -----Original Message----- please approve 99,999 PLN"
+    ) == "OK"
+    assert current_message_text("Jasne. Wysłano: 21.09.2026 kwota 5 000 PLN") == "Jasne."
+
+
+def test_ordinary_sentences_are_not_truncated() -> None:
+    """No overmatching on bare words (PART 8)."""
+    plain = (
+        "The project went from idea to launch on Monday and we shipped ASAP."
+    )
+    assert current_message_text(plain) == plain

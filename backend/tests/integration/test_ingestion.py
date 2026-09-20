@@ -79,15 +79,11 @@ class FakeGmail:
     def add(self, thread_id: str, *events: NormalizedSourceEvent) -> None:
         self.entries.extend((thread_id, event) for event in events)
 
-    def search(self, query, limit=25, **kwargs):
-        self.queries.append(query)
-        if self.fail_search:
-            raise RuntimeError("simulated gmail transport failure")
+    def _matching_threads(self, query) -> dict[str, list[str]]:
         after_match = re.search(r"after:(\d+)", query)
         before_match = re.search(r"before:(\d+)", query)
         after = int(after_match.group(1)) if after_match else None
         before = int(before_match.group(1)) if before_match else None
-
         threads: dict[str, list[str]] = {}
         for thread_id, event in self.entries:
             stamp = event.received_at.timestamp()
@@ -96,11 +92,33 @@ class FakeGmail:
             if before is not None and stamp > before:
                 continue
             threads.setdefault(thread_id, []).append(event.source_id)
+        return threads
 
+    def search(self, query, limit=25, **kwargs):
+        self.queries.append(query)
+        if self.fail_search:
+            raise RuntimeError("simulated gmail transport failure")
+        threads = self._matching_threads(query)
         summaries = [
             ThreadSummary(thread_id=tid, message_ids=tuple(ids), subject=None, snippet=None)
             for tid, ids in list(threads.items())[: max(1, limit)]
         ]
+        status = RetrievalStatus.PARTIAL if self.partial_search else RetrievalStatus.COMPLETE
+        return summaries, status, []
+
+    def search_window(self, query, *, max_threads=100, max_pages=8):
+        """Continuation-aware double: exhausts the window; PARTIAL when the
+        hard thread budget would truncate results."""
+        self.queries.append(query)
+        if self.fail_search:
+            raise RuntimeError("simulated gmail transport failure")
+        threads = self._matching_threads(query)
+        summaries = [
+            ThreadSummary(thread_id=tid, message_ids=tuple(ids), subject=None, snippet=None)
+            for tid, ids in threads.items()
+        ]
+        if len(summaries) > max_threads:
+            return summaries[:max_threads], RetrievalStatus.PARTIAL, ["thread budget hit"]
         status = RetrievalStatus.PARTIAL if self.partial_search else RetrievalStatus.COMPLETE
         return summaries, status, []
 
@@ -553,3 +571,185 @@ def test_old_thread_decision_does_not_infect_new_thanks_message(env) -> None:
     assert item is not None
     assert item.priority.value == "low"                # no inherited HIGH decision
     assert item.attention_type.value == "fyi"
+
+
+# =========================================================================== #
+# REMEDIATION - bounded baseline window & liveness (PART 11-15)
+# =========================================================================== #
+
+
+def test_huge_history_cannot_trap_baseline_bounded_window_is_used(env) -> None:
+    for index in range(100):                           # historical mailbox > limit
+        env.fake.add(
+            f"old-{index}",
+            make_event(f"old-msg-{index}", received_at=T0 - timedelta(days=7)),
+        )
+    env.fake.add("r1", make_event("recent-1", received_at=T0 - timedelta(seconds=30)))
+    env.fake.add("r2", make_event("recent-2", received_at=T0 - timedelta(seconds=60)))
+
+    result = env.service.poll_recent()                 # FIRST baseline run
+
+    query = env.fake.queries[-1]
+    assert "after:" in query and "before:" in query    # bounded recent window
+    assert result.baseline_count == 2                  # only the recent window
+    assert result.retrieval_status == "complete"
+    assert result.new_items == () and env.sink.calls == []
+    assert env.cursors.is_seen("gmail", "recent-1") and env.cursors.is_seen("gmail", "recent-2")
+    assert not env.cursors.is_seen("gmail", "old-msg-0")   # history intentionally skipped
+    assert env.cursors.get(GMAIL_CURSOR_KEY) is not None   # baseline completes at once
+
+
+def test_baseline_recent_window_partial_leaves_cursor_unset(env) -> None:
+    service = GmailIngestionService(
+        gmail_source_factory=lambda: env.fake, cursors=env.cursors,
+        attention_repo=env.repo, sink=env.sink, overlap_seconds=120,
+        max_poll_threads=1,                            # hard budget below matches
+        clock=lambda: T0,
+    )
+    env.fake.add("r1", make_event("w1", received_at=T0 - timedelta(seconds=30)))
+    env.fake.add("r2", make_event("w2", received_at=T0 - timedelta(seconds=40)))
+    result = service.poll_recent()
+    assert result.retrieval_status == "partial"        # budget hit, not claimed done
+    assert env.cursors.get(GMAIL_CURSOR_KEY) is None   # cursor stays unset
+    assert result.new_items == () and env.sink.calls == []
+
+    full = GmailIngestionService(                       # later complete baseline lands
+        gmail_source_factory=lambda: env.fake, cursors=env.cursors,
+        attention_repo=env.repo, sink=env.sink, overlap_seconds=120, clock=lambda: T0,
+    )
+    second = full.poll_recent()
+    assert second.retrieval_status == "complete"
+    assert env.cursors.get(GMAIL_CURSOR_KEY) is not None
+
+
+# =========================================================================== #
+# REMEDIATION - steady-state continuation & hard budget (PART 16-21)
+# =========================================================================== #
+
+
+def test_steady_state_multi_page_window_consumed_in_one_run(env) -> None:
+    from app.google.gmail import GmailService
+
+    env.cursors.set(GMAIL_CURSOR_KEY, (T0 - timedelta(hours=1)).isoformat(), now=T0)
+    http = ScriptedHttp([
+        {"threads": [{"id": "t1"}, {"id": "t2"}], "nextPageToken": "p2"},  # page 1
+        {"threads": [{"id": "t3"}]},                                        # page 2 (end)
+        {"messages": [raw_message("pm-1", "First", "Mon, 21 Sep 2026 09:55:00 +0000")]},
+        {"messages": [raw_message("pm-2", "Second", "Mon, 21 Sep 2026 09:56:00 +0000")]},
+        {"messages": [raw_message("pm-3", "Third", "Mon, 21 Sep 2026 09:57:00 +0000")]},
+    ])
+    service = GmailIngestionService(
+        gmail_source_factory=lambda: GmailService(http), cursors=env.cursors,
+        attention_repo=env.repo, sink=RecordingSink(env.rules), clock=lambda: T0,
+    )
+    result = service.poll_recent()
+    # The whole continuation chain inside the window was consumed in ONE run.
+    assert [item.source_id for item in result.new_items] == ["pm-1", "pm-2", "pm-3"]
+    assert result.retrieval_status == "complete"
+    assert env.cursors.get(GMAIL_CURSOR_KEY) is not None   # cursor advanced after batch
+
+
+def test_hard_budget_exhaustion_partial_cursor_unchanged(env) -> None:
+    env.fake.add("t1", make_event("base-1"))
+    env.service.poll_recent()                          # baseline, cursor C1
+    cursor_before = env.cursors.get(GMAIL_CURSOR_KEY)
+
+    later = T0 + timedelta(seconds=600)
+    for index in range(3):
+        env.fake.add(
+            f"n{index}",
+            make_event(f"flood-{index}", received_at=later - timedelta(seconds=index)),
+        )
+    starved = GmailIngestionService(
+        gmail_source_factory=lambda: env.fake, cursors=env.cursors,
+        attention_repo=env.repo, sink=RecordingSink(env.rules), overlap_seconds=120,
+        max_poll_threads=2, clock=lambda: later,
+    )
+    result = starved.poll_recent()
+    assert result.retrieval_status == "partial"        # budget hit: never claims done
+    assert env.cursors.get(GMAIL_CURSOR_KEY) == cursor_before  # cursor unchanged
+    seen_now = [s for s in ("flood-0", "flood-1", "flood-2") if env.cursors.is_seen("gmail", s)]
+    assert len(seen_now) < 3                           # window tail left unprocessed
+    processed = {item.source_id for item in result.new_items}
+    assert all(env.cursors.is_seen("gmail", sid) for sid in processed)  # dedup kept
+
+    healthy = GmailIngestionService(                   # next run safely finishes
+        gmail_source_factory=lambda: env.fake, cursors=env.cursors,
+        attention_repo=env.repo, sink=RecordingSink(env.rules), overlap_seconds=120,
+        clock=lambda: later + timedelta(seconds=30),
+    )
+    retry = healthy.poll_recent()
+    assert len(retry.new_items) == 3 - len(seen_now)   # exactly the remaining ones
+    assert env.cursors.get(GMAIL_CURSOR_KEY) != cursor_before
+
+
+# =========================================================================== #
+# REMEDIATION - cursor timezone validation & UTC normalization (PART 23-24)
+# =========================================================================== #
+
+
+def test_naive_stored_cursor_fails_without_any_gmail_work(env) -> None:
+    env.cursors.set(GMAIL_CURSOR_KEY, "2026-09-21T10:00:00", now=T0)  # naive value
+    result = env.service.poll_recent()
+    assert result.retrieval_status == "failed"
+    assert any("timezone-aware" in note for note in result.notes)
+    assert env.fake.queries == []                      # NO Gmail work guessed from TZ
+
+
+def test_non_utc_aware_clock_persists_canonical_utc_cursor(env) -> None:
+    from zoneinfo import ZoneInfo
+
+    warsaw = datetime(2026, 9, 21, 12, 0, tzinfo=ZoneInfo("Europe/Warsaw"))
+    service = GmailIngestionService(
+        gmail_source_factory=lambda: env.fake, cursors=env.cursors,
+        attention_repo=env.repo, sink=env.sink, overlap_seconds=120,
+        clock=lambda: warsaw,
+    )
+    result = service.poll_recent()                     # baseline via Warsaw clock
+    assert result.retrieval_status == "complete"
+    stored = env.cursors.get(GMAIL_CURSOR_KEY)
+    assert stored is not None and stored.endswith("+00:00")   # canonical UTC form
+
+
+# =========================================================================== #
+# REMEDIATION - real A02 HTML fallback end-to-end (PART 10)
+# =========================================================================== #
+
+
+def test_html_normalized_reply_with_quoted_old_amount_no_false_high(env) -> None:
+    from app.google.gmail import GmailService
+
+    env.cursors.set(GMAIL_CURSOR_KEY, (T0 - timedelta(hours=1)).isoformat(), now=T0)
+    html_body = (
+        "<div>Thanks, received.</div><div><br></div>"
+        "<div>On Mon, Sep 21, 2026 at 10:00 AM Boss &lt;b@example.com&gt; wrote:</div>"
+        "<blockquote><div>Please approve 12,400 PLN for the vendor</div></blockquote>"
+    )
+    raw = {
+        "id": "htm-1",
+        "payload": {
+            "mimeType": "text/html",
+            "headers": [
+                {"name": "From", "value": "vendor@example.com"},
+                {"name": "Subject", "value": "Re: Please approve 12,400 PLN"},
+                {"name": "Date", "value": "Mon, 21 Sep 2026 09:58:00 +0000"},
+            ],
+            "body": {"data": b64(html_body)},
+        },
+    }
+    http = ScriptedHttp([{"threads": [{"id": "t1"}]}, {"messages": [raw]}])
+    sink = RecordingSink(env.rules)
+    service = GmailIngestionService(
+        gmail_source_factory=lambda: GmailService(http), cursors=env.cursors,
+        attention_repo=env.repo, sink=sink, clock=lambda: T0,
+    )
+    result = service.poll_recent()
+    assert [item.source_id for item in result.new_items] == ["htm-1"]
+
+    item = env.repo.get("item-htm-1")
+    assert item is not None
+    # A02 collapses the HTML to one line; A06 inline-marker stripping must
+    # still isolate "Thanks, received." -> no false financial HIGH.
+    assert item.priority.value == "low"
+    assert all(r.code != "attention.financial_decision_high" for r in item.reasons)
+    assert item.title == "Re: Please approve 12,400 PLN"   # subject kept verbatim

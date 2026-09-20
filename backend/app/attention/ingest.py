@@ -39,7 +39,13 @@ from typing import Callable, Literal, Protocol, Sequence
 
 from ..contracts.domain import AttentionItem, NormalizedSourceEvent, RetrievalStatus
 from ..db.repositories import AttentionRepository, CursorRepository
-from ..google.gmail import DEFAULT_SEARCH_LIMIT, ThreadEvidence, ThreadSummary
+from ..google.gmail import (
+    DEFAULT_SEARCH_LIMIT,
+    MAX_WINDOW_PAGES,
+    MAX_WINDOW_THREADS,
+    ThreadEvidence,
+    ThreadSummary,
+)
 
 logger = logging.getLogger("eva.attention.ingest")
 
@@ -50,10 +56,17 @@ DEFAULT_OVERLAP_SECONDS = 120
 
 
 class ThreadSource(Protocol):
-    """The A02 read-only Gmail surface this service consumes (frozen)."""
+    """The A02 read-only Gmail surface this service consumes (frozen public
+    boundary). ``search_window`` is the internal continuation-aware helper
+    (A06 remediation); when a source does not provide it, the bounded public
+    ``search`` is used instead."""
 
     def search(
         self, query: str, limit: int = ..., **kwargs: object
+    ) -> tuple[Sequence[ThreadSummary], RetrievalStatus, list[str]]: ...
+
+    def search_window(
+        self, query: str, *, max_threads: int = ..., max_pages: int = ...
     ) -> tuple[Sequence[ThreadSummary], RetrievalStatus, list[str]]: ...
 
     def get_thread(self, thread_id: str) -> ThreadEvidence: ...
@@ -98,6 +111,8 @@ class GmailIngestionService:
         query: str = "in:inbox",
         search_limit: int = DEFAULT_SEARCH_LIMIT,
         overlap_seconds: int = DEFAULT_OVERLAP_SECONDS,
+        max_poll_threads: int = MAX_WINDOW_THREADS,
+        max_poll_pages: int = MAX_WINDOW_PAGES,
         clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     ) -> None:
         if overlap_seconds < 0:
@@ -109,9 +124,29 @@ class GmailIngestionService:
         self._query = query
         self._search_limit = max(1, search_limit)
         self._overlap_seconds = overlap_seconds
+        # Hard per-run budgets for exhausting ONE bounded time window -
+        # never whole-mailbox ingestion (remediation PART 17-19).
+        self._max_poll_threads = max(1, max_poll_threads)
+        self._max_poll_pages = max(1, max_poll_pages)
         self._clock = clock
         # Scheduling protection ONLY - durable dedup remains SQLite.
         self._run_lock = threading.Lock()
+
+    # ------------------------------------------------------------------ #
+    def _search_window(
+        self, gmail: ThreadSource, query: str
+    ) -> tuple[Sequence[ThreadSummary], RetrievalStatus, list[str]]:
+        """Continuation-aware window search when available; bounded fallback
+        otherwise. Page tokens never escape this call."""
+        window_search = getattr(gmail, "search_window", None)
+        if callable(window_search):
+            return window_search(
+                query, max_threads=self._max_poll_threads, max_pages=self._max_poll_pages
+            )
+        return gmail.search(query, limit=self._search_limit)
+
+    def _window_query(self, start: datetime, end: datetime) -> str:
+        return f"{self._query} after:{int(start.timestamp())} before:{int(end.timestamp())}"
 
     # ------------------------------------------------------------------ #
     def check_now(self) -> IngestionRunResult:
@@ -132,9 +167,11 @@ class GmailIngestionService:
 
     # ------------------------------------------------------------------ #
     def _run(self) -> IngestionRunResult:
-        poll_started_at = self._clock()
-        if poll_started_at.tzinfo is None or poll_started_at.tzinfo.utcoffset(poll_started_at) is None:
+        raw_now = self._clock()
+        if raw_now.tzinfo is None or raw_now.tzinfo.utcoffset(raw_now) is None:
             raise ValueError("ingestion clock must return timezone-aware datetimes")
+        # ONE canonical UTC representation for queries and persisted cursors.
+        poll_started_at = raw_now.astimezone(timezone.utc)
 
         # Short DB READ (transaction closed before any network work, PART XXXIV).
         cursor_raw = self._cursors.get(GMAIL_CURSOR_KEY)
@@ -142,19 +179,33 @@ class GmailIngestionService:
             return self._baseline(poll_started_at)
         try:
             high_water = datetime.fromisoformat(cursor_raw)
-        except ValueError:
+            # A naive stored value must NEVER silently become host-local time.
+            if high_water.tzinfo is None or high_water.tzinfo.utcoffset(high_water) is None:
+                raise ValueError("stored cursor is not timezone-aware")
+        except (ValueError, TypeError):
             logger.error("gmail cursor is unreadable; refusing to guess a window")
             return IngestionRunResult(
-                retrieval_status="failed", notes=("stored cursor is unreadable",)
+                retrieval_status="failed",
+                notes=("stored cursor is unreadable or not timezone-aware",),
             )
-        return self._poll_window(high_water, poll_started_at)
+        return self._poll_window(high_water.astimezone(timezone.utc), poll_started_at)
 
     # -- first run ------------------------------------------------------ #
     def _baseline(self, poll_started_at: datetime) -> IngestionRunResult:
-        """Mark discovered ids seen WITHOUT emitting them as new (PART XXX)."""
+        """Establish 'everything before now is historical' from a BOUNDED
+        recent window (remediation PART 11-13).
+
+        The baseline deliberately does NOT enumerate the historical mailbox:
+        it queries [poll_started_at - overlap, poll_started_at], marks the
+        discovered message ids seen, emits zero Attention items and sets the
+        cursor only when that bounded retrieval completed. Older mail stays
+        un-fetched on purpose - subsequent windows start from the cursor."""
+        window_start = poll_started_at - timedelta(seconds=self._overlap_seconds)
         try:
             gmail = self._gmail_source_factory()
-            summaries, status, _notes = gmail.search(self._query, limit=self._search_limit)
+            summaries, status, _notes = self._search_window(
+                gmail, self._window_query(window_start, poll_started_at)
+            )
             discovered: list[str] = []
             for summary in summaries:
                 evidence = gmail.get_thread(summary.thread_id)
@@ -193,13 +244,12 @@ class GmailIngestionService:
 
     # -- steady-state poll ---------------------------------------------- #
     def _poll_window(self, high_water: datetime, poll_started_at: datetime) -> IngestionRunResult:
-        start_epoch = int((high_water - timedelta(seconds=self._overlap_seconds)).timestamp())
-        end_epoch = int(poll_started_at.timestamp())
-        windowed_query = f"{self._query} after:{start_epoch} before:{end_epoch}"
-
+        window_start = high_water - timedelta(seconds=self._overlap_seconds)
         try:
             gmail = self._gmail_source_factory()
-            summaries, status, _notes = gmail.search(windowed_query, limit=self._search_limit)
+            summaries, status, _notes = self._search_window(
+                gmail, self._window_query(window_start, poll_started_at)
+            )
             events: list[NormalizedSourceEvent] = []
             for summary in summaries:
                 evidence = gmail.get_thread(summary.thread_id)

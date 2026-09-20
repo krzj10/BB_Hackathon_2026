@@ -122,14 +122,31 @@ _QUOTE_LINE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"^\s*wys\u0142ano:\s", re.IGNORECASE),
 )
 
+# Inline history separators produced by A02's whitespace-collapsing HTML
+# fallback (PART 6/7 of the remediation): structured markers only - each
+# pattern requires a preceding separator, header syntax and/or the distinctive
+# "wrote:" tail, so ordinary sentences containing "on"/"from" survive.
+_INLINE_HISTORY_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\s+on\b.{1,140}?\bwrote:", re.IGNORECASE),                # " On ... wrote:"
+    re.compile(r"\s*-{3,}\s*original message\s*-{3,}", re.IGNORECASE),     # inline -----Original Message-----
+    re.compile(r"\s+w dniu\b.{1,140}?napisa\u0142(a)?:?", re.IGNORECASE),  # " W dniu ... napisał:"
+    re.compile(r"\s+from:\s+\S+@\S+", re.IGNORECASE),                      # " From: addr@host"
+    re.compile(r"\s+od:\s+\S+@\S+", re.IGNORECASE),                        # " Od: addr@host"
+    re.compile(r"\s+sent:\s+\d", re.IGNORECASE),                           # " Sent: 21..." (date-shaped)
+    re.compile(r"\s+wys\u0142ano:\s+\d", re.IGNORECASE),                   # " Wysłano: 21..."
+)
+
 
 def current_message_text(body: str | None) -> str:
-    """Everything before the first recognized quote/history marker line.
+    """The CURRENT message portion: everything before the first recognized
+    quote/history marker - line-based first, then conservative INLINE markers
+    (normalized HTML replies collapse history onto one line).
 
-    Conservative by design (hackathon scope): truncation at the FIRST marker;
-    a message that merely contains "From: " mid-body loses tail content, which
-    can only REDUCE claimed evidence, never invent it. The invariant kept is
-    'quoted/history amount != current amount'."""
+    Conservative by design: truncation at the FIRST reliable marker. A false
+    negative may discard current evidence (safe direction); old quoted
+    evidence must NEVER be promoted to current financial evidence. Ordinary
+    sentences containing bare words like "on" or "from" are untouched -
+    every inline pattern needs header/colon structure."""
     if not body:
         return ""
     lines: list[str] = []
@@ -137,7 +154,38 @@ def current_message_text(body: str | None) -> str:
         if any(pattern.match(line) for pattern in _QUOTE_LINE_PATTERNS):
             break
         lines.append(line)
-    return "\n".join(lines).strip()
+    text = "\n".join(lines)
+
+    cut = len(text)
+    for pattern in _INLINE_HISTORY_PATTERNS:
+        match = pattern.search(text)
+        if match is not None:
+            cut = min(cut, match.start())
+    return text[:cut].strip()
+
+
+# --------------------------------------------------------------------------- #
+# Subject current/history classification (remediation PART 2-5)
+# --------------------------------------------------------------------------- #
+
+_REPLY_FORWARD_PREFIX_RE = re.compile(
+    r"^\s*((re|fw|fwd|odp|pd|przek)\s*:\s*)+", re.IGNORECASE
+)
+
+
+def is_thread_history_subject(subject: str | None) -> bool:
+    """True when the subject carries reply/forward prefix(es): its content is
+    thread HISTORY, not a current request (e.g. 'Re: Re: Fwd: Please approve')."""
+    return bool(subject) and _REPLY_FORWARD_PREFIX_RE.match(subject) is not None
+
+
+def current_subject_text(subject: str | None) -> str:
+    """Subject text usable as CURRENT evidence: '' for reply/forward subjects,
+    the original otherwise. Purely classification-side - the stored subject
+    and the AttentionItem title are never mutated."""
+    if is_thread_history_subject(subject):
+        return ""
+    return subject or ""
 
 
 # --------------------------------------------------------------------------- #
@@ -296,9 +344,16 @@ class AttentionRules:
 
     # ------------------------------------------------------------------ #
     def evaluate(self, event: NormalizedSourceEvent) -> AttentionRuleResult:
-        """Classify ONE message from its CURRENT text only (PART XXXVI)."""
-        current = current_message_text(event.body)
-        haystack = f"{event.subject or ''}\n{current}".lower()
+        """Classify ONE message from its CURRENT evidence only (PART XXXVI).
+
+        Current evidence = current body text (quotes stripped) + the subject
+        ONLY when it is not a reply/forward thread-history subject. Sender
+        identity is independent of subject filtering; newsletter markers may
+        additionally use the original subject (not authorization-sensitive)."""
+        current_body = current_message_text(event.body)
+        current_subject = current_subject_text(event.subject)
+        evidence_text = f"{current_subject}\n{current_body}"
+        haystack = evidence_text.lower()
         source_ids = [ref.id for ref in event.sources]
 
         reasons: list[Reason] = []
@@ -323,7 +378,7 @@ class AttentionRules:
 
         intent = any(phrase in haystack for phrase in DECISION_INTENT_PHRASES)
         action = any(phrase in haystack for phrase in ACTION_REQUEST_PHRASES)
-        amounts = find_pln_amounts(f"{event.subject or ''}\n{current}")
+        amounts = find_pln_amounts(evidence_text)
 
         if intent and amounts:
             # Current decision intent + current PLN amount: the money carried
@@ -351,7 +406,7 @@ class AttentionRules:
                     with_policy=True,
                 )
                 add(CODE_DECISION_REQUIRED, "current message requests a decision", conf=0.75)
-        elif intent and has_unsupported_currency_amount(current):
+        elif intent and has_unsupported_currency_amount(evidence_text):
             # Cautious classification for review; NO conversion, NO threshold.
             result_type = AttentionType.DECISION_REQUIRED
             if floor is AttentionPriority.LOW:
@@ -406,7 +461,10 @@ class AttentionRules:
                 conf=0.9,
             )
 
-        newsletter_hit = any(marker in haystack for marker in NEWSLETTER_MARKERS)
+        # Newsletter detection may ALSO see the original subject: a recurring
+        # newsletter subject is not an authorization-sensitive current request.
+        newsletter_haystack = f"{event.subject or ''}\n{current_body}".lower()
+        newsletter_hit = any(marker in newsletter_haystack for marker in NEWSLETTER_MARKERS)
         stronger = bool(reasons) and (
             result_type is not AttentionType.FYI
             or _PRIORITY_RANK[floor] > _PRIORITY_RANK[AttentionPriority.LOW]
