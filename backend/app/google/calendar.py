@@ -66,6 +66,21 @@ class CalendarReadError(RuntimeError):
     """Sanitized read failure (status codes and ids only)."""
 
 
+class PostWriteVerificationError(RuntimeError):
+    """A mutation request COMPLETED successfully but the follow-up GET
+    verification could not be performed (403, rate limit, transport...).
+
+    This is deliberately NOT a GoogleApiError: the same 403 means "definitive
+    rejection" BEFORE a write and "cannot verify an applied write" AFTER one.
+    Callers must treat it as UNKNOWN - never as a definitive failure, and
+    never as license to blindly re-send the mutation."""
+
+    def __init__(self, endpoint_kind: str, cause_category: str) -> None:
+        super().__init__("post-write verification read failed")
+        self.endpoint_kind = endpoint_kind
+        self.cause_category = cause_category  # sanitized category/class name
+
+
 def _untriaged_reason() -> Reason:
     return Reason(
         code=UNTRIAGED_REASON_CODE,
@@ -326,7 +341,23 @@ class CalendarService:
             raise GoogleApiError(
                 GoogleErrorCategory.MALFORMED_RESPONSE, endpoint_kind="events"
             )
-        return self.get_event(calendar_id=calendar_id, event_id=google_event_id)
+        return self._verify_after_write(calendar_id=calendar_id, event_id=google_event_id)
+
+    def _verify_after_write(self, *, calendar_id: str, event_id: str) -> Meeting:
+        """Post-write read-back. A failure here means the mutation MAY have
+        been applied but its state cannot be confirmed - reported as
+        PostWriteVerificationError (UNKNOWN territory), NEVER as a definitive
+        submission failure."""
+        try:
+            return self.get_event(calendar_id=calendar_id, event_id=event_id)
+        except PostWriteVerificationError:
+            raise
+        except Exception as exc:  # 403 / rate limit / transport / malformed
+            category = (
+                exc.category.value if isinstance(exc, GoogleApiError) else type(exc).__name__
+            )
+            logger.error("calendar post-write verification read failed (%s)", category)
+            raise PostWriteVerificationError("events", category) from exc
 
     def get_event_mutation_state(self, *, calendar_id: str, event_id: str) -> "CalendarMutationState":
         """INTERNAL A04 mutation-safety read (not a public contract surface).
@@ -359,7 +390,7 @@ class CalendarService:
             {"start": start, "end": end},
             {"If-Match": if_match},
         )
-        return self.get_event(calendar_id=calendar_id, event_id=args.ref.event_id)
+        return self._verify_after_write(calendar_id=calendar_id, event_id=args.ref.event_id)
 
     def update_agenda_event(
         self,
@@ -378,7 +409,7 @@ class CalendarService:
             {"description": new_description},
             {"If-Match": if_match},
         )
-        return self.get_event(calendar_id=calendar_id, event_id=event_id)
+        return self._verify_after_write(calendar_id=calendar_id, event_id=event_id)
 
 
 # --------------------------------------------------------------------------- #

@@ -67,6 +67,23 @@ _CALENDAR_TOOLS = frozenset(
     {"calendar.create_event", "calendar.reschedule_event", "calendar.update_agenda"}
 )
 
+#: Statuses at which a repeated, correctly-bound APPROVE is treated as an
+#: idempotent replay returning durable state instead of a fresh authorization
+#: attempt: the pre-execution APPROVED state plus every post-claim/terminal
+#: execution outcome. REJECTED and EXPIRED are deliberately excluded (a new
+#: proposal is genuinely required); a lost HTTP response after execution must
+#: not force re-approval, but a rejected/expired one must never be resurrected.
+_IDEMPOTENT_APPROVE_STATUSES = frozenset(
+    {
+        ProposedActionStatus.APPROVED,
+        ProposedActionStatus.EXECUTING,
+        ProposedActionStatus.SUCCEEDED,
+        ProposedActionStatus.FAILED,
+        ProposedActionStatus.UNKNOWN,
+        ProposedActionStatus.SUPERSEDED,
+    }
+)
+
 
 class ActionPolicyError(Exception):
     """Sanitized policy/confirmation failure with a stable machine code."""
@@ -551,18 +568,21 @@ class ActionApprovalEngine:
                 "policy_changed", "authoritative policy changed; a new proposal is required"
             )
 
-        if action.status == ProposedActionStatus.APPROVED:
-            # Already approved (concurrent winner or replay). Idempotency is
-            # narrow: only an APPROVE on a channel that is STILL allowed for
-            # this risk may observe it - a disallowed channel never gets to
-            # "successfully confirm" anything (a VOICE replay against a HIGH
-            # action stays channel_not_allowed). REJECT after approval fails.
-            # The durable receipt MUST exist and match; an APPROVED action
-            # without its exact receipt is a storage/authorization invariant
-            # violation and fails closed - never repaired here.
+        if action.status in _IDEMPOTENT_APPROVE_STATUSES:
+            # Already approved (concurrent winner or replay) OR already moved
+            # through execution (EXECUTING/SUCCEEDED/FAILED/UNKNOWN/SUPERSEDED):
+            # a repeated APPROVE bound to the SAME revision, digest and policy
+            # version is recovery from a lost response - it returns the durable
+            # authorization state and the executor replays the stored outcome.
+            # It NEVER executes again, never creates a second receipt and
+            # never changes a terminal outcome. Only an APPROVE on a channel
+            # that is STILL allowed may observe it (a VOICE replay against a
+            # HIGH action stays channel_not_allowed). REJECT after approval or
+            # execution always fails. The durable receipt MUST exist and match;
+            # its absence is a storage-invariant violation and fails closed.
             if request.choice == ApprovalChoice.REJECT:
                 raise ActionPolicyError(
-                    "invalid_status", "action is already approved; rejection no longer applies"
+                    "invalid_status", "action is already approved or executed; rejection no longer applies"
                 )
             self._require_allowed_channel(channel, action.risk)
             existing = self._repo.get_receipt(action.id, action.revision)

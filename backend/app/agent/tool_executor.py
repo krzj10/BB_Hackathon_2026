@@ -66,6 +66,7 @@ from app.google.calendar import (
     EVA_AGENDA_END,
     EVA_AGENDA_START,
     CalendarService,
+    PostWriteVerificationError,
     apply_agenda_update,
 )
 from app.google.http import GoogleApiError, GoogleErrorCategory
@@ -482,6 +483,18 @@ class ToolExecutor:
                 return self._perform_agenda(action, args, service, started)
         except _SupersedeRequested:
             raise  # control flow belongs to execute(), never an "unknown" outcome
+        except PostWriteVerificationError:
+            # FIX (Core review): the mutation request SUCCEEDED but its GET
+            # verification failed (403 / rate limit / transport). The same
+            # error category means different things BEFORE vs AFTER a write -
+            # this is never a definitive failure and never license to retry
+            # the mutation; the durable identifiers stay for reconciliation.
+            logger.error("calendar mutation applied but verification failed")
+            return self._unknown_result(
+                action.tool,
+                "mutation submitted successfully; verification read-back unavailable",
+                started, action.id,
+            )
         except GoogleApiError as exc:
             # A provider error escaping the sub-operations is classified by
             # category; bodies are never inspected or logged.

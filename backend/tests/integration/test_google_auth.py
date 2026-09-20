@@ -480,3 +480,93 @@ def test_route_integrations_reports_google_status_without_secrets(tmp_path) -> N
     assert '"google"' in body
     for secret in (ACCESS_TOKEN, REFRESH_TOKEN, CLIENT_SECRET):
         assert secret not in body
+
+
+# ---------------------------------------------------------------------------
+# CORE FIX 5 - serialized refresh + atomic credential persistence
+# ---------------------------------------------------------------------------
+
+
+def _connected_auth(tmp_path, refresher=None):
+    auth = make_auth(tmp_path, refresher=refresher)
+    state = auth.state_store.issue()
+    result = auth.handle_callback({"code": "synthetic-code", "state": state})
+    assert result.outcome is OAuthOutcome.CONNECTED
+    return auth
+
+
+def _credentials_file(tmp_path) -> Path:
+    return tmp_path / "google_credentials.json"
+
+
+def _force_expired(tmp_path) -> None:
+    path = _credentials_file(tmp_path)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["expiry"] = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+
+def test_concurrent_expired_requests_trigger_exactly_one_refresh(tmp_path) -> None:
+    import threading
+    import time as _time
+
+    refresh_calls: list[int] = []
+
+    def slow_refresher(credentials) -> None:
+        refresh_calls.append(1)
+        _time.sleep(0.25)                      # widen the race window without a lock
+        credentials.token = "rotated-access"
+        credentials.expiry = datetime.now(timezone.utc) + timedelta(hours=1)
+
+    auth = _connected_auth(tmp_path, refresher=slow_refresher)
+    _force_expired(tmp_path)
+
+    barrier = threading.Barrier(2)
+    sessions: list[object] = []
+
+    def call() -> None:
+        barrier.wait()                         # deterministic simultaneous start
+        sessions.append(auth.authorized_session())
+
+    threads = [threading.Thread(target=call) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    assert len(refresh_calls) == 1             # re-read under lock skipped the second
+    assert len(sessions) == 2                  # both callers got a usable session
+    tokens = {s.credentials.token for s in sessions}
+    assert tokens == {"rotated-access"}
+
+
+def test_interrupted_credential_write_never_truncates(tmp_path, monkeypatch) -> None:
+    import os as _os
+
+    import app.google.auth as auth_module
+
+    auth = _connected_auth(tmp_path)
+    original_text = _credentials_file(tmp_path).read_text(encoding="utf-8")
+
+    def boom(src, dst):  # simulate an interrupted atomic move
+        raise OSError("interrupted write")
+
+    monkeypatch.setattr(auth_module.os, "replace", boom)
+    with pytest.raises(GoogleAuthError):
+        auth._write_credentials({"access_token": "brand-new-payload"})
+
+    # The previously stored credentials survive byte-identical (never truncated)
+    assert _credentials_file(tmp_path).read_text(encoding="utf-8") == original_text
+    # ...and the temporary file is cleaned up, leaving no partial artifacts.
+    leftovers = [p.name for p in tmp_path.iterdir() if p.name.startswith(".credentials-")]
+    assert leftovers == []
+
+
+def test_credential_write_is_atomic_and_restricted(tmp_path) -> None:
+    auth = _connected_auth(tmp_path)
+    payload = json.loads(_credentials_file(tmp_path).read_text(encoding="utf-8"))
+    payload["access_token"] = "second-write"
+    auth._write_credentials(payload)
+    stored = json.loads(_credentials_file(tmp_path).read_text(encoding="utf-8"))
+    assert stored["access_token"] == "second-write"
+    assert [p.name for p in tmp_path.iterdir() if p.name.startswith(".credentials-")] == []

@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import secrets
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
@@ -163,6 +164,10 @@ class GoogleAuth:
         self._refresher = refresher or _default_refresher
         self._reauth_required = False
         self._last_refresh_error: str | None = None
+        # Serializes load->decide->refresh->persist within this process: two
+        # concurrent expired-token requests perform AT MOST one refresh (the
+        # second caller re-reads the freshly persisted state under the lock).
+        self._refresh_lock = threading.Lock()
         self._exchange = (
             token_exchanger
             if token_exchanger is not None
@@ -270,18 +275,39 @@ class GoogleAuth:
         return datetime.now(timezone.utc) + timedelta(seconds=float(raw))
 
     def _write_credentials(self, payload: dict) -> None:
+        """Atomic credential persistence: the COMPLETE JSON goes to a
+        temporary file in the same directory (0600 best-effort, flushed and
+        fsynced for the local demo durability boundary), then os.replace()
+        moves it onto the target atomically. An interrupted write can never
+        leave a truncated or half-written credential file. Token values are
+        never logged."""
         self._credentials_path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(
-            self._credentials_path,
-            os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
-            0o600,
-        )
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle)
+        tmp_path: Path | None = None
         try:
-            os.chmod(self._credentials_path, 0o600)
-        except OSError:  # best-effort on non-POSIX; path stays gitignored
-            pass
+            fd, tmp_name = tempfile.mkstemp(
+                dir=str(self._credentials_path.parent),
+                prefix=".credentials-",
+                suffix=".tmp",
+            )
+            tmp_path = Path(tmp_name)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle)
+                handle.flush()
+                os.fsync(handle.fileno())
+            try:
+                os.chmod(tmp_path, 0o600)
+            except OSError:  # best-effort on non-POSIX; path stays gitignored
+                pass
+            os.replace(tmp_path, self._credentials_path)
+            tmp_path = None
+        except OSError as exc:
+            raise GoogleAuthError("could not persist credentials") from exc
+        finally:
+            if tmp_path is not None:  # interrupted write: no litter, no truncation
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     def _store_credentials(self, info: dict, granted: tuple[str, ...]) -> None:
         if info.get("refresh_token") is None:
@@ -392,31 +418,36 @@ class GoogleAuth:
         through the persisted expiry before any request is made."""
         if not self.configured:
             raise GoogleAuthError("Google OAuth client id/secret are not configured")
-        data = self._load_credentials()
-        if data is None:
-            raise GoogleAuthError("google account not connected; start the OAuth flow")
-        credentials = self._build_credentials(data)
-        if not credentials.valid:
-            try:
-                self._refresher(credentials)
-            except RefreshError as exc:
-                # Token revoked or expired beyond refresh (e.g. Testing-mode
-                # 7-day expiry). Never surface the provider message verbatim.
-                self._reauth_required = True
-                self._last_refresh_error = "refresh rejected"
-                logger.warning("google refresh failed; reauthorization required")
-                raise GoogleAuthError(
-                    "stored credentials could not be refreshed; reauthorization required"
-                ) from exc
-            except OSError as exc:
-                raise GoogleAuthError("token endpoint unreachable during refresh") from exc
-            try:
-                self._persist_refreshed(credentials, previous_refresh_token=data["refresh_token"])
-            except GoogleAuthError:
-                # A usable session exists but cannot be durably re-stored; the
-                # next process start will simply refresh again. Not fatal for
-                # this request; recorded for honesty in logs only.
-                logger.warning("google refreshed credentials could not be persisted")
+        with self._refresh_lock:
+            # The persisted state is (re)read INSIDE the refresh lock: when a
+            # concurrent caller refreshed while we waited, its new expiry is
+            # visible here and no second refresh happens for the same expired
+            # token state.
+            data = self._load_credentials()
+            if data is None:
+                raise GoogleAuthError("google account not connected; start the OAuth flow")
+            credentials = self._build_credentials(data)
+            if not credentials.valid:
+                try:
+                    self._refresher(credentials)
+                except RefreshError as exc:
+                    # Token revoked or expired beyond refresh (e.g. Testing-mode
+                    # 7-day expiry). Never surface the provider message verbatim.
+                    self._reauth_required = True
+                    self._last_refresh_error = "refresh rejected"
+                    logger.warning("google refresh failed; reauthorization required")
+                    raise GoogleAuthError(
+                        "stored credentials could not be refreshed; reauthorization required"
+                    ) from exc
+                except OSError as exc:
+                    raise GoogleAuthError("token endpoint unreachable during refresh") from exc
+                try:
+                    self._persist_refreshed(credentials, previous_refresh_token=data["refresh_token"])
+                except GoogleAuthError:
+                    # A usable session exists but cannot be durably re-stored; the
+                    # next process start will simply refresh again. Not fatal for
+                    # this request; recorded for honesty in logs only.
+                    logger.warning("google refreshed credentials could not be persisted")
         self._reauth_required = False
         if self._session_factory is not None:
             return self._session_factory(credentials)
