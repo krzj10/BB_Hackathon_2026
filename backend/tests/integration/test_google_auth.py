@@ -570,3 +570,118 @@ def test_credential_write_is_atomic_and_restricted(tmp_path) -> None:
     stored = json.loads(_credentials_file(tmp_path).read_text(encoding="utf-8"))
     assert stored["access_token"] == "second-write"
     assert [p.name for p in tmp_path.iterdir() if p.name.startswith(".credentials-")] == []
+
+
+# ---------------------------------------------------------------------------
+# CORE MICRO-HARDENING - parent-directory durability + disconnect serialization
+# ---------------------------------------------------------------------------
+
+
+def test_parent_directory_is_synced_after_atomic_replace(tmp_path, monkeypatch) -> None:
+    import os as _os
+
+    import app.google.auth as auth_module
+
+    auth = _connected_auth(tmp_path)
+    real_open, real_fsync, real_close = _os.open, _os.fsync, _os.close
+    opened: list[tuple[str, int]] = []
+    synced: list[int] = []
+
+    def spy_open(path, flags, *args, **kwargs):
+        fd = real_open(path, flags, *args, **kwargs)
+        opened.append((str(path), fd))
+        return fd
+
+    def spy_fsync(fd):
+        synced.append(fd)
+        real_fsync(fd)
+
+    monkeypatch.setattr(auth_module.os, "open", spy_open)
+    monkeypatch.setattr(auth_module.os, "fsync", spy_fsync)
+
+    payload = json.loads(_credentials_file(tmp_path).read_text(encoding="utf-8"))
+    payload["access_token"] = "dir-synced-write"
+    auth._write_credentials(payload)
+
+    if getattr(_os, "O_DIRECTORY", None) is not None:      # POSIX-like harness
+        dir_opens = [fd for (path, fd) in opened if path == str(tmp_path)]
+        assert dir_opens and all(fd in synced for fd in dir_opens)
+    else:                                                   # Windows: silent no-op
+        assert json.loads(_credentials_file(tmp_path).read_text(encoding="utf-8"))[
+            "access_token"
+        ] == "dir-synced-write"
+
+
+def test_unsupported_or_failing_directory_fsync_never_breaks_the_write(
+    tmp_path, monkeypatch
+) -> None:
+    import os as _os
+
+    import app.google.auth as auth_module
+
+    auth = _connected_auth(tmp_path)
+    real_open, real_fsync = _os.open, _os.fsync
+    dir_fds: set[int] = set()
+
+    def spy_open(path, flags, *args, **kwargs):
+        fd = real_open(path, flags, *args, **kwargs)
+        if str(path) == str(tmp_path):        # the parent-directory open
+            dir_fds.add(fd)
+        return fd
+
+    def selective_fsync(fd):                  # ONLY directory sync "fails"
+        if fd in dir_fds:
+            raise OSError("directory fsync unsupported")
+        real_fsync(fd)                        # file fsync keeps working
+
+    monkeypatch.setattr(auth_module.os, "open", spy_open)
+    monkeypatch.setattr(auth_module.os, "fsync", selective_fsync)
+
+    payload = json.loads(_credentials_file(tmp_path).read_text(encoding="utf-8"))
+    payload["access_token"] = "still-persisted"
+    auth._write_credentials(payload)          # a refused DIR fsync is harmless
+
+    stored = json.loads(_credentials_file(tmp_path).read_text(encoding="utf-8"))
+    assert stored["access_token"] == "still-persisted"
+    assert [p.name for p in tmp_path.iterdir() if p.name.startswith(".credentials-")] == []
+
+
+def test_clear_credentials_serialized_against_inflight_refresh(tmp_path) -> None:
+    import threading
+    import time as _time
+
+    refresh_started = threading.Event()
+
+    def slow_refresher(credentials) -> None:
+        refresh_started.set()
+        _time.sleep(0.3)                    # hold the refresh lock mid-flight
+        credentials.token = "rotated-access"
+        credentials.expiry = datetime.now(timezone.utc) + timedelta(hours=1)
+
+    auth = _connected_auth(tmp_path, refresher=slow_refresher)
+    _force_expired(tmp_path)
+
+    worker = threading.Thread(target=lambda: auth.authorized_session())
+    worker.start()
+    assert refresh_started.wait(5)          # refresh in progress (lock held)
+    auth.clear_credentials()                # disconnect waits at the lock...
+    worker.join(timeout=30)
+
+    # ...so the LAST writer is clear_credentials: no resurrected credentials.
+    assert not _credentials_file(tmp_path).exists()
+    with pytest.raises(GoogleAuthError):
+        auth.authorized_session()
+
+
+def test_credential_persistence_logs_no_token_values(tmp_path, caplog) -> None:
+    def refresher(credentials) -> None:
+        credentials.token = "rotated-log-marker"
+        credentials.expiry = datetime.now(timezone.utc) + timedelta(hours=1)
+
+    auth = _connected_auth(tmp_path, refresher=refresher)
+    _force_expired(tmp_path)
+    with caplog.at_level("DEBUG"):
+        auth.authorized_session()
+    text = caplog.text
+    assert "rotated-log-marker" not in text
+    assert ACCESS_TOKEN not in text and REFRESH_TOKEN not in text

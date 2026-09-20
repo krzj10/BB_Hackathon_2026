@@ -144,6 +144,31 @@ def _default_refresher(credentials: Credentials) -> None:
     credentials.refresh(Request())
 
 
+def _fsync_parent_directory(path: Path) -> None:
+    """Best-effort durability for the RENAME itself.
+
+    After os.replace() has moved the fully-fsynced temp file onto the target,
+    syncing the PARENT DIRECTORY makes the new directory entry durable across
+    an abrupt crash on POSIX-like filesystems. This is strictly additional to
+    the file-level fsync and MUST NEVER fail the caller: platforms without
+    O_DIRECTORY (e.g. Windows) or that refuse the open/fsync simply return.
+    No path or credential value is ever surfaced here."""
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    try:
+        dir_fd = os.open(str(path.parent), directory_flags)
+    except (OSError, ValueError):  # unsupported platform / refused open
+        return
+    try:
+        os.fsync(dir_fd)
+    except OSError:  # directory fsync unsupported here - harmless
+        pass
+    finally:
+        try:
+            os.close(dir_fd)
+        except OSError:
+            pass
+
+
 class GoogleAuth:
     """Owns the OAuth flow and the credential file. The only component that
     ever sees raw tokens; everything it hands out is sanitized."""
@@ -308,6 +333,15 @@ class GoogleAuth:
                     tmp_path.unlink(missing_ok=True)
                 except OSError:
                     pass
+        # Post-rename durability (best-effort, never fatal): sync the parent
+        # directory so the rename itself survives an abrupt crash on platforms
+        # that support it, and re-assert restricted permissions on the final
+        # target where supported. Neither may expose paths or token values.
+        _fsync_parent_directory(self._credentials_path)
+        try:
+            os.chmod(self._credentials_path, 0o600)
+        except OSError:  # best-effort on non-POSIX; path stays gitignored
+            pass
 
     def _store_credentials(self, info: dict, granted: tuple[str, ...]) -> None:
         if info.get("refresh_token") is None:
@@ -362,13 +396,21 @@ class GoogleAuth:
         return data if isinstance(data, dict) and data.get("refresh_token") else None
 
     def clear_credentials(self) -> None:
-        """Disconnect primitive (no public route in the frozen API)."""
-        try:
-            self._credentials_path.unlink(missing_ok=True)
-        except OSError as exc:
-            raise GoogleAuthError("could not remove stored credentials") from exc
-        self._reauth_required = False
-        self._last_refresh_error = None
+        """Disconnect primitive (no public route in the frozen API).
+
+        Serialized with authorized_session() under the SAME refresh lock: a
+        concurrent in-flight refresh can no longer re-persist credentials AFTER
+        this disconnect (same-instance resurrection race). The final state is
+        deterministic - whoever takes the lock last decides. clear_credentials
+        itself performs no network work and acquires no other lock, so no
+        deadlock ordering exists."""
+        with self._refresh_lock:
+            try:
+                self._credentials_path.unlink(missing_ok=True)
+            except OSError as exc:
+                raise GoogleAuthError("could not remove stored credentials") from exc
+            self._reauth_required = False
+            self._last_refresh_error = None
 
     # -- authorized access ---------------------------------------------------------
 

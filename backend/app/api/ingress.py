@@ -6,13 +6,20 @@ request from consuming parser/temporary-file resources. This middleware caps
 the RAW REQUEST BODY before any multipart parsing happens:
 
 - Content-Length present and above the cap -> immediate 413, body never read;
-- absent/chunked -> bytes are counted as they arrive and the request is
-  terminated with 413 the moment the cap is exceeded.
+- absent/chunked/untrusted -> bytes are counted AS THEY STREAM through a
+  receive() wrapper and the request is terminated with 413 the moment the
+  cumulative count exceeds the cap.
+
+STREAMING (final hardening): valid requests are forwarded chunk-for-chunk -
+the ORIGINAL ASGI messages pass through untouched; this middleware never
+accumulates or copies the body into its own buffer. Counting is additive only.
 
 TWO deliberate boundaries stay in place: this ingress cap (audio file plus a
 SMALL fixed allowance for multipart framing, field parts and headers) and the
 exact 10 MiB AUDIO-file cap enforced inside the handler against decoded bytes.
-Responses are generic - request body content is never echoed or logged."""
+Content-Length is never the sole enforcement mechanism - malformed or negative
+headers fall back to stream counting. Responses are generic: request body
+content is never echoed or logged."""
 
 from __future__ import annotations
 
@@ -33,8 +40,34 @@ VOICE_TRANSCRIBE_PATH = "/api/voice/transcribe"
 _REJECT_BODY = b'{"detail":"request_body_too_large"}'
 
 
+class _RequestBodyTooLarge(BaseException):
+    """Internal control-flow signal raised by the counting receive wrapper.
+
+    Inherits BaseException deliberately: modern Starlette consumes the body
+    inside an anyio task group, which wraps ordinary Exceptions into
+    ExceptionGroups; a BaseException crosses structured-concurrency frames
+    unwrapped. The limiter still defensively unwraps groups and exception
+    chains around the downstream call."""
+
+
+def _is_body_too_large(exc: BaseException) -> bool:
+    if isinstance(exc, _RequestBodyTooLarge):
+        return True
+    for sub in getattr(exc, "exceptions", ()) or ():  # (Base)ExceptionGroup
+        if isinstance(sub, BaseException) and _is_body_too_large(sub):
+            return True
+    inner = exc.__cause__ if exc.__cause__ is not None else exc.__context__
+    hops = 0
+    while inner is not None and hops < 20:
+        if isinstance(inner, _RequestBodyTooLarge):
+            return True
+        inner = inner.__cause__ if inner.__cause__ is not None else inner.__context__
+        hops += 1
+    return False
+
+
 class VoiceIngressLimiter:
-    """Pure-ASGI middleware guarding POST /api/voice/transcribe."""
+    """Pure-ASGI STREAMING body cap guarding POST /api/voice/transcribe."""
 
     def __init__(
         self,
@@ -63,50 +96,49 @@ class VoiceIngressLimiter:
             await self._reject(send)
             return
 
-        buffered = bytearray()
-        disconnected = False
-        while True:
+        state = {"counted": 0, "over": False, "started": False}
+
+        async def counting_receive():
+            if state["over"]:  # already tripped: never resurrect the stream
+                raise _RequestBodyTooLarge()
             message = await receive()
-            if message["type"] == "http.disconnect":
-                disconnected = True
-                break
-            buffered.extend(message.get("body") or b"")
-            if len(buffered) > self.max_body_bytes:
-                # Counted over the cap mid-stream (chunked / lying headers):
-                # terminate now, before multipart parsing sees the body.
-                logger.warning("voice ingress rejected while streaming (count only)")
-                await self._reject(send)
+            if message.get("type") == "http.request":
+                state["counted"] += len(message.get("body") or b"")
+                if state["counted"] > self.max_body_bytes:
+                    # Counted over the cap mid-stream (chunked / lying
+                    # headers): abort now, before multipart parsing continues.
+                    state["over"] = True
+                    logger.warning("voice ingress rejected while streaming (count only)")
+                    raise _RequestBodyTooLarge()
+            return message  # forwarded UNCHANGED: no copy, no concatenation
+
+        async def lifecycle_send(message):
+            if message.get("type") == "http.response.start":
+                state["started"] = True
+            await send(message)
+
+        try:
+            await self.app(scope, counting_receive, lifecycle_send)
+        except BaseException as exc:
+            if not _is_body_too_large(exc):
+                raise
+            if state["started"]:
+                # A response is already in flight; ASGI forbids a second one.
+                # Fail closed: end the exchange without inventing a response,
+                # logging counts only.
+                logger.error("voice ingress over cap after response start (count only)")
                 return
-            if not message.get("more_body", False):
-                break
-
-        if disconnected:
-            return  # client vanished; nothing to answer and nothing parsed.
-
-        messages = [
-            {"type": "http.request", "body": bytes(buffered), "more_body": False},
-            {"type": "http.disconnect"},
-        ]
-        index = 0
-
-        async def replay():
-            nonlocal index
-            if index < len(messages):
-                message = messages[index]
-                index += 1
-                return message
-            return {"type": "http.disconnect"}
-
-        await self.app(scope, replay, send)
+            await self._reject(send)
 
     # ------------------------------------------------------------------ #
     def _declared_length(self, scope) -> int | None:
         for name, value in scope.get("headers") or []:
             if name == b"content-length":
                 try:
-                    return int(value)
+                    parsed = int(value)
                 except ValueError:
-                    return None  # unparseable: fall back to stream counting
+                    return None  # unparseable: stream counting decides
+                return parsed if parsed >= 0 else None  # negative: distrust
         return None
 
     async def _reject(self, send) -> None:

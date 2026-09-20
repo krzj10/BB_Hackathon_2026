@@ -917,7 +917,11 @@ def test_empty_primary_recognition_falls_back_once_to_nonempty(env) -> None:
 # CORE FIX 2 - ASGI ingress cap BEFORE multipart parsing
 # =========================================================================== #
 
-from app.api.ingress import MAX_MULTIPART_REQUEST_BYTES, MULTIPART_OVERHEAD_BYTES  # noqa: E402
+from app.api.ingress import (  # noqa: E402
+    MAX_MULTIPART_REQUEST_BYTES,
+    MULTIPART_OVERHEAD_BYTES,
+    VoiceIngressLimiter,
+)
 
 
 def make_silent_wav(frame_bytes: int) -> bytes:
@@ -984,6 +988,200 @@ def test_ingress_rejection_never_logs_body_bytes(env, caplog) -> None:
     assert response.status_code == 413
     assert "MARKER-AUDIO-BYTES" not in caplog.text
     assert "MARKER-AUDIO-BYTES" not in response.text
+
+
+# ---- streaming pass-through proof (raw ASGI; no HTTP client involved) ----- #
+
+
+class _RecordingDownstream:
+    """Minimal ASGI app that records every body chunk it is handed."""
+
+    def __init__(self, *, respond_after_first_chunk=False):
+        self.chunks: list[bytes] = []
+        self.message_types: list[str] = []
+        self.respond_after_first_chunk = respond_after_first_chunk
+        self.started = False
+
+    async def __call__(self, scope, receive, send):
+        while True:
+            message = await receive()
+            self.message_types.append(message["type"])
+            if message["type"] == "http.disconnect":
+                return
+            self.chunks.append(message.get("body") or b"")
+            if self.respond_after_first_chunk and not self.started:
+                self.started = True
+                await send({"type": "http.response.start", "status": 200, "headers": []})
+                await send({"type": "http.response.body", "body": b"", "more_body": True})
+            if not message.get("more_body", False):
+                if not self.started:
+                    await send({"type": "http.response.start", "status": 200, "headers": []})
+                    await send({"type": "http.response.body", "body": b"ok"})
+                return
+
+
+def _voice_scope(headers=None) -> dict:
+    return {
+        "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
+        "method": "POST", "path": "/api/voice/transcribe", "raw_path": b"/api/voice/transcribe",
+        "query_string": b"", "headers": headers or [], "client": ("test", 1), "server": ("test", 80),
+        "scheme": "http",
+    }
+
+
+def _req_chunks(parts):
+    msgs = []
+    for i, part in enumerate(parts):
+        msgs.append({"type": "http.request", "body": part,
+                     "more_body": i < len(parts) - 1})
+    return msgs
+
+
+def test_valid_streamed_request_forwards_each_chunk_unchanged() -> None:
+    # Three chunks totalling well under the cap must reach downstream as THREE
+    # separate http.request messages - proof the limiter does not concatenate.
+    parts = [b"A" * 1000, b"B" * 1000, b"C" * 500]
+
+    async def run():
+        spy = _RecordingDownstream()
+        mw = VoiceIngressLimiter(spy)
+        incoming = _req_chunks(parts)
+        sent = []
+
+        async def receive():
+            return incoming.pop(0) if incoming else {"type": "http.disconnect"}
+
+        async def send(m):
+            sent.append(m)
+
+        await mw(_voice_scope(), receive, send)
+        return spy, sent
+
+    spy, sent = asyncio.run(run())
+    assert spy.chunks == parts                    # each chunk forwarded verbatim
+    assert spy.message_types == ["http.request", "http.request", "http.request"]
+    assert sent[0]["status"] == 200
+
+
+def test_streaming_over_cap_aborts_with_single_413_no_double_start() -> None:
+    # Chunked stream with NO content-length crosses the cap mid-flight.
+    big = b"X" * (MAX_MULTIPART_REQUEST_BYTES + 1)
+
+    async def run():
+        spy = _RecordingDownstream()
+        mw = VoiceIngressLimiter(spy)
+        incoming = _req_chunks([big[: len(big) // 2], big[len(big) // 2:]])
+        sent: list[dict] = []
+
+        async def receive():
+            return incoming.pop(0) if incoming else {"type": "http.disconnect"}
+
+        async def send(m):
+            sent.append(m)
+
+        await mw(_voice_scope(), receive, send)   # downstream must NOT raise here
+        return spy, sent
+
+    spy, sent = asyncio.run(run())
+    starts = [m for m in sent if m["type"] == "http.response.start"]
+    assert len(starts) == 1 and starts[0]["status"] == 413   # exactly one response
+
+
+def test_disconnect_before_cap_passes_through_without_response() -> None:
+    async def run():
+        spy = _RecordingDownstream()
+        mw = VoiceIngressLimiter(spy)
+        incoming = [{"type": "http.request", "body": b"partial", "more_body": True},
+                    {"type": "http.disconnect"}]
+        sent: list[dict] = []
+
+        async def receive():
+            return incoming.pop(0) if incoming else {"type": "http.disconnect"}
+
+        async def send(m):
+            sent.append(m)
+
+        await mw(_voice_scope(), receive, send)
+        return spy, sent
+
+    spy, sent = asyncio.run(run())
+    assert [m for m in sent if m["type"] == "http.response.start"] == []  # nothing answered
+
+
+def test_non_voice_or_get_scopes_are_not_counted() -> None:
+    get_scope = _voice_scope()
+    get_scope["method"] = "GET"
+
+    async def run():
+        spy = _RecordingDownstream()
+        mw = VoiceIngressLimiter(spy)
+        big = b"Y" * (MAX_MULTIPART_REQUEST_BYTES + 10_000)   # would trip a POST cap
+        incoming = _req_chunks([big])
+        sent: list[dict] = []
+
+        async def receive():
+            return incoming.pop(0) if incoming else {"type": "http.disconnect"}
+
+        async def send(m):
+            sent.append(m)
+
+        await mw(get_scope, receive, send)         # GET is passed through untouched
+        return spy, sent
+
+    spy, sent = asyncio.run(run())                 # no 413 for a non-POST scope
+    assert spy.chunks == [b"Y" * (MAX_MULTIPART_REQUEST_BYTES + 10_000)]
+    starts = [m for m in sent if m["type"] == "http.response.start"]
+    assert all(m["status"] != 413 for m in starts)  # untouched: downstream's own answer
+
+
+def test_over_cap_after_downstream_started_sends_no_second_response() -> None:
+    # Downstream emits response.start on the first chunk, then keeps reading;
+    # a later chunk crosses the cap. The limiter must NOT invent a second
+    # http.response.start (ASGI forbids it) - it fails closed silently.
+    big = b"Q" * (MAX_MULTIPART_REQUEST_BYTES + 1)
+
+    async def run():
+        spy = _RecordingDownstream(respond_after_first_chunk=True)
+        mw = VoiceIngressLimiter(spy)
+        incoming = _req_chunks([b"head", big])
+        sent: list[dict] = []
+
+        async def receive():
+            return incoming.pop(0) if incoming else {"type": "http.disconnect"}
+
+        async def send(m):
+            sent.append(m)
+
+        await mw(_voice_scope(), receive, send)   # must not raise to the caller
+        return spy, sent
+
+    spy, sent = asyncio.run(run())
+    starts = [m for m in sent if m["type"] == "http.response.start"]
+    assert len(starts) == 1 and starts[0]["status"] == 200   # downstream's own start
+
+
+def test_malformed_or_negative_content_length_still_stream_counted() -> None:
+    for bad_len in (b"not-a-number", b"-5"):
+        scope = _voice_scope(headers=[(b"content-length", bad_len)])
+
+        async def run(scope=scope):
+            spy = _RecordingDownstream()
+            mw = VoiceIngressLimiter(spy)
+            incoming = _req_chunks([b"Z" * (MAX_MULTIPART_REQUEST_BYTES + 1)])
+            sent: list[dict] = []
+
+            async def receive():
+                return incoming.pop(0) if incoming else {"type": "http.disconnect"}
+
+            async def send(m):
+                sent.append(m)
+
+            await mw(scope, receive, send)
+            return spy, sent
+
+        spy, sent = asyncio.run(run())             # bad header must NOT bypass counting
+        starts = [m for m in sent if m["type"] == "http.response.start"]
+        assert len(starts) == 1 and starts[0]["status"] == 413
 
 
 # =========================================================================== #
