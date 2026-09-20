@@ -43,6 +43,12 @@ def _clock(request: Request):
 
 
 def _service(request: Request) -> CalendarService:
+    # Demo mode (EVA_DATA_PROVIDER=demo): the deterministic read-only synthetic
+    # calendar, duck-typed to this service's read surface. The attribute is
+    # absent in a normal deployment, so the real Google path below is unchanged.
+    demo_calendar = getattr(request.app.state, "demo_calendar_service", None)
+    if demo_calendar is not None:
+        return demo_calendar  # type: ignore[return-value]
     auth: GoogleAuth | None = getattr(request.app.state, "google_auth", None)
     if auth is None:
         raise HTTPException(status_code=503, detail="google auth is not initialized")

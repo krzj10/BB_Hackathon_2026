@@ -171,3 +171,66 @@ def test_unknown_injection_kind_is_rejected(tmp_path) -> None:
         env.client.post("/api/demo/inject", json={"kind": "chaos"}, headers=SESSION).status_code
         == 422
     )
+
+
+# --------------------------------------------------------------------------- #
+# Demo calendar: Today and the grounded briefing stop being empty without Google
+# --------------------------------------------------------------------------- #
+
+
+def test_demo_calendar_fills_today_with_a_real_conflict(tmp_path) -> None:
+    env = make_env(tmp_path)
+
+    today = env.client.get("/api/calendar/today", headers=SESSION)
+    assert today.status_code == 200, today.text
+    payload = today.json()
+    assert payload["retrieval_status"] == "complete"
+    ids = [meeting["ref"]["event_id"] for meeting in payload["meetings"]]
+    assert "demo-acme-review" in ids and "demo-investor-call" in ids
+
+    spans = {
+        meeting["ref"]["event_id"]: (meeting["span"]["start"], meeting["span"]["end"])
+        for meeting in payload["meetings"]
+    }
+    # The fixture pair must genuinely overlap: that is the conflict to show.
+    acme_start, acme_end = spans["demo-acme-review"]
+    investor_start, _investor_end = spans["demo-investor-call"]
+    assert investor_start < acme_end
+
+    deep_work = next(m for m in payload["meetings"] if m["ref"]["event_id"] == "demo-deep-work")
+    assert "Protected focus block" in (deep_work["description"] or "")
+
+
+def test_briefing_is_grounded_on_demo_email_and_calendar(tmp_path) -> None:
+    env = make_env(tmp_path)
+    env.client.post("/api/demo/reset", headers=SESSION)
+
+    response = env.client.post(
+        "/api/briefing/meeting",
+        json={
+            "meeting_ref": {"calendar_id": "primary", "event_id": "demo-acme-review"},
+            "language": "pl",
+        },
+    )
+    assert response.status_code == 200, response.text
+    briefing = response.json()["briefing"]
+    assert briefing["meeting"]["ref"]["event_id"] == "demo-acme-review"
+    # Evidence joins BOTH surfaces: the calendar event and the linked threads.
+    source_ids = [s["id"] for s in briefing["sources"]]
+    assert any(sid.startswith("gmail:") for sid in source_ids), source_ids
+    assert any(sid.startswith("demo-event:") for sid in source_ids), source_ids
+    # No inference route exists in tests: the deterministic fallback is used and
+    # says so honestly instead of pretending a model answered.
+    notes = " ".join(briefing.get("retrieval_notes") or []).lower()
+    assert "deterministic" in notes
+
+
+def test_demo_calendar_refuses_writes(tmp_path) -> None:
+    from app.google.calendar import CalendarReadError
+
+    env = make_env(tmp_path)
+    service = env.app.state.demo_calendar_service
+    with pytest.raises(CalendarReadError):
+        service.create_event(args=None, google_event_id="x")
+    with pytest.raises(CalendarReadError):
+        service.get_event(calendar_id="primary", event_id="no-such-event")

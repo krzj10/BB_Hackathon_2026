@@ -18,12 +18,17 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class DemoMessage:
-    """One synthetic message with a STABLE id (repeatable resets dedup on it)."""
+    """One synthetic message with a STABLE id (repeatable resets dedup on it).
+
+    ``linked_event_ids`` ties a thread to a demo calendar event, which is how
+    the grounded briefing (B03) associates stored evidence with a meeting.
+    """
 
     fixture_id: str
     sender_email: str
     subject: str
     body: str
+    linked_event_ids: tuple[str, ...] = ()
 
 
 # Newest first: reset stamps fixture i at (reset_time - 2*i) seconds, which
@@ -41,6 +46,7 @@ DECISION_MESSAGES: tuple[DemoMessage, ...] = (
             "Proszę zatwierdzić odpowiedź do 11:00, żeby trzymać termin wdrożenia.\n\n"
             "Anna Kowalska\nACME, Commercial"
         ),
+        linked_event_ids=("demo-acme-review",),
     ),
     DemoMessage(
         fixture_id="workstation-supplier",
@@ -95,6 +101,7 @@ CONTEXT_MESSAGES: tuple[DemoMessage, ...] = (
             "wdrożenia, model wsparcia.\n\nProszę sprawdzić punkty 2 i 3 przed "
             "spotkaniem.\n\nAnna"
         ),
+        linked_event_ids=("demo-acme-review",),
     ),
     DemoMessage(
         fixture_id="q4-roadmap",

@@ -28,6 +28,27 @@ _FIXTURE_SPACING_SECONDS = 2
 
 
 def _event(message: DemoMessage, source_id: str, stamp: datetime) -> NormalizedSourceEvent:
+    refs = [
+        SourceRef(
+            id=f"gmail:{source_id}",
+            kind=SourceKind.GMAIL_MESSAGE,
+            resource_id=source_id,
+            title=message.subject,
+            retrieved_at=stamp,
+        )
+    ]
+    # Evidence links to demo calendar events: this is what lets the grounded
+    # briefing (B03) pull the thread into the meeting context.
+    refs.extend(
+        SourceRef(
+            id=f"demo-event:{event_id}",
+            kind=SourceKind.CALENDAR_EVENT,
+            resource_id=event_id,
+            title=f"calendar event {event_id}",
+            retrieved_at=stamp,
+        )
+        for event_id in message.linked_event_ids
+    )
     return NormalizedSourceEvent(
         source=SourceSystem.GMAIL,
         source_id=source_id,
@@ -35,15 +56,7 @@ def _event(message: DemoMessage, source_id: str, stamp: datetime) -> NormalizedS
         subject=message.subject,
         body=message.body,
         received_at=stamp,
-        sources=[
-            SourceRef(
-                id=f"gmail:{source_id}",
-                kind=SourceKind.GMAIL_MESSAGE,
-                resource_id=source_id,
-                title=message.subject,
-                retrieved_at=stamp,
-            )
-        ],
+        sources=refs,
     )
 
 

@@ -109,6 +109,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         """Builds a CalendarService over the currently authorized session.
         Raises GoogleAuthError (sanitized) when disconnected; the guarded
         executor turns that into a no-mutation safe state."""
+        # Demo mode (EVA_DATA_PROVIDER=demo): deterministic read-only synthetic
+        # calendar behind the same shape. Set only in demo mode, so the real
+        # path below is byte-for-byte the behavior of a normal deployment.
+        demo_calendar = getattr(app.state, "demo_calendar_service", None)
+        if demo_calendar is not None:
+            return demo_calendar
         auth: GoogleAuth = app.state.google_auth
         session = auth.authorized_session()
         factory = getattr(app.state, "google_http_factory", None)
@@ -366,8 +372,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # check-now, never through an unattended poll.
     if demo_mode:
         from .api.demo import router as demo_router
+        from .demo.calendar import DemoCalendarService
         from .demo.service import DemoDataService
 
+        # Set before any request can arrive: calendar_service_factory and the
+        # calendar route both resolve through this attribute in demo mode.
+        app.state.demo_calendar_service = DemoCalendarService(
+            clock=utcnow, timezone_name=settings.eva_timezone
+        )
         app.state.demo_service = DemoDataService(
             db=db,
             source=demo_gmail_source,
