@@ -1,0 +1,18 @@
+# Dependencies
+node_modules/
+
+# Local env files (Vite: .env, .env.local, .env.development, ...)
+.env
+.env.*
+!.env.example
+
+# Local-only Vite overrides
+*.local
+
+# Test coverage
+coverage/
+
+# The root .gitignore carries a Python `lib/` rule that matches this
+# directory at any depth. Re-include our first-party frontend lib.
+!src/lib/
+!src/lib/**
