@@ -1,10 +1,11 @@
 import { Navigate, Route, Routes } from "react-router-dom";
-import { Calendar, Library } from "lucide-react";
+import { Calendar } from "lucide-react";
 import { AppShell } from "./components/layout/AppShell";
 import Today from "./pages/Today";
 import Briefings from "./pages/Briefings";
 import Attention from "./pages/Attention";
 import Decisions from "./pages/Decisions";
+import Knowledge from "./pages/Knowledge";
 import Settings from "./pages/Settings";
 import { SectionPlaceholder } from "./pages/SectionPlaceholder";
 
@@ -26,16 +27,7 @@ export default function App() {
             />
           }
         />
-        <Route
-          path="knowledge"
-          element={
-            <SectionPlaceholder
-              title="Knowledge"
-              description="Organizational context and past interactions."
-              icon={Library}
-            />
-          }
-        />
+        <Route path="knowledge" element={<Knowledge />} />
         <Route path="settings" element={<Settings />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Route>

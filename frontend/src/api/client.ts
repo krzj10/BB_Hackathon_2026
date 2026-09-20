@@ -164,6 +164,17 @@ function audioFileNameFor(mime: string): string {
   return "recording.audio";
 }
 
+/**
+ * Idempotency key for a single user-initiated local command. The backend keys
+ * its idempotent replay on (session, request id), so every distinct click gets
+ * a fresh id while one click keeps one id for its whole lifetime.
+ */
+function newCommandId(): string {
+  const webCrypto = typeof crypto !== "undefined" ? crypto : undefined;
+  if (webCrypto && typeof webCrypto.randomUUID === "function") return webCrypto.randomUUID();
+  return `req-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
 /** REST transport against the frozen A00 endpoints (docs/api-contracts.md §8). */
 export function createRestClient(): EvaClient {
   return {
@@ -173,12 +184,14 @@ export function createRestClient(): EvaClient {
     getCurrentFocus: () => requestJson("GET", "/api/focus/current", undefined) as Promise<FocusCurrentResponse>,
     getBriefing: (request) => requestJson("POST", "/api/briefing/meeting", { body: JSON.stringify(request) }) as Promise<BriefingResponse>,
     getAttentionExplanation: (attentionId) => requestJson("GET", `/api/attention/${encodeURIComponent(attentionId)}/explanation`, undefined) as Promise<AttentionExplanationResponse>,
-    startFocus: (request) => requestJson("POST", "/api/focus/start", { body: JSON.stringify(request) }) as Promise<FocusSessionResponse>,
-    stopFocus: (request) => requestJson("POST", "/api/focus/stop", { body: request ? JSON.stringify(request) : undefined }) as Promise<FocusStopResponse>,
+    startFocus: (request) => requestJson("POST", "/api/focus/start", { body: JSON.stringify(request), headers: { "X-EVA-Request-ID": newCommandId() } }) as Promise<FocusSessionResponse>,
+    stopFocus: (request) => requestJson("POST", "/api/focus/stop", { body: JSON.stringify(request ?? {}), headers: { "X-EVA-Request-ID": newCommandId() } }) as Promise<FocusStopResponse>,
     getFocusSummary: (sessionId) => requestJson("GET", `/api/focus/${encodeURIComponent(sessionId)}/summary`, undefined) as Promise<FocusSummaryResponse>,
     getDecision: (decisionId) => requestJson("GET", `/api/decisions/${encodeURIComponent(decisionId)}`, undefined) as Promise<DecisionResponse>,
     proposeDecisionOutcome: (decisionId, request) => requestJson("POST", `/api/decisions/${encodeURIComponent(decisionId)}/outcome-proposals`, { body: JSON.stringify(request) }) as Promise<ProposedActionResponse>,
-    deferDecision: (decisionId, request) => requestJson("POST", `/api/decisions/${encodeURIComponent(decisionId)}/defer`, { body: request ? JSON.stringify(request) : undefined }) as Promise<DecisionResponse>,
+    // Routes with an all-optional request model still require a JSON body, so
+    // an omitted argument is sent as "{}" rather than an empty request.
+    deferDecision: (decisionId, request) => requestJson("POST", `/api/decisions/${encodeURIComponent(decisionId)}/defer`, { body: JSON.stringify(request ?? {}) }) as Promise<DecisionResponse>,
     getAction: (actionId) => requestJson("GET", `/api/actions/${encodeURIComponent(actionId)}`, undefined) as Promise<ActionResponse>,
     getApprovalChallenge: (actionId) => requestJson("POST", `/api/actions/${encodeURIComponent(actionId)}/challenge`, undefined) as Promise<ApprovalChallengeResponse>,
     confirmAction: (actionId, request) => requestJson("POST", `/api/actions/${encodeURIComponent(actionId)}/confirm`, { body: JSON.stringify(request) }) as Promise<ActionConfirmResponse>,

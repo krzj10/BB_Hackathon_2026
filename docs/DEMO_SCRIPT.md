@@ -61,7 +61,7 @@ Invoke-RestMethod -Method Post http://localhost:5173/api/demo/reset -Headers @{"
 
 Reset jest deterministyczny i powtarzalny — można go klikać między próbami.
 
-## 4. Pokaz w 6 krokach (około 4 minut)
+## 4. Pokaz w 7 krokach (około 4,5 minuty)
 
 **Krok 1 — Attention (30 s).** Ekran główny: 30 spraw, na górze cztery
 `HIGH / decision_required`, na dole newsletterowy szum. Powiedz: *reguły są
@@ -89,13 +89,19 @@ zatwierdź. Status `resolved`, a w szczegółach akcji
 przelewu ani zobowiązania.
 
 **Krok 5 — Briefing spotkania (40 s).** Pokazuje kolizję w kalendarzu i fakty z
-poczty w jednym ujęciu:
+poczty w jednym ujęciu. W UI: zakładka **Briefings** — lista scenariuszy
+(*Monday Briefing*, *Briefing after PTO*) plus briefing dla każdego spotkania z
+dzisiejszego kalendarza; bloki nachodzące na siebie mają znacznik `Conflict`.
+Ten sam briefing można pokazać z konsoli:
 
 ```powershell
 Invoke-RestMethod -Method Post http://localhost:5173/api/briefing/meeting -ContentType "application/json" -Body '{"meeting_ref":{"calendar_id":"primary","event_id":"demo-acme-review"},"language":"pl"}' | Select-Object -ExpandProperty briefing | Format-List
 ```
 
-**Krok 6 — Focus i przerwanie (45 s).**
+**Krok 6 — Focus i przerwanie (45 s).** Focus włączamy z karty **Focus** na
+ekranie głównym: *Start Focus* odpala licznik (format `mm:ss`, pasek postępu),
+który odlicza do zera, a **Stop Focus** przerywa sesję i pokazuje podsumowanie
+(ile spraw odłożono, ile z nich to decyzje). Ten sam przebieg z konsoli:
 
 ```powershell
 $h=@{"X-EVA-Session-ID"="demo";"X-EVA-Request-ID"="f1"}
@@ -105,6 +111,11 @@ Invoke-RestMethod -Method Post http://localhost:5173/api/demo/inject -Headers $h
 # awaria Portalu Klienta -> PRZERYWA (HIGH + urgent, trafia do Decision Inbox)
 Invoke-RestMethod -Method Post http://localhost:5173/api/demo/inject -Headers $h -ContentType "application/json" -Body '{"kind":"urgent"}'
 ```
+
+**Krok 7 — Knowledge (20 s).** Zakładka **Knowledge**: ludzie, konta, projekty
+i zasady pracy, na których Eva opiera klasyfikację — każda pozycja ma podane
+źródło, a licznik „w Attention” jest liczony na żywo z bieżącej klasyfikacji.
+Pokaż wyszukiwarkę (np. `ACME`) i filtr kategorii.
 
 ## 5. Co powiedzieć o bezpieczeństwie (30 s)
 

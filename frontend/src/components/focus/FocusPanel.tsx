@@ -15,6 +15,57 @@ interface FocusPanelProps {
   onSessionChange?: (session: FocusSession | null) => void;
 }
 
+/** Remaining time as m:ss (or h:mm:ss past an hour). Pure, so it is unit-testable. */
+export function formatRemaining(remainingMs: number): string {
+  const total = Math.max(0, Math.floor(remainingMs / 1000));
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const seconds = total % 60;
+  const mm = String(minutes).padStart(2, "0");
+  const ss = String(seconds).padStart(2, "0");
+  return hours > 0 ? `${hours}:${mm}:${ss}` : `${mm}:${ss}`;
+}
+
+/** Elapsed share of the session window, clamped to 0–100. */
+export function sessionProgressPct(startsAt: string, endsAt: string, nowMs: number): number {
+  const start = Date.parse(startsAt);
+  const end = Date.parse(endsAt);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return 0;
+  return Math.min(100, Math.max(0, ((nowMs - start) / (end - start)) * 100));
+}
+
+/**
+ * Ticks once a second against the session's own end timestamp (never a locally
+ * accumulated counter, so a backgrounded tab or a re-render cannot drift).
+ * Fires `onEnd` exactly once per session when the remaining time reaches zero.
+ */
+function useCountdownTo(endsAt: string | undefined, onEnd?: () => void): number {
+  const [nowMs, setNowMs] = React.useState(() => Date.now());
+  const onEndRef = React.useRef(onEnd);
+  const firedRef = React.useRef(false);
+
+  React.useEffect(() => {
+    onEndRef.current = onEnd;
+  }, [onEnd]);
+
+  React.useEffect(() => {
+    if (!endsAt) return undefined;
+    firedRef.current = false;
+    const tick = () => {
+      setNowMs(Date.now());
+      if (!firedRef.current && Date.parse(endsAt) - Date.now() <= 0) {
+        firedRef.current = true;
+        onEndRef.current?.();
+      }
+    };
+    tick();
+    const timer = window.setInterval(tick, 1000);
+    return () => window.clearInterval(timer);
+  }, [endsAt]);
+
+  return endsAt ? Date.parse(endsAt) - nowMs : 0;
+}
+
 function formatThreshold(threshold: AttentionPriority): { label: string; className: string } {
   switch (threshold) {
     case "high":
@@ -113,9 +164,19 @@ function FocusStartForm({ onStart }: { onStart: (request: FocusStartRequest) => 
   );
 }
 
-function ActiveFocusDisplay({ session, onStop }: { session: FocusSession; onStop: () => Promise<void> }) {
+function ActiveFocusDisplay({
+  session,
+  onStop,
+  onNaturalEnd,
+}: {
+  session: FocusSession;
+  onStop: () => Promise<void>;
+  onNaturalEnd: (session: FocusSession) => void;
+}) {
   const thresholdStyle = formatThreshold(session.threshold);
   const [isStopping, setIsStopping] = React.useState(false);
+  const remainingMs = useCountdownTo(session.ends_at, () => onNaturalEnd(session));
+  const progress = sessionProgressPct(session.starts_at, session.ends_at, Date.now());
 
   const handleStop = async () => {
     setIsStopping(true);
@@ -135,12 +196,43 @@ function ActiveFocusDisplay({ session, onStop }: { session: FocusSession; onStop
           {thresholdStyle.label}
         </Badge>
       </div>
-      <div className="space-y-2 text-[13px] text-muted-foreground">
-        <p>Until {formatTimeInWarsaw(session.ends_at)}</p>
-        {session.sender_overrides && session.sender_overrides.length > 0 && (
-          <p>Sender overrides: {session.sender_overrides.join(", ")}</p>
-        )}
+
+      {/* Live countdown: the ticking digits are decorative for screen readers,
+          which get the stable "Until …" line below instead. */}
+      <div className="rounded-card border border-border/60 bg-muted/40 px-4 py-3">
+        <div className="flex items-baseline justify-between gap-3">
+          <p className="text-[11px] font-medium uppercase tracking-[0.06em] text-subtle-foreground">
+            Time remaining
+          </p>
+          <p
+            role="timer"
+            aria-live="off"
+            className="font-mono text-[28px] font-semibold leading-none tabular-nums"
+          >
+            {formatRemaining(remainingMs)}
+          </p>
+        </div>
+        <div
+          role="progressbar"
+          aria-label="Focus session progress"
+          aria-valuemin={0}
+          aria-valuemax={100}
+          aria-valuenow={Math.round(progress)}
+          className="mt-3 h-1.5 w-full overflow-hidden rounded-full bg-border/60"
+        >
+          <div
+            className="h-full rounded-full bg-primary transition-[width] duration-1000 ease-linear"
+            style={{ width: `${progress}%` }}
+          />
+        </div>
+        <p className="mt-2 text-[12px] text-muted-foreground">
+          Until {formatTimeInWarsaw(session.ends_at)} · started {formatTimeInWarsaw(session.starts_at)}
+        </p>
       </div>
+
+      {session.sender_overrides && session.sender_overrides.length > 0 && (
+        <p className="text-[13px] text-muted-foreground">Sender overrides: {session.sender_overrides.join(", ")}</p>
+      )}
       <button
         type="button"
         onClick={handleStop}
@@ -259,6 +351,27 @@ export function FocusPanel({ onSessionChange }: FocusPanelProps) {
     }
   };
 
+  /**
+   * The countdown reached zero: ask the backend for the summary of the session
+   * that just ended and show it, exactly as an explicit Stop would.
+   */
+  const handleNaturalEnd = React.useCallback(
+    async (ended: FocusSession) => {
+      try {
+        const { summary } = await client.getFocusSummary(ended.id);
+        setStopResult({ session: ended, summary });
+      } catch {
+        // No summary available is not an error state: the panel falls back to
+        // the normal "Focus off" view after the refetch below.
+        setStopResult(null);
+      } finally {
+        setReloadKey((n) => n + 1);
+        if (onSessionChange) onSessionChange(null);
+      }
+    },
+    [client, onSessionChange],
+  );
+
   const session = focus.status === "ready" ? focus.data?.session ?? null : null;
 
   if (focus.status === "loading") {
@@ -317,7 +430,7 @@ export function FocusPanel({ onSessionChange }: FocusPanelProps) {
           </p>
         )}
         {session ? (
-          <ActiveFocusDisplay session={session} onStop={handleStop} />
+          <ActiveFocusDisplay session={session} onStop={handleStop} onNaturalEnd={handleNaturalEnd} />
         ) : stopResult ? (
           <FocusCompletionSummaryDisplay summary={stopResult.summary} onClose={() => setStopResult(null)} />
         ) : (
