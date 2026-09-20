@@ -113,6 +113,11 @@ class Settings(BaseSettings):
     eva_env: str = "development"
     eva_timezone: str = "Europe/Warsaw"
     eva_db_url: str = "sqlite:///./eva.db"
+    #: External data source. ``google`` (default) is the real read-only Gmail
+    #: boundary; ``demo`` swaps ONLY that boundary for deterministic synthetic
+    #: fixtures - the Attention, Decision, Focus and approval pipelines stay
+    #: exactly the same in both modes.
+    eva_data_provider: str = "google"
 
     # --- mandatory self-hosted inference ----------------------------------
     eva_llm_provider: str = "openai_compatible"
@@ -203,6 +208,15 @@ class Settings(BaseSettings):
         from app.voice.stt_base import canonicalize_stt_provider_name
 
         return canonicalize_stt_provider_name(value)
+
+    @field_validator("eva_data_provider")
+    @classmethod
+    def _validate_data_provider(cls, value: str) -> str:
+        # Unknown providers fail clearly at load; demo mode is opt-in.
+        normalized = value.strip().lower()
+        if normalized not in {"google", "demo"}:
+            raise ValueError("EVA_DATA_PROVIDER must be 'google' or 'demo'")
+        return normalized
 
     @field_validator("eva_stt_max_concurrency")
     @classmethod

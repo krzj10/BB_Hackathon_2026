@@ -221,12 +221,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # updates take effect without rebuilding the engine.
     from .attention.classifier import LLMAmbiguityClassifier
 
+    #: Demo mode swaps ONLY the external Gmail boundary (see app/demo/). It is
+    #: also deterministic: the optional LLM strengthener stays off so a reset
+    #: always yields the same classification of the same fixtures.
+    demo_mode = settings.eva_data_provider == "demo"
+
     attention_engine = AttentionEngine(
         rules=app.state.attention_rules,
         policy_version=policy.version,
         focus_service=focus_service,
         clock=utcnow,
-        classifier=LLMAmbiguityClassifier(lambda: app.state.llm_router),
+        classifier=(
+            None if demo_mode else LLMAmbiguityClassifier(lambda: app.state.llm_router)
+        ),
     )
     app.state.attention_engine = attention_engine
     app.state.attention_sink = attention_engine
@@ -311,9 +318,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # decision_projection. IMPORTANT SENDERS: exact-address set is an
     # ORG-configuration handoff - empty here on purpose, never hardcoded.
     from .attention.ingest import GmailIngestionService
+    from .demo.source import DemoGmailSource
+
+    demo_gmail_source = DemoGmailSource() if demo_mode else None
+
+    def _gmail_source():
+        """The ONE external-data seam: real GmailService, or the deterministic
+        synthetic mailbox in demo mode. Downstream code is identical."""
+        if demo_gmail_source is not None:
+            return demo_gmail_source
+        return GmailService(_google_http())
 
     app.state.ingestion_service = GmailIngestionService(
-        gmail_source_factory=lambda: GmailService(_google_http()),
+        gmail_source_factory=_gmail_source,
         cursors=app.state.cursor_repository,
         attention_repo=app.state.attention_repository,
         sink=attention_engine,
@@ -343,6 +360,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         clock=utcnow,
         enabled_provider=_gmail_ready,
     )
+
+    # -- Demo mode controls (EVA_DATA_PROVIDER=demo only). The scheduler stays
+    # Google-gated on purpose: synthetic data arrives through reset/inject and
+    # check-now, never through an unattended poll.
+    if demo_mode:
+        from .api.demo import router as demo_router
+        from .demo.service import DemoDataService
+
+        app.state.demo_service = DemoDataService(
+            db=db,
+            source=demo_gmail_source,
+            ingestion_service=app.state.ingestion_service,
+            attention_repo=app.state.attention_repository,
+            decision_repo=app.state.decision_repository,
+            clock=utcnow,
+        )
+        app.include_router(demo_router)
 
     # -- A05 voice pipeline: one normalizer + one STT service per application.
     # Tests replace app.state.audio_normalizer / stt_service (and the inject
