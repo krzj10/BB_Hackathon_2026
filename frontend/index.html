@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="EVA — voice-first executive assistant" />
+    <meta name="theme-color" media="(prefers-color-scheme: light)" content="#f7f7f8" />
+    <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#131316" />
+    <title>EVA</title>
+    <script>
+      // Pre-paint theme resolution to avoid a flash. Truth table mirrors
+      // src/lib/theme.ts (keep both in sync): "dark" => dark, "light" => light,
+      // "system"/missing/invalid/storage-failure => prefers-color-scheme.
+      (function () {
+        var stored = null;
+        try {
+          var value = localStorage.getItem("eva-theme");
+          if (value === "dark" || value === "light" || value === "system") stored = value;
+        } catch (e) {}
+        var prefersDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+        if (stored === "dark" || (stored !== "light" && prefersDark)) {
+          document.documentElement.classList.add("dark");
+        }
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
