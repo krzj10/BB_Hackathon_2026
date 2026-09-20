@@ -18,6 +18,11 @@ Guarantees:
 - per-message dedup via the durable seen_sources ledger plus the canonical
   UNIQUE attention_items(source, source_id) constraint - never an in-memory
   set as authority;
+- ingestion-window membership uses Gmail PROVIDER internalDate (remediation):
+  a thread matching the window query never resurfaces older thread history,
+  and a message without a trustworthy internalDate is treated as uncertain
+  (excluded, retrieval PARTIAL, cursor held) - never backfilled from the
+  sender-controlled RFC Date header;
 - a source is marked seen ONLY AFTER successful downstream ingestion, so a
   transient failure retries on the next overlapping poll;
 - NO Gmail HTTP request and NO AttentionEngine call ever happens while a
@@ -149,6 +154,36 @@ class GmailIngestionService:
         return f"{self._query} after:{int(start.timestamp())} before:{int(end.timestamp())}"
 
     # ------------------------------------------------------------------ #
+    @staticmethod
+    def _window_qualified(
+        evidence: ThreadEvidence, window_start: datetime, window_end: datetime
+    ) -> tuple[list[tuple[NormalizedSourceEvent, datetime]], list[str]]:
+        """Messages of a thread whose GMAIL internalDate falls inside the
+        poll window - never the whole thread history (remediation PART 2-9).
+
+        Gmail returns a thread when ANY message matches ``after:/before:``,
+        and ``threads.get`` then hands back older messages too. Provider
+        internalDate owns membership: the RFC Date header is sender-controlled
+        and only feeds the canonical event, never this filter. Convention:
+        INCLUSIVE on both ends - the overlap plus durable dedup guarantee no
+        loss at boundaries. Returns (eligible, uncertain) where uncertain
+        means some message lacked a trustworthy internalDate."""
+        eligible: list[tuple[NormalizedSourceEvent, datetime]] = []
+        uncertain_ids: list[str] = []
+        for event in evidence.messages:
+            internal_at = evidence.internal_dates.get(event.source_id)
+            if internal_at is None:
+                # No provider timestamp: not safely window-qualified. The A02
+                # note already marks the retrieval PARTIAL; never guess.
+                uncertain_ids.append(event.source_id)
+                continue
+            if window_start <= internal_at <= window_end:
+                eligible.append((event, internal_at))
+            # Older thread history is intentionally ignored this run - it
+            # stays untouched (not seen, not emitted) for its own window.
+        return eligible, uncertain_ids
+
+    # ------------------------------------------------------------------ #
     def check_now(self) -> IngestionRunResult:
         """The SAME real ingestion path as polling - never a fixture."""
         return self.poll_recent()
@@ -201,6 +236,7 @@ class GmailIngestionService:
         cursor only when that bounded retrieval completed. Older mail stays
         un-fetched on purpose - subsequent windows start from the cursor."""
         window_start = poll_started_at - timedelta(seconds=self._overlap_seconds)
+        uncertain_ids: list[str] = []
         try:
             gmail = self._gmail_source_factory()
             summaries, status, _notes = self._search_window(
@@ -211,7 +247,14 @@ class GmailIngestionService:
                 evidence = gmail.get_thread(summary.thread_id)
                 if evidence.retrieval_status is not RetrievalStatus.COMPLETE:
                     status = RetrievalStatus.PARTIAL
-                discovered.extend(m.source_id for m in evidence.messages)
+                # Baseline marks seen ONLY messages whose provider timestamp
+                # belongs to the baseline window - thread history stays
+                # historical and untouched (remediation PART 8).
+                qualified, uncertain = self._window_qualified(
+                    evidence, window_start, poll_started_at
+                )
+                discovered.extend(event.source_id for event, _ in qualified)
+                uncertain_ids.extend(uncertain)
         except Exception as exc:  # sanitized: class name only, never bodies
             logger.error("gmail baseline retrieval failed (%s)", type(exc).__name__)
             return IngestionRunResult(
@@ -224,6 +267,10 @@ class GmailIngestionService:
                 marked += 1
 
         notes: list[str] = []
+        for source_id in dict.fromkeys(uncertain_ids):
+            notes.append(
+                f"gmail:{source_id}: no usable provider internalDate; treated as uncertain"
+            )
         if status is RetrievalStatus.COMPLETE:
             # Cursor advances ONLY on a safely completed baseline.
             self._cursors.set(GMAIL_CURSOR_KEY, poll_started_at.isoformat(), now=poll_started_at)
@@ -245,39 +292,53 @@ class GmailIngestionService:
     # -- steady-state poll ---------------------------------------------- #
     def _poll_window(self, high_water: datetime, poll_started_at: datetime) -> IngestionRunResult:
         window_start = high_water - timedelta(seconds=self._overlap_seconds)
+        uncertain_ids: list[str] = []
         try:
             gmail = self._gmail_source_factory()
             summaries, status, _notes = self._search_window(
                 gmail, self._window_query(window_start, poll_started_at)
             )
-            events: list[NormalizedSourceEvent] = []
+            # Only messages whose Gmail internalDate belongs to THIS window
+            # are eligible - thread history returned by threads.get is not
+            # (remediation PART 7/9). Processing order follows the provider
+            # arrival clock, never the sender-controlled Date header.
+            events: list[tuple[NormalizedSourceEvent, datetime]] = []
             for summary in summaries:
                 evidence = gmail.get_thread(summary.thread_id)
                 if evidence.retrieval_status is not RetrievalStatus.COMPLETE:
                     status = RetrievalStatus.PARTIAL
-                events.extend(evidence.messages)
+                qualified, uncertain = self._window_qualified(
+                    evidence, window_start, poll_started_at
+                )
+                events.extend(qualified)
+                uncertain_ids.extend(uncertain)
         except Exception as exc:  # sanitized class name only
             logger.error("gmail retrieval failed (%s)", type(exc).__name__)
             return IngestionRunResult(
                 retrieval_status="failed", notes=("gmail retrieval failed",)
             )
 
-        # Durable-dedup READ (short, closed) then stable processing order.
-        fresh: list[NormalizedSourceEvent] = []
+        # Durable-dedup READ (short, closed) then stable processing order:
+        # Gmail internalDate ASC, then source_id (PART XXXVII + remediation).
+        fresh: list[tuple[NormalizedSourceEvent, datetime]] = []
         duplicates = 0
         seen_in_batch: set[str] = set()  # within-run repeat guard only; the
-        for event in events:             # durable authority stays SQLite.
+        for event, internal_at in events:  # durable authority stays SQLite.
             if event.source_id in seen_in_batch or self._cursors.is_seen("gmail", event.source_id):
                 duplicates += 1
                 continue
             seen_in_batch.add(event.source_id)
-            fresh.append(event)
-        fresh.sort(key=lambda e: (e.received_at, e.source_id))  # PART XXXVII
+            fresh.append((event, internal_at))
+        fresh.sort(key=lambda pair: (pair[1], pair[0].source_id))
 
         new_items: list[AttentionItem] = []
         notes: list[str] = []
+        for source_id in dict.fromkeys(uncertain_ids):
+            notes.append(
+                f"gmail:{source_id}: no usable provider internalDate; treated as uncertain"
+            )
         failed_source: str | None = None
-        for event in fresh:
+        for event, _internal_at in fresh:
             if self._sink is None:
                 # Downstream not wired yet (B04 handoff): leave UNSEEN.
                 notes.append("attention sink not wired; sources left unseen")

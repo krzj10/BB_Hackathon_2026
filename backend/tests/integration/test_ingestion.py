@@ -67,17 +67,32 @@ def make_event(
 
 
 class FakeGmail:
-    """ThreadSource double honouring after:/before: window semantics."""
+    """ThreadSource double honouring Gmail window semantics: a thread matches
+    an after:/before: query when ANY member's provider internalDate is inside
+    the window, and get_thread then returns the WHOLE thread - including
+    history that must not be re-ingested."""
 
     def __init__(self) -> None:
-        self.entries: list[tuple[str, NormalizedSourceEvent]] = []
+        self.entries: list[tuple[str, NormalizedSourceEvent, datetime]] = []
         self.queries: list[str] = []
         self.fail_search = False
         self.partial_search = False
         self.partial_thread_ids: set[str] = set()
 
-    def add(self, thread_id: str, *events: NormalizedSourceEvent) -> None:
-        self.entries.extend((thread_id, event) for event in events)
+    def add(
+        self,
+        thread_id: str,
+        *events: NormalizedSourceEvent,
+        internal_at: datetime | dict[str, datetime] | None = None,
+    ) -> None:
+        """internal_at models Gmail Message.internalDate; defaults to the
+        event's received_at unless overridden (dict maps source_id)."""
+        for event in events:
+            if isinstance(internal_at, dict):
+                stamp = internal_at.get(event.source_id, event.received_at)
+            else:
+                stamp = internal_at or event.received_at
+            self.entries.append((thread_id, event, stamp))
 
     def _matching_threads(self, query) -> dict[str, list[str]]:
         after_match = re.search(r"after:(\d+)", query)
@@ -85,8 +100,8 @@ class FakeGmail:
         after = int(after_match.group(1)) if after_match else None
         before = int(before_match.group(1)) if before_match else None
         threads: dict[str, list[str]] = {}
-        for thread_id, event in self.entries:
-            stamp = event.received_at.timestamp()
+        for thread_id, event, internal_at in self.entries:
+            stamp = internal_at.timestamp()          # provider clock, like Gmail
             if after is not None and stamp < after:
                 continue
             if before is not None and stamp > before:
@@ -123,12 +138,20 @@ class FakeGmail:
         return summaries, status, []
 
     def get_thread(self, thread_id):
-        messages = [event for tid, event in self.entries if tid == thread_id]
+        messages: list[NormalizedSourceEvent] = []
+        internal_dates: dict[str, datetime] = {}
+        for tid, event, internal_at in self.entries:
+            if tid == thread_id:
+                messages.append(event)
+                internal_dates[event.source_id] = internal_at
         status = (
             RetrievalStatus.PARTIAL if thread_id in self.partial_thread_ids
             else RetrievalStatus.COMPLETE
         )
-        return ThreadEvidence(thread_id=thread_id, messages=messages, retrieval_status=status)
+        return ThreadEvidence(
+            thread_id=thread_id, messages=messages, retrieval_status=status,
+            internal_dates=internal_dates,
+        )
 
 
 class RecordingSink:
@@ -440,14 +463,25 @@ def b64(text: str) -> str:
     return base64.urlsafe_b64encode(text.encode("utf-8")).decode("ascii").rstrip("=")
 
 
-def raw_message(msg_id: str, body_text: str, date: str) -> dict:
+def raw_message(
+    msg_id: str, body_text: str, date: str,
+    *, internal: datetime | None = None,
+    sender: str = "sender@example.com", subject: str = "Threaded update",
+) -> dict:
+    """Synthetic raw Gmail message. ``internal`` overrides the provider
+    internalDate (defaults to the Date header's instant) so tests can model
+    sender-controlled headers independently of Gmail arrival time."""
+    from email.utils import parsedate_to_datetime
+
+    moment = internal if internal is not None else parsedate_to_datetime(date)
     return {
         "id": msg_id,
+        "internalDate": str(int(moment.timestamp() * 1000)),
         "payload": {
             "mimeType": "text/plain",
             "headers": [
-                {"name": "From", "value": "sender@example.com"},
-                {"name": "Subject", "value": "Threaded update"},
+                {"name": "From", "value": sender},
+                {"name": "Subject", "value": subject},
                 {"name": "Date", "value": date},
             ],
             "body": {"data": b64(body_text)},
@@ -471,8 +505,8 @@ def test_pagination_across_two_pages_flows_through_ingestion(env) -> None:
     http = ScriptedHttp([
         {"threads": [{"id": "t1"}], "nextPageToken": "p2"},       # page 1
         {"threads": [{"id": "t2"}]},                              # page 2 (done)
-        {"messages": [raw_message("pm-1", "First", "Mon, 21 Sep 2026 09:55:00 +0000")]},
-        {"messages": [raw_message("pm-2", "Second", "Mon, 21 Sep 2026 09:56:00 +0000")]},
+        {"messages": [raw_message("pm-1", "First", "Mon, 21 Sep 2026 09:59:00 +0000")]},
+        {"messages": [raw_message("pm-2", "Second", "Mon, 21 Sep 2026 09:59:30 +0000")]},
     ])
     service = GmailIngestionService(
         gmail_source_factory=lambda: GmailService(http), cursors=env.cursors,
@@ -727,6 +761,7 @@ def test_html_normalized_reply_with_quoted_old_amount_no_false_high(env) -> None
     )
     raw = {
         "id": "htm-1",
+        "internalDate": str(int(datetime(2026, 9, 21, 9, 58, tzinfo=timezone.utc).timestamp() * 1000)),
         "payload": {
             "mimeType": "text/html",
             "headers": [
@@ -753,3 +788,147 @@ def test_html_normalized_reply_with_quoted_old_amount_no_false_high(env) -> None
     assert item.priority.value == "low"
     assert all(r.code != "attention.financial_decision_high" for r in item.reasons)
     assert item.title == "Re: Please approve 12,400 PLN"   # subject kept verbatim
+
+
+# =========================================================================== #
+# REMEDIATION - provider internalDate owns window membership (PART 2-16)
+# =========================================================================== #
+
+
+def test_old_financial_history_in_active_thread_is_not_resurfaced(env) -> None:
+    """The critical case: a thread matches the poll because of ONE new
+    message; threads.get returns the old financial request too - it must NOT
+    be ingested, emitted, classified or marked seen by this poll."""
+    env.cursors.set(GMAIL_CURSOR_KEY, (T0 - timedelta(hours=1)).isoformat(), now=T0)
+    env.fake.add(
+        "t1",
+        make_event("old-financial", body="Please approve 12,400 PLN for the vendor.",
+                   received_at=T0 - timedelta(days=60)),
+        internal_at=T0 - timedelta(days=60),
+    )
+    env.fake.add(
+        "t1",
+        make_event("current-thanks", body="Thanks.",
+                   received_at=T0 - timedelta(seconds=30)),
+        internal_at=T0 - timedelta(seconds=30),
+    )
+
+    result = env.service.poll_recent()
+
+    assert env.sink.calls == ["current-thanks"]              # ONLY the new message
+    assert [item.source_id for item in result.new_items] == ["current-thanks"]
+    assert not env.cursors.is_seen("gmail", "old-financial")  # untouched history
+    assert env.repo.get("item-old-financial") is None         # never persisted
+    assert all(i.priority.value != "high" for i in result.new_items)  # no false HIGH
+
+
+def test_baseline_marks_only_window_qualified_thread_messages(env) -> None:
+    """Baseline must not enumerate thread history indirectly via get_thread."""
+    env.fake.add(
+        "t9",
+        make_event("hist-old", body="Please approve 12,400 PLN",
+                   received_at=T0 - timedelta(days=30)),
+        internal_at=T0 - timedelta(days=30),
+    )
+    env.fake.add(
+        "t9",
+        make_event("hist-new", body="OK", received_at=T0 - timedelta(seconds=60)),
+        internal_at=T0 - timedelta(seconds=60),
+    )
+
+    result = env.service.poll_recent()                        # first run = baseline
+
+    assert result.baseline_count == 1                         # only the recent one
+    assert env.cursors.is_seen("gmail", "hist-new")
+    assert not env.cursors.is_seen("gmail", "hist-old")       # stays historical
+    assert env.sink.calls == []                               # zero emissions
+    assert env.cursors.get(GMAIL_CURSOR_KEY) is not None      # cursor established
+
+
+def test_date_header_spoofing_cannot_influence_window_membership(env) -> None:
+    """Real A02 path: internalDate owns poll membership; the RFC Date header
+    only feeds the canonical event."""
+    from app.google.gmail import GmailService
+
+    env.cursors.set(GMAIL_CURSOR_KEY, (T0 - timedelta(hours=1)).isoformat(), now=T0)
+    msg_in = raw_message(                       # provider: NOW; header: 2 months old
+        "spoof-in", "Fresh note.", "Mon, 20 Jul 2026 09:00:00 +0000",
+        internal=T0 - timedelta(seconds=45),
+    )
+    msg_out = raw_message(                      # provider: OLD; header: today
+        "spoof-out", "Please approve 12,400 PLN.", "Mon, 21 Sep 2026 09:59:00 +0000",
+        internal=T0 - timedelta(days=60),
+    )
+    http = ScriptedHttp([{"threads": [{"id": "t1"}]}, {"messages": [msg_in, msg_out]}])
+    sink = RecordingSink(env.rules)
+    service = GmailIngestionService(
+        gmail_source_factory=lambda: GmailService(http), cursors=env.cursors,
+        attention_repo=env.repo, sink=sink, clock=lambda: T0,
+    )
+
+    result = service.poll_recent()
+
+    assert sink.calls == ["spoof-in"]                     # internalDate wins both ways
+    assert [i.source_id for i in result.new_items] == ["spoof-in"]
+    assert not env.cursors.is_seen("gmail", "spoof-out")
+    assert env.repo.get("item-spoof-out") is None
+    item = env.repo.get("item-spoof-in")
+    assert item is not None and item.received_at.month == 7   # canonical semantics kept
+
+
+def test_missing_internal_date_is_uncertain_partial_cursor_held(env) -> None:
+    from app.google.gmail import GmailService
+
+    cursor_value = (T0 - timedelta(hours=1)).isoformat()
+    env.cursors.set(GMAIL_CURSOR_KEY, cursor_value, now=T0)
+    raw = raw_message("noid-1", "Please approve 12,400 PLN right away",
+                      "Mon, 21 Sep 2026 09:58:00 +0000")
+    del raw["internalDate"]                                   # provider time unknown
+    http = ScriptedHttp([{"threads": [{"id": "t1"}]}, {"messages": [raw]}])
+    sink = RecordingSink(env.rules)
+    service = GmailIngestionService(
+        gmail_source_factory=lambda: GmailService(http), cursors=env.cursors,
+        attention_repo=env.repo, sink=sink, clock=lambda: T0,
+    )
+
+    result = service.poll_recent()
+
+    assert result.retrieval_status == "partial"               # uncertain, never guessed
+    assert env.cursors.get(GMAIL_CURSOR_KEY) == cursor_value  # cursor held
+    assert sink.calls == []                                   # not ingested as current
+    assert not env.cursors.is_seen("gmail", "noid-1")
+    assert any("no usable provider internalDate" in note for note in result.notes)
+    assert all("approve" not in note.lower() for note in result.notes)  # ids only
+
+
+def test_processing_order_follows_internal_date(env) -> None:
+    env.cursors.set(GMAIL_CURSOR_KEY, (T0 - timedelta(hours=1)).isoformat(), now=T0)
+    # RFC Date header order is the REVERSE of provider arrival order.
+    env.fake.add("t1", make_event("hdr-late", received_at=T0 - timedelta(seconds=10)),
+                 internal_at={"hdr-late": T0 - timedelta(seconds=90)})
+    env.fake.add("t1", make_event("hdr-mid", received_at=T0 - timedelta(seconds=20)),
+                 internal_at={"hdr-mid": T0 - timedelta(seconds=60)})
+    env.fake.add("t1", make_event("hdr-early", received_at=T0 - timedelta(seconds=30)),
+                 internal_at={"hdr-early": T0 - timedelta(seconds=40)})
+
+    result = env.service.poll_recent()
+
+    assert [i.source_id for i in result.new_items] == ["hdr-late", "hdr-mid", "hdr-early"]
+
+
+def test_late_arrival_overlap_uses_internal_date(env) -> None:
+    env.service.poll_recent()                                 # baseline at T0
+    later = T0 + timedelta(seconds=60)
+    env.holder["now"] = later
+    env.fake.add(
+        "t2",
+        make_event("late-bird", body="Slipped through.",
+                   received_at=T0 - timedelta(seconds=600)),   # ancient header
+        internal_at={"late-bird": T0 - timedelta(seconds=30)}, # arrived inside overlap
+    )
+
+    result = env.service.poll_recent()
+
+    assert [i.source_id for i in result.new_items] == ["late-bird"]  # processed once
+    again = env.service.poll_recent()
+    assert again.new_items == ()                               # durable exactly-once

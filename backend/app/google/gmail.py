@@ -26,7 +26,7 @@ import html as html_module
 import logging
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.utils import parseaddr, parsedate_to_datetime
 from typing import Any
 
@@ -158,6 +158,31 @@ def _parse_received(value: str | None, retrieved_at: datetime) -> tuple[datetime
     return retrieved_at, notes
 
 
+def parse_internal_date(raw: dict[str, Any]) -> tuple[datetime | None, str | None]:
+    """Parse Gmail ``Message.internalDate`` (epoch-milliseconds string) into an
+    aware UTC datetime: (parsed, None), or (None, sanitized note).
+
+    internalDate is the PROVIDER arrival time and owns ingestion-window
+    membership; the RFC Date header is sender-controlled and must never be a
+    fallback for it. Missing/non-numeric/negative/overflow values are flagged
+    honestly - never guessed from the host timezone. Notes carry ids only."""
+    message_id = raw.get("id") or "?"
+    value = raw.get("internalDate")
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None, f"message {message_id}: missing internalDate"
+    try:
+        millis = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None, f"message {message_id}: non-numeric internalDate"
+    if millis < 0:
+        return None, f"message {message_id}: negative internalDate"
+    try:
+        moment = datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(milliseconds=millis)
+    except (OverflowError, OSError, ValueError):
+        return None, f"message {message_id}: internalDate out of range"
+    return moment, None
+
+
 @dataclass
 class ThreadSummary:
     thread_id: str
@@ -172,6 +197,10 @@ class ThreadEvidence:
     messages: list[NormalizedSourceEvent]
     retrieval_status: RetrievalStatus
     notes: list[str] = field(default_factory=list)
+    #: INTERNAL ingestion metadata (not a canonical contract): Gmail
+    #: internalDate per message id, aware UTC. A message absent from this map
+    #: has no trustworthy provider timestamp and is NOT window-qualified.
+    internal_dates: dict[str, datetime] = field(default_factory=dict)
 
 
 class GmailService:
@@ -257,15 +286,23 @@ class GmailService:
                 if summary is not None:
                     summaries.append(summary)
             token = payload.get("nextPageToken")
-            if len(summaries) >= max_threads:
-                # Hard thread budget reached; remaining matches (if any) stay
-                # unclaimed - honestly PARTIAL, never silently skipped.
-                status = RetrievalStatus.PARTIAL
+            if len(summaries) > max_threads:
+                # A fetched page exceeded the hard budget: truncate and stay
+                # honestly PARTIAL - remaining matches are never skipped.
+                notes.append(
+                    f"window search truncated at the {max_threads}-thread "
+                    "budget while Gmail returned more results"
+                )
+                return summaries[:max_threads], RetrievalStatus.PARTIAL, notes
+            if token is not None and len(summaries) == max_threads:
+                # Budget reached AND continuation exists -> PARTIAL. But a
+                # chain that ENDS exactly at the budget (token None) is a
+                # proven-complete result set and stays COMPLETE.
                 notes.append(
                     f"window search stopped at the {max_threads}-thread budget "
-                    "while more may remain"
+                    "while nextPageToken existed"
                 )
-                return summaries[:max_threads], status, notes
+                return summaries, RetrievalStatus.PARTIAL, notes
             if token is None:
                 break
         if token is not None:
@@ -301,6 +338,17 @@ class GmailService:
             thread_id=thread_id, messages=[], retrieval_status=RetrievalStatus.COMPLETE
         )
         for raw in payload.get("messages") or []:
+            if not isinstance(raw, dict):
+                evidence.notes.append("skipped non-object message entry")
+                continue
+            # Provider arrival time first: it owns ingestion-window
+            # membership. Missing/invalid values flag the thread PARTIAL;
+            # they are NEVER backfilled from the sender-controlled Date header.
+            internal_at, internal_note = parse_internal_date(raw)
+            if internal_at is not None and raw.get("id"):
+                evidence.internal_dates[raw["id"]] = internal_at
+            elif internal_note is not None:
+                evidence.notes.append(internal_note)
             try:
                 message = self._normalize_message(raw, retrieved_at, evidence.notes)
             except ValueError as exc:  # malformed message: honest partial result

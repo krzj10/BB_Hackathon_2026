@@ -7,13 +7,16 @@ malformed-message partial retrieval and provenance preservation."""
 from __future__ import annotations
 
 import base64
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+
+import pytest
 
 from app.contracts.domain import RetrievalStatus
 from app.google.gmail import (
     MAX_BODY_CHARS,
     GmailService,
     decode_body,
+    parse_internal_date,
     sanitize_html,
 )
 
@@ -36,9 +39,14 @@ class FakeHttp:
 
 def message(msg_id="msg-1", *, subject="Q3 invoice", sender="CFO <cfo@example.com>",
             date="Mon, 21 Sep 2026 10:30:00 +0200", body_text="Hello EVA") -> dict:
+    from email.utils import parsedate_to_datetime
+
+    arrival = parsedate_to_datetime(date)
     return {
         "id": msg_id,
         "snippet": "Hello EVA",
+        # Gmail always provides provider arrival time on full-format reads.
+        "internalDate": str(int(arrival.timestamp() * 1000)),
         "payload": {
             "mimeType": "text/plain",
             "headers": [
@@ -164,6 +172,79 @@ def test_search_window_page_budget_reports_partial() -> None:
     summaries, status, _notes = service.search_window("q", max_threads=100, max_pages=2)
     assert len(summaries) == 2
     assert status is RetrievalStatus.PARTIAL
+
+
+def test_search_window_exact_budget_without_token_is_complete() -> None:
+    # A result set that ENDS exactly at the budget is proven complete.
+    page = {"threads": [{"id": "t1"}, {"id": "t2"}]}  # no nextPageToken
+    service = GmailService(FakeHttp([page]))
+    summaries, status, _notes = service.search_window("q", max_threads=2)
+    assert len(summaries) == 2
+    assert status is RetrievalStatus.COMPLETE
+
+
+def test_search_window_exact_budget_with_token_is_partial() -> None:
+    page = {"threads": [{"id": "t1"}, {"id": "t2"}], "nextPageToken": "p3"}
+    service = GmailService(FakeHttp([page]))
+    summaries, status, notes = service.search_window("q", max_threads=2)
+    assert len(summaries) == 2
+    assert status is RetrievalStatus.PARTIAL
+    assert any("budget" in note for note in notes)
+
+
+def test_search_window_truncates_over_budget_page() -> None:
+    pages = [
+        {"threads": [{"id": "t1"}, {"id": "t2"}], "nextPageToken": "p2"},
+        {"threads": [{"id": "t3"}, {"id": "t4"}]},  # overshoots the 3-thread budget
+    ]
+    service = GmailService(FakeHttp(pages))
+    summaries, status, _notes = service.search_window("q", max_threads=3)
+    assert [s.thread_id for s in summaries] == ["t1", "t2", "t3"]  # truncated to budget
+    assert status is RetrievalStatus.PARTIAL
+
+
+# ---------------------------------------------------------------------------
+# Provider internalDate extraction (A06 window membership source)
+# ---------------------------------------------------------------------------
+
+
+def test_internal_date_parsed_to_aware_utc() -> None:
+    arrival = datetime(2026, 9, 21, 8, 30, tzinfo=timezone.utc)
+    raw = message("msg-id-1")
+    raw["internalDate"] = str(int(arrival.timestamp() * 1000))
+    service = GmailService(FakeHttp([{"messages": [raw]}]))
+    evidence = service.get_thread("t")
+    parsed = evidence.internal_dates["msg-id-1"]
+    assert parsed.tzinfo is not None and parsed.utcoffset() == timedelta(0)
+    assert parsed == arrival
+    assert evidence.retrieval_status is RetrievalStatus.COMPLETE
+
+
+@pytest.mark.parametrize("bad", [None, "", "abc", "-5", "9" * 18])
+def test_missing_or_invalid_internal_date_flagged_safely(bad) -> None:
+    raw = message("msg-bad")
+    if bad is None:
+        del raw["internalDate"]
+    else:
+        raw["internalDate"] = bad
+    service = GmailService(FakeHttp([{"messages": [raw]}]))
+    evidence = service.get_thread("t")
+    assert "msg-bad" not in evidence.internal_dates      # never guessed
+    assert evidence.retrieval_status is RetrievalStatus.PARTIAL
+    assert any("internalDate" in note for note in evidence.notes)
+    # Notes carry ids only - no body content:
+    assert all("Hello EVA" not in note for note in evidence.notes)
+
+
+def test_parse_internal_date_helper_is_utc_and_strict() -> None:
+    parsed, note = parse_internal_date({"id": "m", "internalDate": "1789985280000"})
+    assert note is None and parsed is not None
+    assert parsed == datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(
+        milliseconds=1789985280000
+    )
+    for bad in ({}, {"internalDate": "x"}, {"internalDate": "-1"}):
+        value, note = parse_internal_date({"id": "m", **bad})
+        assert value is None and note is not None
 
 
 # ---------------------------------------------------------------------------
