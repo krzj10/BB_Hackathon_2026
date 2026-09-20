@@ -1,12 +1,13 @@
 """STT orchestration (A05): primary/fallback selection, bounded concurrency,
 timeout, language resolution - one service layer, no competing contracts.
 
-Concurrency model: an ``asyncio.Semaphore`` bounds SIMULTANEOUS provider
-calls. Known limitation (accepted deliberately per the plan): cancelling a
-timed-out ``asyncio.to_thread`` does NOT terminate native inference
-immediately - the worker may keep computing after the permit is released.
-That is exactly why the default concurrency stays conservative (1) and the
-timeout exists to free the CALLER even when the native call cannot be freed.
+Concurrency model: an ``asyncio.Semaphore`` provides inference LEASES. A
+lease is released only when the provider task ACTUALLY finishes - on timeout
+or caller cancellation the shielded task keeps running and keeps its lease
+(done-callback releases it exactly once). Native inference cannot reliably be
+interrupted, so this is what makes ``EVA_STT_MAX_CONCURRENCY`` a true bound;
+the default therefore stays conservative (1), and a timed-out request must
+retry later once capacity frees up.
 
 Duration: ``Transcript.duration_ms`` is measured by this service with a
 MONOTONIC clock around the provider attempt - never wall-clock timestamps.
@@ -51,6 +52,16 @@ class TranscriptionTimeoutError(SttError):
         super().__init__("transcription_timeout", message)
 
 
+class NoSpeechDetectedError(SttError):
+    """A provider answered successfully but produced empty/whitespace text.
+    Treated as unsuccessful recognition (fallback allowed once); if no
+    provider yields non-empty text this is an input-quality 422, never a
+    fabricated 200."""
+
+    def __init__(self, message: str = "no speech was recognized") -> None:
+        super().__init__("no_speech_detected", message)
+
+
 def canonicalize_stt_provider_name(raw: str | None) -> str:
     """Map configured spellings to the two supported identities; unknown
     values are REJECTED clearly (never silently defaulted)."""
@@ -86,9 +97,19 @@ class TranscriptionService:
 
     # ------------------------------------------------------------------ #
     async def transcribe(self, audio: AudioInput, language_hint: str | None = None) -> Transcript:
-        """Run the primary provider; on unavailability/failure/timeout try
-        the known local fallback EXACTLY ONCE with the SAME normalized
-        AudioInput (never re-normalized, never a fabricated transcript)."""
+        """Transcribe with AUTOMATIC language detection on the providers.
+
+        The optional ``language_hint`` is a PRIOR CONVERSATION LANGUAGE used
+        only after transcription to resolve ambiguous short approvals - it is
+        never passed into provider inference (a confident English sentence
+        spoken in a Polish conversation must stay English).
+
+        Fallback policy: primary unavailability or an ordinary recognition
+        failure (including an empty transcript) tries the known local
+        fallback EXACTLY ONCE with the SAME normalized AudioInput. A TIMEOUT
+        IS TERMINAL for this request - the primary native worker may still be
+        running and holds its inference permit, so starting a fallback would
+        defeat the concurrency boundary."""
         chain = [p for p in (self._primary, self._fallback) if p is not None]
         if not chain:
             raise ProviderUnavailableError("no speech-to-text provider configured")
@@ -96,11 +117,14 @@ class TranscriptionService:
         last_error: SttError | None = None
         for index, provider in enumerate(chain):
             try:
-                transcript = await self._attempt(provider, audio, language_hint)
-            except (ProviderUnavailableError, TranscriptionFailedError, TranscriptionTimeoutError) as exc:
+                transcript = await self._attempt(provider, audio)
+            except TranscriptionTimeoutError:
+                logger.error("stt attempt %d timed out", index + 1)
+                raise  # terminal: no fallback while native work may continue
+            except (ProviderUnavailableError, TranscriptionFailedError, NoSpeechDetectedError) as exc:
                 # Never log provider text - only position and stable code.
                 logger.error("stt attempt %d failed (%s)", index + 1, exc.code)
-                # Keep the MOST informative failure: timeout > failure >
+                # Keep the MOST informative failure: no-speech > failure >
                 # unavailable, independent of fallback ordering.
                 if last_error is None or self._severity(exc) >= self._severity(last_error):
                     last_error = exc
@@ -110,26 +134,52 @@ class TranscriptionService:
 
     @staticmethod
     def _severity(error: SttError) -> int:
-        if isinstance(error, TranscriptionTimeoutError):
+        if isinstance(error, NoSpeechDetectedError):
             return 3
         if isinstance(error, TranscriptionFailedError):
             return 2
         return 1
 
-    async def _attempt(
-        self, provider: SpeechToTextProvider, audio: AudioInput, language_hint: str | None
-    ) -> Transcript:
-        async with self._semaphore:
-            started = self._clock()
-            try:
-                transcript = await asyncio.wait_for(
-                    provider.transcribe(audio, language_hint), timeout=self._timeout
-                )
-            except asyncio.TimeoutError as exc:
-                raise TranscriptionTimeoutError() from exc
-            elapsed_ms = max(0, int((self._clock() - started) * 1000))
-            # duration_ms is OUR measured provider elapsed time (monotonic).
-            return transcript.model_copy(update={"duration_ms": elapsed_ms})
+    async def _attempt(self, provider: SpeechToTextProvider, audio: AudioInput) -> Transcript:
+        """One inference attempt holding the concurrency LEASE honestly.
+
+        The permit is acquired BEFORE the provider task starts and released
+        only when that task ACTUALLY finishes - never when the caller gives
+        up. On timeout (or caller cancellation/disconnect) the shielded task
+        keeps running with its permit; a done-callback releases it exactly
+        once and consumes any background exception so no unhandled-task
+        warnings appear. This is what makes ``max_concurrency`` a real bound
+        even across timeouts, where cancelling asyncio plumbing does NOT stop
+        native inference threads.
+
+        Providers always receive ``language=None``: automatic detection."""
+        await self._semaphore.acquire()
+        task = asyncio.create_task(provider.transcribe(audio, None))
+        released = False
+
+        def _release(_finished: asyncio.Task) -> None:
+            nonlocal released
+            if not released:
+                released = True
+                self._semaphore.release()
+            if not _finished.cancelled():
+                # Retrieve (and silence) any background exception.
+                exc = _finished.exception()
+                if exc is not None:
+                    logger.error("stt background task ended with (%s)", type(exc).__name__)
+
+        task.add_done_callback(_release)
+        started = self._clock()
+        try:
+            transcript = await asyncio.wait_for(asyncio.shield(task), timeout=self._timeout)
+        except asyncio.TimeoutError as exc:
+            # Permit intentionally stays held until the native worker exits.
+            raise TranscriptionTimeoutError() from exc
+        elapsed_ms = max(0, int((self._clock() - started) * 1000))
+        if not transcript.text or not transcript.text.strip():
+            raise NoSpeechDetectedError()
+        # duration_ms is OUR measured provider elapsed time (monotonic).
+        return transcript.model_copy(update={"duration_ms": elapsed_ms})
 
     def _finalize(self, transcript: Transcript, language_hint: str | None) -> Transcript:
         language, confidence = resolve_language(
@@ -150,11 +200,11 @@ class TranscriptionService:
         provider detail beyond the providers' own sanitized messages)."""
         primary = await self._health_of(self._primary)
         fallback = await self._health_of(self._fallback)
-        if primary is not None and primary.status is HealthStatus.OK:
+        if primary is not None and primary.status is HealthStatus.READY:
             return ProviderHealth(
-                status=HealthStatus.OK, provider=primary.provider, model=primary.model
+                status=HealthStatus.READY, provider=primary.provider, model=primary.model
             )
-        if fallback is not None and fallback.status is HealthStatus.OK:
+        if fallback is not None and fallback.status is HealthStatus.READY:
             return ProviderHealth(
                 status=HealthStatus.DEGRADED,
                 detail="primary unavailable; local fallback ready",

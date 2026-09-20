@@ -131,9 +131,9 @@ def generate_google_event_id(action_id: str, revision: int) -> str:
     """Deterministic Google-valid client event id for (action, revision).
 
     Derived from a SHA-256 digest rendered in lowercase base32hex (charset
-    [0-9a-v], URL-safe per Google's event-id rules, length 48). Stable across
-    retries and process restarts; unique enough to treat collisions as real.
-    Deliberately NOT ``action-<uuid>`` with hyphens."""
+    [0-9a-v], URL-safe per Google's event-id rules, 52 characters unpadded).
+    Stable across retries and process restarts; unique enough to treat
+    collisions as real. Deliberately NOT ``action-<uuid>`` with hyphens."""
     digest = hashlib.sha256(f"{action_id}:{revision}".encode("utf-8")).digest()
     return base64.b32hexencode(digest).decode("ascii").lower().rstrip("=")
 

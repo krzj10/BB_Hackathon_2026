@@ -51,7 +51,7 @@ from ..contracts.domain import (
     SourceRef,
     TimedSpan,
 )
-from .http import GoogleHttp
+from .http import GoogleApiError, GoogleErrorCategory, GoogleHttp
 
 logger = logging.getLogger("eva.google.calendar")
 
@@ -316,10 +316,17 @@ class CalendarService:
             {"sendUpdates": google_send_updates(args.send_updates)},
             body,
         )
-        # Read-back through the SAME normalization path as reads (LVI/LVIII):
-        # trust the GET, not only the POST response.
-        event_id = payload.get("id") or google_event_id
-        return self.get_event(calendar_id=calendar_id, event_id=event_id)
+        # IDENTITY FREEZE: the durably reserved client id is the ONLY read-
+        # back anchor. A response naming a DIFFERENT resource is a malformed/
+        # ambiguous provider answer - it is never followed; reconciliation in
+        # the executor proceeds against google_event_id instead.
+        returned_id = payload.get("id")
+        if returned_id is not None and returned_id != google_event_id:
+            logger.error("calendar create response reported an unexpected event id")
+            raise GoogleApiError(
+                GoogleErrorCategory.MALFORMED_RESPONSE, endpoint_kind="events"
+            )
+        return self.get_event(calendar_id=calendar_id, event_id=google_event_id)
 
     def get_event_mutation_state(self, *, calendar_id: str, event_id: str) -> "CalendarMutationState":
         """INTERNAL A04 mutation-safety read (not a public contract surface).

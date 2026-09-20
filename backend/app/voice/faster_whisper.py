@@ -2,8 +2,13 @@
 
 Lifecycle: ONE model instance per application/provider, loaded lazily and
 reused - never per request. The model factory is injectable so tests never
-import or download the real package; load failures become sanitized
-unavailable states that do not retry-storm.
+import the real package.
+
+RUNTIME MODEL LOADING IS LOCAL-FILES-ONLY: the default factory passes
+``local_files_only=True``, so a missing local model fails fast as an
+unavailable provider instead of silently downloading from the Hub. A human
+must prepare/download and cache the model before rehearsal; application code
+never performs model acquisition.
 
 faster-whisper inference is BLOCKING native code: it always runs via
 ``asyncio.to_thread`` so the FastAPI event loop stays responsive.
@@ -28,12 +33,17 @@ PROVIDER_NAME = "faster-whisper"
 
 
 def _default_model_factory(model_name: str, device: str, compute_type: str) -> Any:
-    """Import happens HERE only (module import must not require the package);
-    real use requires a human-installed wheel and a pre-downloaded model -
-    nothing is ever downloaded by application code."""
+    """Import happens HERE only (module import must not require the package).
+
+    ``local_files_only=True`` is the runtime guarantee: a model that is not
+    already present on this machine produces a load failure (sanitized
+    unavailable state) - NEVER an implicit network download. Model acquisition
+    belongs to human setup, not to application startup or request handling."""
     from faster_whisper import WhisperModel  # deferred: heavy native wheel
 
-    return WhisperModel(model_name, device=device, compute_type=compute_type)
+    return WhisperModel(
+        model_name, device=device, compute_type=compute_type, local_files_only=True
+    )
 
 
 class FasterWhisperProvider:
@@ -111,7 +121,7 @@ class FasterWhisperProvider:
     async def health(self) -> ProviderHealth:
         if self._model is not None:
             return ProviderHealth(
-                status=HealthStatus.OK, provider=PROVIDER_NAME, model=self._model_name
+                status=HealthStatus.READY, provider=PROVIDER_NAME, model=self._model_name
             )
         if self._load_failed:
             return ProviderHealth(

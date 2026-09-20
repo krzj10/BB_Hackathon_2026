@@ -14,8 +14,10 @@ import array
 import asyncio
 import io
 import subprocess
+import sys
 import threading
 import time
+import types
 import wave
 from pathlib import Path
 from types import SimpleNamespace
@@ -134,7 +136,7 @@ class FakeSttProvider:
 
         if self.fail == "unavailable":
             return ProviderHealth(status=HealthStatus.UNAVAILABLE, provider=self.name)
-        return ProviderHealth(status=HealthStatus.OK, provider=self.name)
+        return ProviderHealth(status=HealthStatus.READY, provider=self.name)
 
 
 class Env(SimpleNamespace):
@@ -522,15 +524,18 @@ def test_both_unavailable_returns_503_without_fabrication(env) -> None:
     assert "transcript" not in response.json()   # nothing invented
 
 
-def test_timeout_maps_to_504(env) -> None:
-    env.primary.block_seconds = 1.0
+def test_timeout_maps_to_504_and_is_terminal(env) -> None:
+    env.primary.block_seconds = 0.2
     env.fallback.fail = "unavailable"
-    app_state_service = TranscriptionService(
+    env.app.state.stt_service = TranscriptionService(
         primary=env.primary, fallback=env.fallback, max_concurrency=1, timeout_seconds=0.05
     )
-    env.app.state.stt_service = app_state_service
     response = post_transcribe(env)
     assert response.status_code == 504
+    assert "transcription_timeout" in response.json()["detail"]
+    # PART 8: a timeout is TERMINAL - the still-running primary holds its
+    # inference lease, so no fallback may start for this request.
+    assert env.fallback.calls == []
 
 
 def test_bounded_concurrency_never_exceeds_configured() -> None:
@@ -664,3 +669,243 @@ def test_validate_canonical_wav_rejects_noncanonical() -> None:
     with pytest.raises(AudioInputError) as caught:
         validate_canonical_wav(buffer.getvalue())
     assert caught.value.code == "audio_decode_failed"
+
+
+# =========================================================================== #
+# REMEDIATION - conversation hint is NEVER an inference-language override
+# =========================================================================== #
+
+
+def test_conversation_hint_never_forces_provider_inference_language(env) -> None:
+    response = post_transcribe(env, language="pl")
+    assert response.status_code == 200
+    # Providers receive language=None (automatic detection). The multipart
+    # `language` field is a PRIOR CONVERSATION LANGUAGE only.
+    assert env.primary.calls[0][1] is None
+
+
+def test_long_english_with_polish_hint_stays_english(env) -> None:
+    env.primary.text = "Please move the client review to tomorrow afternoon"
+    env.primary.language = "en"
+    env.primary.confidence = 0.95
+    response = post_transcribe(env, language="pl")
+    payload = response.json()["transcript"]
+    assert payload["language"] == "en"          # confident detection wins
+    assert env.primary.calls[0][1] is None      # decoded automatically
+
+
+def test_long_polish_with_english_hint_stays_polish(env) -> None:
+    env.primary.text = "Przenieś przegląd klienta na jutro po południu"
+    env.primary.language = "pl"
+    env.primary.confidence = 0.97
+    response = post_transcribe(env, language="en")
+    assert response.json()["transcript"]["language"] == "pl"
+
+
+def test_orchestrator_drives_whisper_cpp_with_auto_language(tmp_path) -> None:
+    """The public conversation hint must not become '-l pl' in the CLI."""
+    model = tmp_path / "m.bin"
+    model.write_bytes(b"x")
+    runner = FakeCppRunner()
+    provider = WhisperCppProvider(binary="w", model_path=str(model), runner=runner)
+    service = TranscriptionService(primary=provider, timeout_seconds=5.0)
+    transcript = asyncio.run(service.transcribe(AudioInput(wav_bytes=make_wav()), "pl"))
+    command = runner.commands[0]
+    assert command[command.index("-l") + 1] == "auto"
+    assert transcript.language == "und"  # auto without probability: honest
+
+
+# =========================================================================== #
+# REMEDIATION - timeout keeps the concurrency LEASE (deterministic events)
+# =========================================================================== #
+
+
+class GatedProvider:
+    """Deterministic worker double: each call blocks in a real thread on a
+    threading.Event gate. Synchronization authority is EVENTS, not sleeps."""
+
+    def __init__(self) -> None:
+        self.gate = threading.Event()
+        self.calls = 0
+        self.active = 0
+        self.max_observed = 0
+        self._lock = threading.Lock()
+
+    async def transcribe(self, audio: AudioInput, language: str | None = None) -> Transcript:
+        with self._lock:
+            self.calls += 1
+            self.active += 1
+            self.max_observed = max(self.max_observed, self.active)
+        try:
+            await asyncio.to_thread(self.gate.wait)  # native-style blocking work
+            return Transcript(
+                text="done", language="en", language_confidence=0.9,
+                duration_ms=0, provider="gated",
+            )
+        finally:
+            with self._lock:
+                self.active -= 1
+
+
+def test_timeout_retains_concurrency_lease() -> None:
+    async def scenario() -> None:
+        provider = GatedProvider()
+        fallback = FakeSttProvider("whisper.cpp")
+        service = TranscriptionService(
+            primary=provider, fallback=fallback, max_concurrency=1, timeout_seconds=0.05
+        )
+        audio = AudioInput(wav_bytes=make_wav(0.2))
+
+        with pytest.raises(TranscriptionTimeoutError):
+            await service.transcribe(audio)
+        assert provider.calls == 1              # first worker started...
+        assert fallback.calls == []             # ...timeout terminal: no fallback
+
+        second = asyncio.create_task(service.transcribe(audio))
+        for _ in range(20):                     # ample scheduling, no sleep-sync
+            await asyncio.sleep(0)
+        assert provider.calls == 1              # lease STILL held by the worker
+        assert fallback.calls == []
+
+        provider.gate.set()                     # first native call REALLY exits
+        result = await second                   # only now may the next start
+        assert result.text == "done"
+        assert provider.calls == 2
+        assert provider.max_observed == 1       # real concurrency never exceeded
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_caller_does_not_release_lease_early() -> None:
+    async def scenario() -> None:
+        provider = GatedProvider()
+        service = TranscriptionService(primary=provider, max_concurrency=1, timeout_seconds=30.0)
+        audio = AudioInput(wav_bytes=make_wav(0.2))
+
+        first = asyncio.create_task(service.transcribe(audio))
+        while provider.calls < 1:
+            await asyncio.sleep(0)
+        first.cancel()                          # client disconnect equivalent
+        with pytest.raises(asyncio.CancelledError):
+            await first
+
+        second = asyncio.create_task(service.transcribe(audio))
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert provider.calls == 1              # abandoned worker keeps its lease
+
+        provider.gate.set()
+        result = await second
+        assert result.text == "done"
+        assert provider.max_observed == 1
+
+    asyncio.run(scenario())
+
+
+# =========================================================================== #
+# REMEDIATION - faster-whisper runtime loading is LOCAL-FILES-ONLY
+# =========================================================================== #
+
+
+def test_default_factory_enforces_local_files_only(monkeypatch) -> None:
+    captured: dict = {}
+
+    class FakeWhisperModel:
+        def __init__(self, model, device=None, compute_type=None, local_files_only=False):
+            captured.update(
+                model=model, device=device, compute_type=compute_type,
+                local_files_only=local_files_only,
+            )
+
+    module = types.ModuleType("faster_whisper")
+    module.WhisperModel = FakeWhisperModel
+    monkeypatch.setitem(sys.modules, "faster_whisper", module)  # no real package
+
+    provider = FasterWhisperProvider(model_name="base")          # DEFAULT factory
+    asyncio.run(provider.warmup())
+    assert captured["local_files_only"] is True                  # no Hub fetch path
+    assert asyncio.run(provider.health()).status is HealthStatus.READY
+
+
+def test_missing_local_model_is_unavailable_without_download(monkeypatch) -> None:
+    attempts = []
+
+    def refusing_factory(model, device=None, compute_type=None, local_files_only=False):
+        attempts.append(local_files_only)
+        raise OSError(f"Model '{model}' is not available locally")  # like missing cache
+
+    module = types.ModuleType("faster_whisper")
+    module.WhisperModel = refusing_factory
+    monkeypatch.setitem(sys.modules, "faster_whisper", module)
+
+    provider = FasterWhisperProvider()
+    service = TranscriptionService(primary=provider)
+    asyncio.run(service.warmup())              # startup path: swallows, never raises
+    assert attempts == [True]                  # local-only attempt, no fallback fetch
+    health = asyncio.run(provider.health())
+    assert health.status is HealthStatus.UNAVAILABLE
+    with pytest.raises(ProviderUnavailableError):
+        asyncio.run(provider.transcribe(AudioInput(wav_bytes=make_wav())))
+
+
+# =========================================================================== #
+# REMEDIATION - whisper.cpp binary health (real discovery, sanitized detail)
+# =========================================================================== #
+
+
+def test_whisper_cpp_binary_health_matrix(tmp_path) -> None:
+    model = tmp_path / "ggml.bin"
+    model.write_bytes(b"synthetic-model")
+
+    async def status(**kwargs):
+        return (await WhisperCppProvider(**kwargs).health()).status
+
+    unavailable = HealthStatus.UNAVAILABLE
+    assert asyncio.run(status(binary="", model_path=str(model))) is unavailable
+    assert asyncio.run(status(binary="w", model_path="")) is unavailable
+    assert asyncio.run(
+        status(binary="w", model_path=str(tmp_path / "absent.bin"), runner=FakeCppRunner())
+    ) is unavailable
+    # REAL runner: explicit path that does not exist -> unavailable...
+    missing_path = WhisperCppProvider(binary=str(tmp_path / "no-such-bin.exe"), model_path=str(model))
+    health = asyncio.run(missing_path.health())
+    assert health.status is HealthStatus.UNAVAILABLE
+    assert str(tmp_path) not in (health.detail or "")            # no private paths out
+    # ...and a bare command name that is not on PATH -> unavailable.
+    assert asyncio.run(
+        status(binary="definitely-not-a-real-command-xyz", model_path=str(model))
+    ) is unavailable
+    # Injected fake runner + synthetic model: usable in tests (OK).
+    usable = WhisperCppProvider(binary="fake", model_path=str(model), runner=FakeCppRunner())
+    assert asyncio.run(usable.health()).status is HealthStatus.READY
+
+
+def test_whisper_cpp_real_runner_missing_binary_raises_unavailable(tmp_path) -> None:
+    model = tmp_path / "ggml.bin"
+    model.write_bytes(b"x")
+    provider = WhisperCppProvider(binary=str(tmp_path / "no-such-bin.exe"), model_path=str(model))
+    with pytest.raises(ProviderUnavailableError):
+        asyncio.run(provider.transcribe(AudioInput(wav_bytes=make_wav())))
+
+
+# =========================================================================== #
+# REMEDIATION - empty recognition is never a 200
+# =========================================================================== #
+
+
+def test_empty_provider_transcript_never_returns_200(env) -> None:
+    env.primary.text = ""      # VAD/STT answered with nothing (realistic silence)
+    env.fallback.text = "   "  # whitespace is equally empty
+    response = post_transcribe(env)
+    assert response.status_code == 422
+    assert "no_speech_detected" in response.json()["detail"]
+    assert "transcript" not in response.json()   # nothing fabricated
+
+
+def test_empty_primary_recognition_falls_back_once_to_nonempty(env) -> None:
+    env.primary.text = ""
+    response = post_transcribe(env)              # fallback has real text
+    assert response.status_code == 200
+    payload = response.json()["transcript"]
+    assert payload["provider"] == "whisper.cpp"
+    assert payload["text"] == "Fallback transcript"

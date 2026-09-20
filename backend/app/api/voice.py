@@ -29,6 +29,7 @@ from ..voice.audio import (
     is_supported_mime,
 )
 from ..voice.stt_base import (
+    NoSpeechDetectedError,
     ProviderUnavailableError,
     SttError,
     TranscriptionTimeoutError,
@@ -104,6 +105,10 @@ async def transcribe(
         transcript = await _service(request).transcribe(normalized, language_hint=language)
     except TranscriptionTimeoutError as exc:
         raise HTTPException(status_code=504, detail=f"{exc.code}: {exc.message}") from None
+    except NoSpeechDetectedError as exc:
+        # Input-quality outcome after allowed fallbacks: an empty recognition
+        # is NOT a 200 with an empty transcript.
+        raise HTTPException(status_code=422, detail=f"{exc.code}: {exc.message}") from None
     except (ProviderUnavailableError, SttError) as exc:
         # Fixed sanitized messages only - no provider output or local paths.
         raise HTTPException(status_code=503, detail=f"{exc.code}: {exc.message}") from None

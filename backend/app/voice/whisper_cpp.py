@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -62,17 +63,32 @@ class WhisperCppProvider:
         self._model_path = (model_path or "").strip()
         self._timeout = timeout_seconds
         self._runner = runner or _default_runner
+        # Injected fake runners own their own executable resolution, so real
+        # PATH/filesystem discovery is only enforced for the real runner.
+        self._uses_default_runner = runner is None
 
     @property
     def name(self) -> str:
         return PROVIDER_NAME
 
+    def _binary_present(self) -> bool:
+        """Executable availability for the REAL runner: an explicit path must
+        be a file; a bare command name is resolved via shutil.which(). Fake
+        runners bypass discovery (deterministic tests)."""
+        if not self._binary:
+            return False
+        if not self._uses_default_runner:
+            return True
+        if "/" in self._binary or "\\" in self._binary or Path(self._binary).is_absolute():
+            return Path(self._binary).is_file()
+        return shutil.which(self._binary) is not None
+
     def _configured(self) -> bool:
         if not self._binary or not self._model_path:
             return False
-        # The MODEL file must exist (it is user-prepared); the binary itself is
-        # resolved by the runner at call time (fake runners skip PATH checks).
-        return Path(self._model_path).is_file()
+        # The MODEL file must exist (it is user-prepared) and, for the real
+        # runner, the binary must actually be resolvable.
+        return Path(self._model_path).is_file() and self._binary_present()
 
     def _command(self, wav_path: str, language: str | None) -> list[str]:
         tag = normalize_language_tag(language) or "auto"
@@ -133,6 +149,7 @@ class WhisperCppProvider:
         )
 
     async def health(self) -> ProviderHealth:
+        # Sanitized states only - configured paths are NEVER echoed outward.
         if not self._binary or not self._model_path:
             return ProviderHealth(
                 status=HealthStatus.UNAVAILABLE,
@@ -145,7 +162,13 @@ class WhisperCppProvider:
                 detail="whisper.cpp model file not present",
                 provider=PROVIDER_NAME,
             )
-        return ProviderHealth(status=HealthStatus.OK, provider=PROVIDER_NAME)
+        if not self._binary_present():
+            return ProviderHealth(
+                status=HealthStatus.UNAVAILABLE,
+                detail="whisper.cpp binary not found",
+                provider=PROVIDER_NAME,
+            )
+        return ProviderHealth(status=HealthStatus.READY, provider=PROVIDER_NAME)
 
 
 #: whisper.cpp prints informational lines to stdout before the transcript.
