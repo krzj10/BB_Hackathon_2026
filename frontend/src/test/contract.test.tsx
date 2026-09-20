@@ -26,6 +26,7 @@ import type {
   FocusCompletionSummary,
   Meeting,
   ProposedAction,
+  ActionConfirmResponse,
   ApprovalChallengeResponse,
   ApprovalRequest,
   BriefingRequest,
@@ -570,7 +571,7 @@ describe("Attention queue → detail → stored explanation → close (Rules-of-
 });
 
 describe("Decision Inbox: outcome proposal → HIGH approval → challenge → confirm", () => {
-  it("RECORD ACCEPT produces the HIGH approval UI and explicit confirmation completes the flow", async () => {
+  it("RECORD ACCEPT opens approval WITHOUT fetching a challenge; explicit Confirm fetches it exactly once, then confirms", async () => {
     const client = createMockClient();
     const challengeSpy = vi.spyOn(client, "getApprovalChallenge");
     const confirmSpy = vi.spyOn(client, "confirmAction");
@@ -590,22 +591,27 @@ describe("Decision Inbox: outcome proposal → HIGH approval → challenge → c
     expect(askEva).toBeDisabled();
     expect(askEva.getAttribute("title")).toBe("Preview — assistant integration not connected");
 
-    // RECORD ACCEPT → proposal → approval UI (not immediate success)
+    // RECORD ACCEPT → proposal → approval UI; the raw challenge must NOT be
+    // fetched merely because the approval screen was opened.
     fireEvent.click(screen.getByRole("button", { name: "RECORD ACCEPT" }));
 
     expect(await screen.findByText(/High Risk — Explicit Confirmation Required/i)).toBeInTheDocument();
     expect(screen.getByText(/Confirm \(Approve\)/)).toBeInTheDocument();
-    expect(challengeSpy).toHaveBeenCalledTimes(1);
+    expect(challengeSpy).not.toHaveBeenCalled();
     expect(confirmSpy).not.toHaveBeenCalled();
 
-    // Explicit UI confirmation
+    // Explicit UI confirmation: challenge fetched exactly once, then confirm
     fireEvent.click(screen.getByRole("button", { name: "Confirm (Approve)" }));
 
-    // Canonical result renders truthfully
-    expect(await screen.findByText(/Approved & Executed/i)).toBeInTheDocument();
+    expect(await screen.findByText("Action status: Succeeded.")).toBeInTheDocument();
+    expect(challengeSpy).toHaveBeenCalledTimes(1);
     expect(confirmSpy).toHaveBeenCalledTimes(1);
+    // confirmAction occurs only after the challenge call resolves
+    expect(challengeSpy.mock.invocationCallOrder[0]).toBeLessThan(confirmSpy.mock.invocationCallOrder[0]);
 
-    // Full ApprovalRequest fields used, challenge obtained through the client flow
+    // Full ApprovalRequest fields used; challenge was bound to the stored action
+    const [challengeActionId] = challengeSpy.mock.calls[0];
+    expect(challengeActionId).toBe("act-demo-decision-record-dec-demo-finance-001");
     const [confirmActionId, confirmRequest] = confirmSpy.mock.calls[0] as [string, ApprovalRequest];
     expect(confirmActionId).toBe("act-demo-decision-record-dec-demo-finance-001");
     expect(confirmRequest).toMatchObject({
@@ -615,8 +621,45 @@ describe("Decision Inbox: outcome proposal → HIGH approval → challenge → c
       choice: "approve",
       challenge: "demo-one-time-challenge-0001",
     });
-    const challengeResponse = await client.getApprovalChallenge("act-demo-decision-record-dec-demo-finance-001");
-    expect(confirmRequest.challenge).toBe(challengeResponse.challenge);
+    expect(screen.queryByText(/Approved & Executed/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/approved and executed/i)).not.toBeInTheDocument();
+  });
+
+  it("explicit Reject fetches the challenge exactly once and preserves the REJECT outcome end-to-end", async () => {
+    const client = createMockClient();
+    const challengeSpy = vi.spyOn(client, "getApprovalChallenge");
+    const confirmSpy = vi.spyOn(client, "confirmAction");
+
+    const { default: DecisionsFresh } = await importWithClient<typeof import("../pages/Decisions")>("../pages/Decisions", client);
+    render(<DecisionsFresh />);
+
+    const row = await screen.findByRole("button", { name: /Open Faktura za migracje/i });
+    fireEvent.click(row);
+
+    // RECORD REJECT
+    fireEvent.click(await screen.findByRole("button", { name: "RECORD REJECT" }));
+
+    // Approval UI shows the REJECT proposal; no challenge fetched yet
+    expect(await screen.findByText(/High Risk — Explicit Confirmation Required/i)).toBeInTheDocument();
+    expect(challengeSpy).not.toHaveBeenCalled();
+
+    // Explicit UI confirmation
+    fireEvent.click(screen.getByRole("button", { name: "Confirm (Approve)" }));
+
+    expect(await screen.findByText("Action status: Succeeded.")).toBeInTheDocument();
+    expect(challengeSpy).toHaveBeenCalledTimes(1);
+    expect(confirmSpy).toHaveBeenCalledTimes(1);
+
+    // The stored proposal still carries outcome=reject — never silently ACCEPT
+    const proposal = await client.getAction("act-demo-decision-record-dec-demo-finance-001");
+    expect(proposal.action.arguments).toMatchObject({ outcome: "reject" });
+    const confirmResponse = (await confirmSpy.mock.results[0].value) as ActionConfirmResponse;
+    expect(confirmResponse.action.arguments).toMatchObject({ outcome: "reject" });
+    expect(confirmResponse.result?.data).toMatchObject({ outcome: "reject" });
+    expect(confirmResponse.receipt?.action_id).toBe(confirmResponse.action.id);
+    expect(confirmResponse.receipt?.revision).toBe(1);
+    expect(confirmResponse.receipt?.arguments_digest).toBe(confirmResponse.action.arguments_digest);
+    expect(confirmResponse.receipt?.policy_version).toBe(confirmResponse.action.policy_version);
   });
 
   it("DEFER returns a canonical deferred Decision and never enters the approval flow", async () => {
@@ -664,6 +707,174 @@ describe("Decision Inbox: outcome proposal → HIGH approval → challenge → c
     expect(response.action.risk).toBe("high");
     expect(response.action.requires_approval).toBe(true);
     expect(response.action.voice_approval_allowed).toBe(false);
+  });
+});
+
+describe("Mock approval invariants: binding, replay protection, outcome preservation", () => {
+  const propose = (client: EvaClient, outcome: "accept" | "reject" = "accept") =>
+    client.proposeDecisionOutcome("dec-demo-finance-001", {
+      outcome,
+      session_id: "sess-invariant",
+      request_id: "req-invariant",
+    });
+
+  it("binds the challenge to the exact stored proposed action (id/revision/digest/expiry)", async () => {
+    const client = createMockClient();
+    const { action } = await propose(client, "accept");
+
+    const challenge = await client.getApprovalChallenge(action.id);
+    expect(challenge).toMatchObject({
+      action_id: action.id,
+      revision: action.revision,
+      arguments_digest: action.arguments_digest,
+      expires_at: action.expires_at,
+      challenge: expect.any(String),
+    });
+  });
+
+  it("refuses a challenge for a different or unknown action id", async () => {
+    const client = createMockClient();
+    const { action } = await propose(client);
+
+    await expect(client.getApprovalChallenge("act-some-other-action")).rejects.toThrow(/does not match the stored proposal/);
+    await expect(client.getApprovalChallenge("act-never-proposed")).rejects.toThrow();
+    void action;
+  });
+
+  it("rejects confirmations with wrong action id, revision, digest or challenge", async () => {
+    const client = createMockClient();
+    const { action } = await propose(client, "accept");
+    const challenge = await client.getApprovalChallenge(action.id);
+    const validRequest: ApprovalRequest = {
+      action_id: action.id,
+      revision: action.revision,
+      arguments_digest: action.arguments_digest,
+      choice: "approve",
+      challenge: challenge.challenge,
+    };
+
+    // wrong action id: URL/argument pair disagrees
+    await expect(
+      client.confirmAction("act-other", validRequest)
+    ).rejects.toThrow(/does not match request action_id/);
+    // wrong action id vs stored proposal (URL and request agree on the wrong id)
+    await expect(
+      client.confirmAction("act-other", { ...validRequest, action_id: "act-other" })
+    ).rejects.toThrow(/does not match the stored proposal/);
+    // wrong revision
+    await expect(
+      client.confirmAction(action.id, { ...validRequest, revision: 99 })
+    ).rejects.toThrow(/revision does not match/);
+    // wrong digest
+    await expect(
+      client.confirmAction(action.id, { ...validRequest, arguments_digest: "sha256:wrong" })
+    ).rejects.toThrow(/arguments_digest does not match/);
+    // wrong challenge token
+    await expect(
+      client.confirmAction(action.id, { ...validRequest, challenge: "not-the-issued-token" })
+    ).rejects.toThrow(/Invalid challenge/);
+  });
+
+  it("consumes the challenge once — a replayed confirmation is rejected", async () => {
+    const client = createMockClient();
+    const { action } = await propose(client, "accept");
+    const challenge = await client.getApprovalChallenge(action.id);
+    const request: ApprovalRequest = {
+      action_id: action.id,
+      revision: action.revision,
+      arguments_digest: action.arguments_digest,
+      choice: "approve",
+      challenge: challenge.challenge,
+    };
+
+    await expect(client.confirmAction(action.id, request)).resolves.toBeTruthy();
+    await expect(client.confirmAction(action.id, request)).rejects.toThrow(/already been consumed/);
+
+    // After consumption the action's canonical state has genuinely advanced
+    const after = await client.getAction(action.id);
+    expect(after.action.status).toBe("succeeded");
+  });
+
+  it("RECORD REJECT stays reject through the completed mock flow (API level)", async () => {
+    const client = createMockClient();
+    const { action } = await propose(client, "reject");
+    const challenge = await client.getApprovalChallenge(action.id);
+
+    const response = await client.confirmAction(action.id, {
+      action_id: action.id,
+      revision: action.revision,
+      arguments_digest: action.arguments_digest,
+      choice: "approve",
+      challenge: challenge.challenge,
+    });
+
+    expect(response.action.arguments).toMatchObject({ outcome: "reject" });
+    expect(response.result?.data).toMatchObject({ outcome: "reject" });
+    expect(response.receipt?.action_id).toBe(action.id);
+    expect(response.receipt?.revision).toBe(action.revision);
+    expect(response.receipt?.arguments_digest).toBe(action.arguments_digest);
+    expect(response.receipt?.policy_version).toBe(action.policy_version);
+  });
+
+  it("two mock clients never share Focus or approval mutable state", async () => {
+    const clientA = createMockClient();
+    const clientB = createMockClient();
+
+    // A stops Focus; B is unaffected
+    await clientA.stopFocus();
+    await expect(clientA.getCurrentFocus()).resolves.toMatchObject({ session: null });
+    const bFocus = await clientB.getCurrentFocus();
+    expect(bFocus.session).not.toBeNull();
+    expect(bFocus.session?.id).toBe("focus-demo-001");
+
+    // A proposes an outcome; B has no stored proposal and cannot be challenged
+    const { action } = await propose(clientA, "accept");
+    await expect(clientB.getApprovalChallenge(action.id)).rejects.toThrow(/No pending action proposal/);
+    // ...and B's own proposal flow is independent
+    const { action: actionB } = await propose(clientB, "reject");
+    expect(actionB.id).toBe(action.id);
+    const challengeB = await clientB.getApprovalChallenge(actionB.id);
+    expect(challengeB.challenge).toBeTruthy();
+  });
+});
+
+describe("requires_approval=false never requests a challenge", () => {
+  it("registers the proposal and shows honest pending state without Confirm/Reject or challenge", async () => {
+    const client = createMockClient();
+    const challengeSpy = vi.spyOn(client, "getApprovalChallenge");
+    const noApprovalAction = syntheticAction({
+      id: "act-no-approval-001",
+      risk: "low",
+      requires_approval: false,
+      voice_approval_allowed: false,
+      status: "pending",
+    });
+    const proposeSpy = vi
+      .spyOn(client, "proposeDecisionOutcome")
+      .mockResolvedValue({ action: noApprovalAction });
+    vi.spyOn(client, "getAction").mockResolvedValue({
+      action: { ...noApprovalAction, status: "executing" },
+    });
+
+    const { default: DecisionsFresh } = await importWithClient<typeof import("../pages/Decisions")>("../pages/Decisions", client);
+    render(<DecisionsFresh />);
+
+    const row = await screen.findByRole("button", { name: /Open Faktura za migracje/i });
+    fireEvent.click(row);
+    fireEvent.click(await screen.findByRole("button", { name: "RECORD ACCEPT" }));
+
+    // Honest pending state — no approval controls, no challenge
+    expect(await screen.findByText(/Proposal registered — no approval required/i)).toBeInTheDocument();
+    expect(proposeSpy).toHaveBeenCalledTimes(1);
+    expect(challengeSpy).not.toHaveBeenCalled();
+    expect(screen.queryByRole("button", { name: "Confirm (Approve)" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Reject" })).not.toBeInTheDocument();
+
+    // Canonical action state remains obtainable through getAction
+    fireEvent.click(screen.getByRole("button", { name: "Check action state" }));
+    expect(await screen.findByText(/Latest canonical state:/)).toBeInTheDocument();
+    expect(screen.getByText("Executing…")).toBeInTheDocument();
+    expect(challengeSpy).not.toHaveBeenCalled();
   });
 });
 
@@ -724,6 +935,14 @@ describe("ActionApproval renders per backend fields and never fabricates a chall
     render(<ActionApproval action={syntheticAction({ status: "succeeded" })} />);
     expect(screen.getAllByText("Succeeded").length).toBeGreaterThan(0);
     expect(screen.getByText(/Action completed successfully/i)).toBeInTheDocument();
+  });
+
+  it("never labels a merely approved action as executed", () => {
+    render(<ActionApproval action={syntheticAction({ status: "approved" })} />);
+    expect(screen.getAllByText("Approved").length).toBeGreaterThan(0);
+    expect(screen.queryByText(/executed/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Approved & Executed/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Action completed successfully/i)).not.toBeInTheDocument();
   });
 });
 
@@ -979,6 +1198,7 @@ describe("Voice/preview interaction cannot confirm a HIGH approval", () => {
   it("clicking the Voice Orb repeatedly never calls confirmAction while approval is pending", async () => {
     const client = createMockClient();
     const confirmSpy = vi.spyOn(client, "confirmAction");
+    const challengeSpy = vi.spyOn(client, "getApprovalChallenge");
 
     vi.resetModules();
     vi.doMock("../api/client", async (importOriginal) => {
@@ -1007,6 +1227,8 @@ describe("Voice/preview interaction cannot confirm a HIGH approval", () => {
     fireEvent.click(row);
     fireEvent.click(await screen.findByRole("button", { name: "RECORD ACCEPT" }));
     expect(await screen.findByText(/High Risk — Explicit Confirmation Required/i)).toBeInTheDocument();
+    // Opening the approval screen must not have fetched a challenge
+    expect(challengeSpy).not.toHaveBeenCalled();
 
     // Voice orb preview cycling must not confirm anything
     const orb = screen.getByRole("button", { name: /eva voice orb/i });
@@ -1014,11 +1236,14 @@ describe("Voice/preview interaction cannot confirm a HIGH approval", () => {
       fireEvent.click(orb);
     }
     expect(confirmSpy).not.toHaveBeenCalled();
+    expect(challengeSpy).not.toHaveBeenCalled();
     expect(screen.getByText(/High Risk — Explicit Confirmation Required/i)).toBeInTheDocument();
 
     // Only the explicit UI control confirms
     fireEvent.click(screen.getByRole("button", { name: "Confirm (Approve)" }));
-    expect(await screen.findByText(/Approved & Executed/i)).toBeInTheDocument();
+    expect(await screen.findByText("Action status: Succeeded.")).toBeInTheDocument();
+    expect(challengeSpy).toHaveBeenCalledTimes(1);
     expect(confirmSpy).toHaveBeenCalledTimes(1);
+    expect(challengeSpy.mock.invocationCallOrder[0]).toBeLessThan(confirmSpy.mock.invocationCallOrder[0]);
   });
 });

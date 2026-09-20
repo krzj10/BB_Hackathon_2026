@@ -7,8 +7,8 @@ import type {
   Decision,
   ProposedAction,
   ProposedActionResponse,
+  ActionResponse,
   ActionConfirmResponse,
-  ApprovalChallengeResponse,
   ApprovalRequest,
   DecisionOutcomeProposalRequest,
 } from "../api/types.generated";
@@ -41,11 +41,38 @@ function formatStatus(status: Decision["status"]): { label: string; className: s
   }
 }
 
+/** Truthful canonical ProposedAction status labels — never "executed" for merely approved. */
+function formatActionStatus(status: ProposedAction["status"]): { label: string; className: string } {
+  switch (status) {
+    case "pending":
+      return { label: "Pending", className: "bg-primary/10 text-primary border-primary/30" };
+    case "approved":
+      return { label: "Approved", className: "bg-success/10 text-success border-success/30" };
+    case "executing":
+      return { label: "Executing…", className: "bg-warning/10 text-warning border-warning/30" };
+    case "succeeded":
+      return { label: "Succeeded", className: "bg-success/10 text-success border-success/30" };
+    case "failed":
+      return { label: "Failed", className: "bg-danger/10 text-danger border-danger/30" };
+    case "unknown":
+      return { label: "Unknown", className: "bg-muted text-muted-foreground border-border/60" };
+    case "rejected":
+      return { label: "Rejected", className: "bg-danger/10 text-danger border-danger/30" };
+    case "expired":
+      return { label: "Expired", className: "bg-muted text-muted-foreground border-border/60" };
+    case "superseded":
+      return { label: "Superseded", className: "bg-muted text-muted-foreground border-border/60" };
+    default:
+      return { label: status, className: "bg-muted text-muted-foreground border-border/60" };
+  }
+}
+
 type DecisionDetailState =
   | { phase: "detail"; decision: Decision }
   | { phase: "proposing"; decision: Decision; outcome: "accept" | "reject" }
-  | { phase: "approval"; decision: Decision; proposedAction: ProposedAction; challenge: ApprovalChallengeResponse; loadingChallenge: boolean }
-  | { phase: "confirming"; decision: Decision; proposedAction: ProposedAction; challenge: ApprovalChallengeResponse; choice: "approve" | "reject"; loading: boolean }
+  | { phase: "approval"; decision: Decision; proposedAction: ProposedAction }
+  | { phase: "proposal-registered"; decision: Decision; proposedAction: ProposedAction }
+  | { phase: "confirming"; decision: Decision; proposedAction: ProposedAction; choice: "approve" | "reject" }
   | { phase: "result"; decision: Decision; confirmResponse: ActionConfirmResponse };
 
 interface DecisionDetailContainerProps {
@@ -57,6 +84,7 @@ interface DecisionDetailContainerProps {
 function DecisionDetailContainer({ decision, onClose, setReloadKey }: DecisionDetailContainerProps) {
   const client = getEvaClient();
   const [state, setState] = React.useState<DecisionDetailState>({ phase: "detail", decision });
+  const [checkedAction, setCheckedAction] = React.useState<ProposedAction | null>(null);
 
   const handleRecordOutcome = async (outcome: "accept" | "reject") => {
     setState({ phase: "proposing", decision, outcome });
@@ -69,8 +97,13 @@ function DecisionDetailContainer({ decision, onClose, setReloadKey }: DecisionDe
       const response: ProposedActionResponse = await client.proposeDecisionOutcome(decision.id, request);
       const proposedAction = response.action;
 
-      const challenge = await client.getApprovalChallenge(proposedAction.id);
-      setState({ phase: "approval", decision, proposedAction, challenge, loadingChallenge: false });
+      // The backend field is authoritative — never inferred from risk.
+      // The challenge is NOT fetched here; only after an explicit UI choice.
+      if (proposedAction.requires_approval) {
+        setState({ phase: "approval", decision, proposedAction });
+      } else {
+        setState({ phase: "proposal-registered", decision, proposedAction });
+      }
     } catch (error) {
       console.error("Failed to propose decision outcome:", error);
       setState({ phase: "detail", decision });
@@ -89,16 +122,27 @@ function DecisionDetailContainer({ decision, onClose, setReloadKey }: DecisionDe
 
   const handleConfirmChoice = async (choice: "approve" | "reject") => {
     if (state.phase !== "approval") return;
-    const { proposedAction, challenge, decision: currentDecision } = state;
-    setState({ phase: "confirming", decision: currentDecision, proposedAction, challenge, choice, loading: true });
+    const { proposedAction, decision: currentDecision } = state;
+    setState({ phase: "confirming", decision: currentDecision, proposedAction, choice });
 
     try {
+      // Challenge is obtained only NOW, after the explicit UI choice, through
+      // the client flow — never manufactured or reused by the UI.
+      const challengeResponse = await client.getApprovalChallenge(proposedAction.id);
+      if (
+        challengeResponse.action_id !== proposedAction.id ||
+        challengeResponse.revision !== proposedAction.revision ||
+        challengeResponse.arguments_digest !== proposedAction.arguments_digest
+      ) {
+        throw new Error("Approval challenge binding does not match the proposed action");
+      }
+
       const confirmRequest: ApprovalRequest = {
         action_id: proposedAction.id,
         revision: proposedAction.revision,
         arguments_digest: proposedAction.arguments_digest,
         choice,
-        challenge: challenge.challenge,
+        challenge: challengeResponse.challenge,
       };
 
       const confirmResponse: ActionConfirmResponse = await client.confirmAction(proposedAction.id, confirmRequest);
@@ -106,6 +150,15 @@ function DecisionDetailContainer({ decision, onClose, setReloadKey }: DecisionDe
     } catch (error) {
       console.error("Failed to confirm action:", error);
       setState({ phase: "detail", decision: currentDecision });
+    }
+  };
+
+  const handleCheckActionState = async (actionId: string) => {
+    try {
+      const response: ActionResponse = await client.getAction(actionId);
+      setCheckedAction(response.action);
+    } catch (error) {
+      console.error("Failed to read action state:", error);
     }
   };
 
@@ -331,46 +384,97 @@ function DecisionDetailContainer({ decision, onClose, setReloadKey }: DecisionDe
               </CardTitle>
             </CardHeader>
             <CardContent>
-              <p className="text-[13px] text-muted-foreground">Submitting approval confirmation…</p>
+              <p className="text-[13px] text-muted-foreground">
+                Obtaining the one-time challenge and submitting the confirmation…
+              </p>
             </CardContent>
           </Card>
         )}
 
-        {state.phase === "result" && (
-          <Card className={state.confirmResponse.action.status === "approved" ? "border-success/30 bg-success/5 dark:bg-success/10" : "border-danger/30 bg-danger/5 dark:bg-danger/10"}>
-            <CardHeader>
-              <CardTitle className="text-[13px] flex items-center gap-2">
-                <span>{state.confirmResponse.action.status === "approved" ? "✅" : "🚫"}</span>
-                {state.confirmResponse.action.status === "approved" ? "Approved & Executed" : "Rejected"}
-              </CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-2">
-              <p className={`text-[13px] font-medium ${state.confirmResponse.action.status === "approved" ? "text-success" : "text-danger"}`}>
-                Action {state.confirmResponse.action.status === "approved" ? "approved and executed" : "rejected"}.
-              </p>
-              {state.confirmResponse.receipt && (
-                <p className="text-[12px] text-muted-foreground">
-                  Approval receipt: {state.confirmResponse.receipt.id} via {state.confirmResponse.receipt.channel} at {formatTimeInWarsaw(state.confirmResponse.receipt.approved_at)}
+        {state.phase === "result" && (() => {
+          const actionStatus = formatActionStatus(state.confirmResponse.action.status);
+          const isSuccess = state.confirmResponse.action.status === "succeeded";
+          const isApproved = state.confirmResponse.action.status === "approved";
+          const isFailed = state.confirmResponse.action.status === "failed" || state.confirmResponse.action.status === "rejected";
+          const cardClass = isSuccess || isApproved
+            ? "border-success/30 bg-success/5 dark:bg-success/10"
+            : isFailed
+              ? "border-danger/30 bg-danger/5 dark:bg-danger/10"
+              : "border-muted bg-muted/30";
+          return (
+            <Card className={cardClass}>
+              <CardHeader>
+                <CardTitle className="text-[13px] flex items-center gap-2">
+                  <span>{isSuccess ? "✅" : isFailed || state.confirmResponse.action.status === "rejected" ? "🚫" : "ℹ️"}</span>
+                  {actionStatus.label}
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-2">
+                <p className={`text-[13px] font-medium ${isSuccess ? "text-success" : isFailed || state.confirmResponse.action.status === "rejected" ? "text-danger" : "text-muted-foreground"}`}>
+                  Action status: {actionStatus.label}.
                 </p>
-              )}
-              {state.confirmResponse.result && (
-                <details className="mt-2">
-                  <summary className="cursor-pointer text-[12.5px] text-primary">Tool result details</summary>
-                  <pre className="mt-2 text-[11px] text-muted-foreground bg-muted p-2 rounded border border-border/60 overflow-auto max-h-32">
-                    {JSON.stringify(state.confirmResponse.result, null, 2)}
-                  </pre>
-                </details>
-              )}
-              <button
-                type="button"
-                onClick={onClose}
-                className="mt-3 rounded-control border border-border-strong px-4 py-2 text-[13.5px] font-medium text-foreground transition-colors hover:bg-accent"
-              >
-                Close
-              </button>
-            </CardContent>
-          </Card>
-        )}
+                {state.confirmResponse.receipt && (
+                  <p className="text-[12px] text-muted-foreground">
+                    Approval receipt: {state.confirmResponse.receipt.id} via {state.confirmResponse.receipt.channel} at {formatTimeInWarsaw(state.confirmResponse.receipt.approved_at)}
+                  </p>
+                )}
+                {state.confirmResponse.result && (
+                  <details className="mt-2">
+                    <summary className="cursor-pointer text-[12.5px] text-primary">Tool result details</summary>
+                    <pre className="mt-2 text-[11px] text-muted-foreground bg-muted p-2 rounded border border-border/60 overflow-auto max-h-32">
+                      {JSON.stringify(state.confirmResponse.result, null, 2)}
+                    </pre>
+                  </details>
+                )}
+                <button
+                  type="button"
+                  onClick={onClose}
+                  className="mt-3 rounded-control border border-border-strong px-4 py-2 text-[13.5px] font-medium text-foreground transition-colors hover:bg-accent"
+                >
+                  Close
+                </button>
+              </CardContent>
+            </Card>
+          );
+        })()}
+
+        {state.phase === "proposal-registered" && (() => {
+          const actionStatus = formatActionStatus(state.proposedAction.status);
+          return (
+            <Card className="border-primary/30">
+              <CardHeader>
+                <CardTitle className="text-[13px] flex items-center gap-2">
+                  <span className="text-muted-foreground">📝</span>
+                  Proposal registered — no approval required
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-3">
+                <p className="text-[13px] leading-relaxed">{state.proposedAction.summary}</p>
+                <p className="text-[13px] text-muted-foreground">
+                  This proposal does not require explicit approval. Current canonical status:{" "}
+                  <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium ${actionStatus.className}`}>
+                    {actionStatus.label}
+                  </span>
+                </p>
+                {checkedAction && checkedAction.id === state.proposedAction.id && (
+                  <p className="text-[12.5px] text-muted-foreground">
+                    Latest canonical state:{" "}
+                    <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium ${formatActionStatus(checkedAction.status).className}`}>
+                      {formatActionStatus(checkedAction.status).label}
+                    </span>
+                  </p>
+                )}
+                <button
+                  type="button"
+                  onClick={() => handleCheckActionState(state.proposedAction.id)}
+                  className="rounded-control border border-border-strong px-4 py-2 text-[13.5px] font-medium text-foreground transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  Check action state
+                </button>
+              </CardContent>
+            </Card>
+          );
+        })()}
 
         {decision.status === "resolved" && decision.outcome && state.phase === "detail" && (
           <Card className="border-success/30 bg-success/5 dark:bg-success/10">

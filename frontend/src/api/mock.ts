@@ -18,12 +18,14 @@ import type {
   ActionConfirmResponse,
   ToolResult,
   BriefingRequest,
+  BriefingResponse,
   FocusStartRequest,
   FocusStopRequest,
   DecisionOutcomeProposalRequest,
   DeferDecisionRequest,
   ApprovalRequest,
   ApprovalChallengeResponse,
+  DecisionOutcome,
 } from "./types.generated";
 import acmeFixture from "../../../contracts/fixtures/meeting_acme_high.json";
 import teamSyncFixture from "../../../contracts/fixtures/meeting_team_sync_medium.json";
@@ -100,16 +102,27 @@ const partialBriefing: ExecutiveBriefing = {
   retrieval_notes: ["Korespondencja ograniczona do ostatnich 30 dni; watki starsze nieodpytane."],
 };
 
-// Build canonical attention explanation from the fixture's own reasons and delivery_reasons.
-// policy_version is derived from fixture Reason data, never fabricated separately.
+// Canonical attention explanation built strictly from the fixture's own stored
+// data. policy_version is derived from canonical fixture Reason data; a fixture
+// without a usable policy version is a contract drift and fails loudly instead
+// of silently substituting a fabricated value.
+const canonicalExplanationPolicyVersion: string = (() => {
+  const derived =
+    financeAttention.reasons?.find((r) => r.policy_version)?.policy_version ??
+    financeAttention.delivery_reasons?.find((r) => r.policy_version)?.policy_version;
+  if (!derived) {
+    throw new Error(
+      "canonical attention fixture contains no usable policy_version; refusing to fabricate one"
+    );
+  }
+  return derived;
+})();
+
 const attentionExplanation: AttentionExplanationResponse = {
   item_id: financeAttention.id,
   priority_reasons: financeAttention.reasons ?? [],
   delivery_reasons: financeAttention.delivery_reasons ?? [],
-  policy_version:
-    financeAttention.reasons?.[0]?.policy_version ??
-    financeAttention.delivery_reasons?.[0]?.policy_version ??
-    "policy-v1",
+  policy_version: canonicalExplanationPolicyVersion,
   sources: financeAttention.sources ?? [],
 };
 
@@ -119,42 +132,6 @@ const decisionDetail: DecisionResponse = {
 
 const decisionDetailResolved: DecisionResponse = {
   decision: financeDecisionResolved,
-};
-
-// Mock ProposedAction for decision.record_outcome (HIGH risk, requires approval)
-const decisionRecordOutcomeProposedAction: ProposedAction = {
-  id: "act-demo-decision-record-001",
-  session_id: "sess-demo-001",
-  request_id: "req-demo-001",
-  revision: 1,
-  tool: "decision.record_outcome",
-  arguments: {
-    tool: "decision.record_outcome",
-    decision_id: financeDecision.id,
-    outcome: "accept",
-  },
-  arguments_digest: "sha256:demo-digest-decision-record-0001",
-  summary: "Record ACCEPT outcome for financial decision: Faktura za migracje - 12 400 PLN",
-  reason: "User recorded ACCEPT outcome for financial decision",
-  impact: "Local decision record only. No payment, purchase, supplier commitment, or external instruction is sent.",
-  before: { outcome: null, status: "needs_review" },
-  after: { outcome: "accept", status: "resolved" },
-  resource_version: "1",
-  policy_version: "policy-v1",
-  risk: "high",
-  requires_approval: true,
-  voice_approval_allowed: false,
-  created_at: "2026-09-21T13:45:00+02:00",
-  expires_at: "2026-09-21T13:50:00+02:00",
-  status: "pending",
-};
-
-const approvalChallenge: ApprovalChallengeResponse = {
-  action_id: decisionRecordOutcomeProposedAction.id,
-  revision: decisionRecordOutcomeProposedAction.revision,
-  arguments_digest: decisionRecordOutcomeProposedAction.arguments_digest,
-  challenge: "demo-one-time-challenge-0001",
-  expires_at: decisionRecordOutcomeProposedAction.expires_at,
 };
 
 const actionPendingResponse: ActionResponse = {
@@ -194,9 +171,6 @@ export interface MockClientOptions {
   mode?: MockMode;
 }
 
-// In-memory mock state for Focus lifecycle
-let mockFocusState: FocusSession | null = activeFocusSession;
-
 function respond<T>(mode: MockMode, fixtures: T, empty: T): Promise<T> {
   switch (mode) {
     case "pending":
@@ -226,21 +200,48 @@ function respondByMode<T>(mode: MockMode, cases: Partial<Record<MockMode, T>>, f
   return Promise.resolve(pickCase(mode, cases, fallback));
 }
 
+/** Stateful mock operations: deterministic single value, or error/pending behavior. */
+function statefulRespond<T>(mode: MockMode, value: T): Promise<T> {
+  if (mode === "pending") {
+    return new Promise<T>(() => {});
+  }
+  if (mode === "error") {
+    return Promise.reject(new Error("Simulated transport failure (mock error mode)"));
+  }
+  return Promise.resolve(value);
+}
+
 export function createMockClient(options: MockClientOptions = {}): EvaClient {
   const mode = options.mode ?? "fixtures";
 
-  // Reset mock Focus state for each new client
-  mockFocusState = activeFocusSession;
+  // ---- Client-local mutable mock state -------------------------------------
+  // Everything below lives inside this closure: two independently created
+  // mock clients never share or reset each other's Focus/approval state.
+  let focusState: FocusSession | null = activeFocusSession;
+
+  // Approval state: the current pending proposal, the one-time challenge
+  // issued for it, and whether that challenge has already been consumed.
+  let storedProposal: ProposedAction | null = null;
+  let issuedChallenge: ApprovalChallengeResponse | null = null;
+  let challengeConsumed = false;
 
   return {
     getTodayCalendar: () => respond(mode, fixtureToday, emptyToday),
     getAttention: () => respond(mode, fixtureAttention, emptyAttention),
     getDecisions: () => respond(mode, fixtureDecisions, emptyDecisions),
-    getCurrentFocus: () => respond(mode, { session: mockFocusState }, emptyFocus),
+    getCurrentFocus: () => respond(mode, { session: focusState }, emptyFocus),
 
-    getBriefing: (request: BriefingRequest) =>
-      respondByMode(mode, {
-        fixtures: { briefing: { ...briefing, meeting: { ...briefing.meeting, ref: request.meeting_ref } } },
+    getBriefing: (request: BriefingRequest) => {
+      // Preserve both the requested meeting_ref and language in the response.
+      const fixtureResponse: BriefingResponse = {
+        briefing: {
+          ...briefing,
+          meeting: { ...briefing.meeting, ref: request.meeting_ref },
+          language: request.language,
+        },
+      };
+      return respondByMode(mode, {
+        fixtures: fixtureResponse,
         empty: { briefing: { ...briefing, previous_interactions: [], open_topics: [], previous_decisions: [], risks: [], suggestions: [], sources: [], spoken_summary: "" } },
         "partial-evidence": { briefing: partialBriefing },
         "focus-active": { briefing: briefing },
@@ -249,12 +250,13 @@ export function createMockClient(options: MockClientOptions = {}): EvaClient {
         "action-high-confirmation": { briefing: briefing },
         "action-unknown": { briefing: briefing },
         "decision-resolved": { briefing: briefing },
-      }, { briefing: briefing }),
+      }, { briefing: briefing });
+    },
 
     getAttentionExplanation: (attentionId: string) =>
       respondByMode(mode, {
         fixtures: { ...attentionExplanation, item_id: attentionId },
-        empty: { item_id: attentionId, priority_reasons: [], delivery_reasons: [], policy_version: "policy-v1", sources: [] },
+        empty: { item_id: attentionId, priority_reasons: [], delivery_reasons: [], policy_version: "policy-empty-preview (synthetic)", sources: [] },
         "focus-active": { ...attentionExplanation, item_id: attentionId },
         "focus-completed": { ...attentionExplanation, item_id: attentionId },
         "action-pending": { ...attentionExplanation, item_id: attentionId },
@@ -265,7 +267,7 @@ export function createMockClient(options: MockClientOptions = {}): EvaClient {
       }, { ...attentionExplanation, item_id: attentionId }),
 
     startFocus: (request: FocusStartRequest) => {
-      mockFocusState = {
+      focusState = {
         id: "focus-demo-001",
         starts_at: new Date().toISOString(),
         ends_at: new Date(Date.now() + request.duration_minutes * 60 * 1000).toISOString(),
@@ -274,7 +276,7 @@ export function createMockClient(options: MockClientOptions = {}): EvaClient {
         policy_version: "policy-v1",
         stopped_at: null,
       };
-      const sessionResponse: FocusSessionResponse = { session: mockFocusState };
+      const sessionResponse: FocusSessionResponse = { session: focusState };
       return respondByMode(mode, {
         fixtures: sessionResponse,
         empty: { session: { id: "", starts_at: "", ends_at: "", threshold: "medium", policy_version: "", stopped_at: null } },
@@ -289,14 +291,14 @@ export function createMockClient(options: MockClientOptions = {}): EvaClient {
     },
 
     stopFocus: (_request?: FocusStopRequest) => {
-      if (!mockFocusState) {
+      if (!focusState) {
         return Promise.reject(new Error("No active Focus session to stop"));
       }
       const stoppedSession: FocusSession = {
-        ...mockFocusState,
+        ...focusState,
         stopped_at: new Date().toISOString(),
       };
-      mockFocusState = null;
+      focusState = null;
       return respondByMode(mode, {
         fixtures: { session: stoppedSession, summary: focusCompletionSummary },
         empty: { session: { ...activeFocusSession, stopped_at: "2026-09-21T13:30:00+02:00" }, summary: focusCompletionSummary },
@@ -337,7 +339,6 @@ export function createMockClient(options: MockClientOptions = {}): EvaClient {
       }, decisionDetail),
 
     proposeDecisionOutcome: (decisionId: string, request: DecisionOutcomeProposalRequest) => {
-      // Build a ProposedAction for decision.record_outcome based on the request
       const outcomeProposedAction: ProposedAction = {
         id: `act-demo-decision-record-${decisionId}`,
         session_id: request.session_id,
@@ -365,17 +366,13 @@ export function createMockClient(options: MockClientOptions = {}): EvaClient {
         status: "pending",
       };
 
-      return respondByMode(mode, {
-        fixtures: { action: outcomeProposedAction },
-        empty: { action: outcomeProposedAction },
-        "focus-active": { action: outcomeProposedAction },
-        "focus-completed": { action: outcomeProposedAction },
-        "action-pending": { action: outcomeProposedAction },
-        "action-high-confirmation": { action: outcomeProposedAction },
-        "action-unknown": { action: outcomeProposedAction },
-        "decision-resolved": { action: outcomeProposedAction },
-        "partial-evidence": { action: outcomeProposedAction },
-      }, { action: outcomeProposedAction });
+      // Store the exact proposed action; any previously issued challenge is
+      // invalidated because it was bound to a different proposal.
+      storedProposal = outcomeProposedAction;
+      issuedChallenge = null;
+      challengeConsumed = false;
+
+      return statefulRespond(mode, { action: outcomeProposedAction });
     },
 
     deferDecision: (_decisionId: string, _request?: DeferDecisionRequest) => {
@@ -399,8 +396,12 @@ export function createMockClient(options: MockClientOptions = {}): EvaClient {
       }, { decision: deferredDecision });
     },
 
-    getAction: (_actionId: string) =>
-      respondByMode(mode, {
+    getAction: (actionId: string) => {
+      // The canonical stored action state is authoritative for its own id.
+      if (storedProposal && actionId === storedProposal.id) {
+        return statefulRespond(mode, { action: storedProposal } as ActionResponse);
+      }
+      return respondByMode(mode, {
         fixtures: actionPendingResponse,
         empty: actionPendingResponse,
         "focus-active": actionPendingResponse,
@@ -410,81 +411,127 @@ export function createMockClient(options: MockClientOptions = {}): EvaClient {
         "action-unknown": actionUnknownResponse,
         "decision-resolved": actionSucceededResponse,
         "partial-evidence": actionPendingResponse,
-      }, actionPendingResponse),
+      }, actionPendingResponse);
+    },
 
-    getApprovalChallenge: (_actionId: string) =>
-      respondByMode(mode, {
-        fixtures: approvalChallenge,
-        empty: { action_id: "", revision: 0, arguments_digest: "", challenge: "", expires_at: "" },
-        "focus-active": approvalChallenge,
-        "focus-completed": approvalChallenge,
-        "action-pending": approvalChallenge,
-        "action-high-confirmation": approvalChallenge,
-        "action-unknown": approvalChallenge,
-        "decision-resolved": approvalChallenge,
-        "partial-evidence": approvalChallenge,
-      }, approvalChallenge),
+    getApprovalChallenge: (actionId: string) => {
+      if (mode === "pending") {
+        return new Promise<ApprovalChallengeResponse>(() => {});
+      }
+      if (mode === "error") {
+        return Promise.reject(new Error("Simulated transport failure (mock error mode)"));
+      }
+      if (!storedProposal) {
+        return Promise.reject(new Error("No pending action proposal exists to challenge"));
+      }
+      if (actionId !== storedProposal.id) {
+        return Promise.reject(
+          new Error(`Challenge requested for action "${actionId}" does not match the stored proposal "${storedProposal.id}"`)
+        );
+      }
+      if (storedProposal.status !== "pending") {
+        return Promise.reject(new Error(`Action is not pending (status: ${storedProposal.status}); no challenge issued`));
+      }
+      // Issue a fresh one-time demo challenge bound to the STORED action
+      // binding (id/revision/digest/expiry) — never to request data.
+      issuedChallenge = {
+        action_id: storedProposal.id,
+        revision: storedProposal.revision,
+        arguments_digest: storedProposal.arguments_digest,
+        challenge: "demo-one-time-challenge-0001",
+        expires_at: storedProposal.expires_at,
+      };
+      challengeConsumed = false;
+      return Promise.resolve(issuedChallenge);
+    },
 
-    confirmAction: (_actionId: string, request: ApprovalRequest) => {
-      // Verify the challenge matches
-      if (request.challenge !== approvalChallenge.challenge) {
+    confirmAction: (actionId: string, request: ApprovalRequest) => {
+      if (mode === "pending") {
+        return new Promise<ActionConfirmResponse>(() => {});
+      }
+      if (mode === "error") {
+        return Promise.reject(new Error("Simulated transport failure (mock error mode)"));
+      }
+      // URL/action argument binding
+      if (actionId !== request.action_id) {
+        return Promise.reject(new Error("Confirm URL action id does not match request action_id"));
+      }
+      if (!storedProposal) {
+        return Promise.reject(new Error("No stored action proposal exists"));
+      }
+      // Request must match the stored proposal binding exactly
+      if (request.action_id !== storedProposal.id) {
+        return Promise.reject(new Error("Request action_id does not match the stored proposal"));
+      }
+      if (request.revision !== storedProposal.revision) {
+        return Promise.reject(new Error("Request revision does not match the stored proposal"));
+      }
+      if (request.arguments_digest !== storedProposal.arguments_digest) {
+        return Promise.reject(new Error("Request arguments_digest does not match the stored proposal"));
+      }
+      // Challenge must be the currently issued one, bound to the same
+      // action/revision/digest, and not already consumed.
+      if (!issuedChallenge) {
+        return Promise.reject(new Error("No challenge has been issued for this action"));
+      }
+      if (
+        issuedChallenge.action_id !== request.action_id ||
+        issuedChallenge.revision !== request.revision ||
+        issuedChallenge.arguments_digest !== request.arguments_digest
+      ) {
+        return Promise.reject(new Error("Issued challenge is bound to a different action binding"));
+      }
+      if (request.challenge !== issuedChallenge.challenge) {
         return Promise.reject(new Error("Invalid challenge"));
       }
-      if (request.choice === "approve") {
-        const approvedAction: ProposedAction = {
-          ...decisionRecordOutcomeProposedAction,
-          status: "approved",
-        };
-        const approveResult: ActionConfirmResponse = {
-          action: approvedAction,
-          receipt: {
-            id: "rcpt-demo-decision-record-001",
-            action_id: decisionRecordOutcomeProposedAction.id,
-            revision: decisionRecordOutcomeProposedAction.revision,
-            arguments_digest: decisionRecordOutcomeProposedAction.arguments_digest,
-            channel: "ui",
-            approved_at: "2026-09-21T13:46:00+02:00",
-            policy_version: "policy-v1",
-          },
-          result: {
-            call_id: "call-demo-decision-record-001",
-            tool: "decision.record_outcome",
-            status: "ok",
-            data: { decision_id: financeDecision.id, outcome: "accept", recorded_at: "2026-09-21T13:46:00+02:00" },
-            error: null,
-            sources: [],
-            action_id: decisionRecordOutcomeProposedAction.id,
-            duration_ms: 120,
-          },
-        };
-        return respondByMode(mode, {
-          fixtures: approveResult,
-          empty: approveResult,
-          "focus-active": approveResult,
-          "focus-completed": approveResult,
-          "action-pending": approveResult,
-          "action-high-confirmation": approveResult,
-          "action-unknown": approveResult,
-          "decision-resolved": approveResult,
-          "partial-evidence": approveResult,
-        }, approveResult);
-      } else {
-        const rejectedAction: ProposedAction = {
-          ...decisionRecordOutcomeProposedAction,
-          status: "rejected",
-        };
-        return respondByMode(mode, {
-          fixtures: { action: rejectedAction, receipt: null, result: null },
-          empty: { action: rejectedAction, receipt: null, result: null },
-          "focus-active": { action: rejectedAction, receipt: null, result: null },
-          "focus-completed": { action: rejectedAction, receipt: null, result: null },
-          "action-pending": { action: rejectedAction, receipt: null, result: null },
-          "action-high-confirmation": { action: rejectedAction, receipt: null, result: null },
-          "action-unknown": { action: rejectedAction, receipt: null, result: null },
-          "decision-resolved": { action: rejectedAction, receipt: null, result: null },
-          "partial-evidence": { action: rejectedAction, receipt: null, result: null },
-        }, { action: rejectedAction, receipt: null, result: null });
+      if (challengeConsumed) {
+        return Promise.reject(new Error("Challenge has already been consumed"));
       }
+
+      // Consume the one-time challenge.
+      challengeConsumed = true;
+
+      if (request.choice === "reject") {
+        const rejectedAction: ProposedAction = { ...storedProposal, status: "rejected" };
+        storedProposal = rejectedAction;
+        return Promise.resolve({ action: rejectedAction, receipt: null, result: null });
+      }
+
+      // Simulated complete local executor flow for decision.record_outcome:
+      // the local write succeeds, so the canonical status genuinely advances
+      // to "succeeded" together with the ToolResult (never "approved" while
+      // claiming execution).
+      const recordedOutcome: DecisionOutcome = (storedProposal.arguments as { outcome?: DecisionOutcome }).outcome ?? "accept";
+      const recordedAt = new Date().toISOString();
+      const succeededAction: ProposedAction = { ...storedProposal, status: "succeeded" };
+      const confirmResponse: ActionConfirmResponse = {
+        action: succeededAction,
+        receipt: {
+          id: `rcpt-demo-${storedProposal.id}`,
+          action_id: storedProposal.id,
+          revision: storedProposal.revision,
+          arguments_digest: storedProposal.arguments_digest,
+          channel: "ui",
+          approved_at: recordedAt,
+          policy_version: storedProposal.policy_version,
+        },
+        result: {
+          call_id: `call-demo-${storedProposal.id}`,
+          tool: storedProposal.tool,
+          status: "ok",
+          data: {
+            decision_id: (storedProposal.arguments as { decision_id?: string }).decision_id ?? null,
+            outcome: recordedOutcome,
+            recorded_at: recordedAt,
+          },
+          error: null,
+          sources: [],
+          action_id: storedProposal.id,
+          duration_ms: 120,
+        },
+      };
+      storedProposal = succeededAction;
+      return Promise.resolve(confirmResponse);
     },
   };
 }
