@@ -37,6 +37,9 @@ describe("Settings screen", () => {
     render(<Settings />);
 
     expect(await screen.findByText("openai_compatible")).toBeInTheDocument();
+    // Form hydration happens in an effect after the data render — await the
+    // hydrated values so the assertion is deterministic under any scheduler.
+    await screen.findByDisplayValue("https://demo-host.tailnet.example:8321/v1");
     expect(screen.getByLabelText("Base URL")).toHaveValue("https://demo-host.tailnet.example:8321/v1");
     expect(screen.getByLabelText("Model ID")).toHaveValue("demo-served-model-id");
     expect(screen.getByText("Configured")).toBeInTheDocument();
@@ -110,7 +113,7 @@ describe("Settings save (PUT /api/settings/llm)", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     const client = createRestClient();
-    // No api_key field at all â€” blank inputs must be omitted, never sent as ""
+    // No api_key field at all — blank inputs must be omitted, never sent as ""
     const response = await client.updateLlmSettings({ model: "new-model-id" });
 
     const [url, init] = fetchMock.mock.calls[0];
@@ -233,13 +236,26 @@ describe("Settings detect models (POST /api/settings/llm/detect)", () => {
     expect(screen.getByLabelText("Model ID")).toHaveValue("demo-fast-model-id");
   });
 
-  it("disables Detect Models while the form is dirty and explains why", async () => {
+  it("disables Detect Models AND Test Connection while the form is dirty and explains why", async () => {
     render(<Settings />);
     await screen.findByText("openai_compatible");
 
+    // Clean form → both enabled
+    expect(screen.getByRole("button", { name: "Detect models" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Test connection" })).toBeEnabled();
+
+    // Edit → both disabled, explanatory saved-settings message visible
     fireEvent.change(screen.getByLabelText("Model ID"), { target: { value: "unsaved-model" } });
     expect(screen.getByRole("button", { name: "Detect models" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Test connection" })).toBeDisabled();
     expect(screen.getByText("Detect/test use saved settings — save first.")).toBeInTheDocument();
+
+    // Successful save → form clean again → both re-enabled
+    fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
+    await screen.findByText("Saved");
+    expect(screen.getByRole("button", { name: "Detect models" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Test connection" })).toBeEnabled();
+    expect(screen.queryByText("Detect/test use saved settings — save first.")).not.toBeInTheDocument();
   });
 
   it("detect failure remains failure", async () => {
@@ -381,7 +397,7 @@ describe("Settings cloud status", () => {
     // Both cloud flags render as read-only status
     expect(screen.getAllByText("Disabled", { exact: false }).length).toBe(2);
     expect(screen.getByText(/backend-managed in the current MVP/)).toBeInTheDocument();
-    // No editable cloud controls exist â€” the update contract does not expose them
+    // No editable cloud controls exist — the update contract does not expose them
     expect(screen.queryByRole("checkbox")).not.toBeInTheDocument();
     expect(screen.queryByRole("switch")).not.toBeInTheDocument();
   });
@@ -459,3 +475,182 @@ describe("Settings mock transport", () => {
   });
 });
 
+
+describe("Settings state remediation (reviewed slice hardening)", () => {
+  it("clearing a configured Base URL saves base_url: null, never an empty string", async () => {
+    const client = createMockClient();
+    const updateSpy = vi.spyOn(client, "updateLlmSettings");
+    vi.resetModules();
+    vi.doMock("../api/client", async (importOriginal) => {
+      const actual = await importOriginal<typeof import("../api/client")>();
+      return { ...actual, getEvaClient: () => client };
+    });
+    const { default: SettingsFresh } = await import("../pages/Settings");
+    render(<SettingsFresh />);
+    await screen.findByText("openai_compatible");
+
+    // Initial configured Base URL exists
+    expect(screen.getByLabelText("Base URL")).toHaveValue("https://demo-host.tailnet.example:8321/v1");
+
+    // User clears the field and saves
+    fireEvent.change(screen.getByLabelText("Base URL"), { target: { value: "" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
+    expect(await screen.findByText("Saved")).toBeInTheDocument();
+
+    // PUT request carries base_url: null — never ""
+    expect(updateSpy).toHaveBeenCalledTimes(1);
+    const request = updateSpy.mock.calls[0][0] as LlmSettingsUpdateRequest;
+    expect(request.base_url).toBeNull();
+    expect(request.base_url).not.toBe("");
+
+    // Sanitized mock state reflects the null URL truthfully
+    const settings = await client.getLlmSettings();
+    expect(settings.base_url).toBeNull();
+    expect(settings.configured).toBe(false);
+    vi.doUnmock("../api/client");
+    vi.resetModules();
+  });
+
+  it("Save settings is disabled while the form is clean and enabled once dirty", async () => {
+    render(<Settings />);
+    await screen.findByText("openai_compatible");
+
+    expect(screen.getByRole("button", { name: "Save settings" })).toBeDisabled();
+    fireEvent.change(screen.getByLabelText("Model ID"), { target: { value: "changed-model" } });
+    expect(screen.getByRole("button", { name: "Save settings" })).toBeEnabled();
+  });
+
+  it("detected model list from a previous configuration disappears after saving a change", async () => {
+    const client = createMockClient();
+    vi.resetModules();
+    vi.doMock("../api/client", async (importOriginal) => {
+      const actual = await importOriginal<typeof import("../api/client")>();
+      return { ...actual, getEvaClient: () => client };
+    });
+    const { default: SettingsFresh } = await import("../pages/Settings");
+    render(<SettingsFresh />);
+    await screen.findByText("openai_compatible");
+
+    // Detect models against the saved configuration
+    fireEvent.click(screen.getByRole("button", { name: "Detect models" }));
+    expect(await screen.findByText("demo-served-model-id")).toBeInTheDocument();
+
+    // Change the model and save — the stale list must not survive
+    fireEvent.change(screen.getByLabelText("Model ID"), { target: { value: "brand-new-model" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
+    expect(await screen.findByText("Saved")).toBeInTheDocument();
+    expect(screen.queryByText("demo-served-model-id")).not.toBeInTheDocument();
+    expect(screen.queryByText("demo-fast-model-id")).not.toBeInTheDocument();
+    vi.doUnmock("../api/client");
+    vi.resetModules();
+  });
+
+  it("previous connection-test result disappears after saving a changed configuration", async () => {
+    const client = createMockClient();
+    vi.resetModules();
+    vi.doMock("../api/client", async (importOriginal) => {
+      const actual = await importOriginal<typeof import("../api/client")>();
+      return { ...actual, getEvaClient: () => client };
+    });
+    const { default: SettingsFresh } = await import("../pages/Settings");
+    render(<SettingsFresh />);
+    await screen.findByText("openai_compatible");
+
+    // Test connection against the saved configuration
+    fireEvent.click(screen.getByRole("button", { name: "Test connection" }));
+    expect(await screen.findByText("Ready")).toBeInTheDocument();
+    expect(screen.getByText("42 ms")).toBeInTheDocument();
+
+    // Change the model and save — stale health/latency must not survive
+    fireEvent.change(screen.getByLabelText("Model ID"), { target: { value: "brand-new-model" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
+    expect(await screen.findByText("Saved")).toBeInTheDocument();
+    expect(screen.queryByText("Ready")).not.toBeInTheDocument();
+    expect(screen.queryByText("42 ms")).not.toBeInTheDocument();
+    expect(screen.queryByText(/Last test/)).not.toBeInTheDocument();
+    vi.doUnmock("../api/client");
+    vi.resetModules();
+  });
+
+  it("Saved indicator disappears once the user edits again after a successful save", async () => {
+    render(<Settings />);
+    await screen.findByText("openai_compatible");
+
+    fireEvent.change(screen.getByLabelText("Model ID"), { target: { value: "saved-model" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
+    expect(await screen.findByText("Saved")).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText("Model ID"), { target: { value: "edited-again" } });
+    expect(screen.queryByText("Saved")).not.toBeInTheDocument();
+  });
+
+  it("renders the top-level tested model when health.model is absent (A)", async () => {
+    const client = createMockClient();
+    vi.spyOn(client, "testLlmConnection").mockResolvedValue({
+      health: { status: "ready", provider: "openai_compatible" },
+      model: "actual-server-model-id",
+      latency_ms: 40,
+    });
+    vi.resetModules();
+    vi.doMock("../api/client", async (importOriginal) => {
+      const actual = await importOriginal<typeof import("../api/client")>();
+      return { ...actual, getEvaClient: () => client };
+    });
+    const { default: SettingsFresh } = await import("../pages/Settings");
+    render(<SettingsFresh />);
+    await screen.findByText("openai_compatible");
+
+    fireEvent.click(screen.getByRole("button", { name: "Test connection" }));
+    expect(await screen.findByText("Ready")).toBeInTheDocument();
+    expect(screen.getByText("actual-server-model-id")).toBeInTheDocument();
+    vi.doUnmock("../api/client");
+    vi.resetModules();
+  });
+
+  it("invents no model when neither health.model nor response.model is present (B)", async () => {
+    const client = createMockClient();
+    vi.spyOn(client, "testLlmConnection").mockResolvedValue({
+      health: { status: "unavailable", detail: "connection refused" },
+      latency_ms: null,
+    });
+    vi.resetModules();
+    vi.doMock("../api/client", async (importOriginal) => {
+      const actual = await importOriginal<typeof import("../api/client")>();
+      return { ...actual, getEvaClient: () => client };
+    });
+    const { default: SettingsFresh } = await import("../pages/Settings");
+    render(<SettingsFresh />);
+    await screen.findByText("openai_compatible");
+
+    fireEvent.click(screen.getByRole("button", { name: "Test connection" }));
+    expect(await screen.findByText("Unavailable")).toBeInTheDocument();
+    // No fabricated model ID anywhere in the rendered result
+    expect(screen.queryByText("actual-server-model-id")).not.toBeInTheDocument();
+    expect(screen.queryByText("demo-served-model-id")).not.toBeInTheDocument();
+    vi.doUnmock("../api/client");
+    vi.resetModules();
+  });
+
+  it("renders a duplicated model id only once when both fields agree (C)", async () => {
+    const client = createMockClient();
+    vi.spyOn(client, "testLlmConnection").mockResolvedValue({
+      health: { status: "ready", provider: "openai_compatible", model: "same-model-id" },
+      model: "same-model-id",
+      latency_ms: 40,
+    });
+    vi.resetModules();
+    vi.doMock("../api/client", async (importOriginal) => {
+      const actual = await importOriginal<typeof import("../api/client")>();
+      return { ...actual, getEvaClient: () => client };
+    });
+    const { default: SettingsFresh } = await import("../pages/Settings");
+    render(<SettingsFresh />);
+    await screen.findByText("openai_compatible");
+
+    fireEvent.click(screen.getByRole("button", { name: "Test connection" }));
+    expect(await screen.findByText("Ready")).toBeInTheDocument();
+    expect(screen.getAllByText("same-model-id")).toHaveLength(1);
+    vi.doUnmock("../api/client");
+    vi.resetModules();
+  });
+});

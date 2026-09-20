@@ -33,18 +33,24 @@ function healthBadge(status: HealthStatus): { label: string; className: string }
   }
 }
 
-function HealthLine({ health }: { health: NonNullable<LlmTestConnectionResponse["health"]> }) {
+function HealthLine({
+  health,
+  testedModel,
+}: {
+  health: NonNullable<LlmTestConnectionResponse["health"]>;
+  testedModel?: string | null;
+}) {
   const badge = healthBadge(health.status);
-  const parts: string[] = [badge.label];
-  if (health.model) parts.push(health.model);
-  if (health.detail) parts.push(health.detail);
+  // Precedence: top-level response model first, then health.model; render the
+  // single tested model once — never a duplicate label, never an invented one.
+  const model = testedModel ?? health.model ?? null;
   return (
     <div className="flex flex-wrap items-center gap-2 text-[13px]">
       <span className={`inline-flex items-center rounded-full border px-2.5 py-0.5 text-[11px] font-medium ${badge.className}`}>
         {badge.label}
       </span>
       {health.provider && <span className="text-muted-foreground">{health.provider}</span>}
-      {health.model && <span className="font-mono text-[12px]">{health.model}</span>}
+      {model && <span className="font-mono text-[12px]">{model}</span>}
       {health.detail && <span className="text-muted-foreground">{health.detail}</span>}
     </div>
   );
@@ -117,10 +123,16 @@ export default function Settings() {
 
   const data = settings.status === "ready" ? settings.data : null;
 
+  // Suppresses the dirty-effect clearing of the Saved indicator while a
+  // post-save rehydration is still in flight (the form briefly differs from
+  // the stale query data during that gap).
+  const pendingRehydrateRef = React.useRef(false);
+
   // Hydrate the form once per loaded response; blank password fields never
   // receive or echo an existing secret.
   React.useEffect(() => {
     if (data && hydratedFrom !== data) {
+      pendingRehydrateRef.current = true;
       setBaseUrl(data.base_url ?? "");
       setModel(data.model ?? "");
       setApiKey("");
@@ -128,6 +140,8 @@ export default function Settings() {
       setFallbackModel(data.fallback_model ?? "");
       setFallbackApiKey("");
       setHydratedFrom(data);
+    } else if (data) {
+      pendingRehydrateRef.current = false;
     }
   }, [data, hydratedFrom]);
 
@@ -145,17 +159,30 @@ export default function Settings() {
     : baseUrl.length > 0 && !/^https?:\/\//.test(baseUrl) ? "Base URL must begin with http:// or https://."
     : null;
 
+  // A cleared Base URL must be sent as null (the frozen contract is
+  // `string | null` and the backend rejects ""), never as an empty string.
+  const clearSavedIndicatorIfDirty = () => {
+    if (!pendingRehydrateRef.current) setSavedAt(null);
+  };
+
+  React.useEffect(() => {
+    if (dirty) clearSavedIndicatorIfDirty();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dirty]);
+
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!client || validation) return;
+    if (!client || validation || !dirty) return;
     setSaving(true);
     setSaveError(null);
     setSavedAt(null);
     try {
       const request: LlmSettingsUpdateRequest = {};
-      // Omit unchanged/blank values — a blank input must never clear an
-      // existing key or clobber saved fields.
-      if (baseUrl !== (data?.base_url ?? "")) request.base_url = baseUrl;
+      // Omit unchanged values — a blank input must never clear an existing
+      // key or clobber saved fields. A CLEARED Base URL is sent as null
+      // (the frozen contract is `string | null`; "" would be rejected by
+      // the backend validator), consistent with the fallback field.
+      if (baseUrl !== (data?.base_url ?? "")) request.base_url = baseUrl || null;
       if (model !== (data?.model ?? "")) request.model = model;
       if (apiKey.length > 0) request.api_key = apiKey;
       if (fallbackBaseUrl !== (data?.fallback_base_url ?? "")) request.fallback_base_url = fallbackBaseUrl || null;
@@ -165,11 +192,20 @@ export default function Settings() {
       setSavedAt(Date.now());
       setApiKey("");
       setFallbackApiKey("");
+      // On a successful save the configuration changed: stale operation
+      // results from the previous configuration no longer describe it.
+      setDetectedModels(null);
+      setDetectError(null);
+      setTestResult(null);
+      setTestError(null);
       setHydratedFrom(null);
+      pendingRehydrateRef.current = true;
       // Refresh sanitized view from the response (never echoes the key).
       setReloadKey((n) => n + 1);
       void response;
     } catch (error) {
+      // A failed save keeps the typed replacement key in transient React
+      // state so the user can retry; it is never persisted anywhere.
       setSaveError(error instanceof Error ? error.message : "Save failed");
     } finally {
       setSaving(false);
@@ -349,7 +385,7 @@ export default function Settings() {
         <div className="flex flex-wrap items-center gap-3">
           <button
             type="submit"
-            disabled={saving || !!validation}
+            disabled={saving || !!validation || !dirty}
             className="rounded-control bg-primary px-4 py-2 text-[13.5px] font-medium text-primary-foreground transition-colors hover:bg-primary/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
           >
             {saving ? "Saving…" : "Save settings"}
@@ -365,7 +401,7 @@ export default function Settings() {
           <button
             type="button"
             onClick={handleTest}
-            disabled={testing}
+            disabled={testing || dirty}
             className="rounded-control border border-border-strong px-4 py-2 text-[13.5px] font-medium text-foreground transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
           >
             {testing ? "Testing…" : "Test connection"}
@@ -394,7 +430,7 @@ export default function Settings() {
           {testResult?.health && (
             <div className="flex flex-wrap items-center gap-2">
               <span className="text-[12px] uppercase tracking-[0.06em] text-subtle-foreground">Last test</span>
-              <HealthLine health={testResult.health} />
+              <HealthLine health={testResult.health} testedModel={testResult.model ?? null} />
               {testResult.latency_ms != null && (
                 <span className="text-[12.5px] text-muted-foreground">{testResult.latency_ms} ms</span>
               )}
