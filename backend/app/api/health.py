@@ -48,8 +48,9 @@ def build_component_health(
     if settings.self_hosted_configured:
         components["llm"] = ProviderHealth(
             status=HealthStatus.DEGRADED,
-            detail="self-hosted route configured and allowlisted; provider adapter "
-            "pending (B01); not probed in A00",
+            detail="self-hosted route configured and allowlisted; B01 adapter live - "
+            "use POST /api/settings/llm/test for a synthetic live probe (health stays "
+            "probe-free by contract)",
             provider=settings.eva_llm_provider,
             model=settings.eva_llm_model or None,
         )
@@ -66,7 +67,8 @@ def build_component_health(
     if settings.self_hosted_fallback_configured:
         components["llm_fallback"] = ProviderHealth(
             status=HealthStatus.DEGRADED,
-            detail="self-hosted fallback configured and allowlisted; not probed in A00",
+            detail="self-hosted fallback configured and allowlisted; live probe via "
+            "the settings test route only",
             model=settings.eva_llm_fallback_model or None,
         )
     else:
