@@ -34,6 +34,7 @@ from .db.session import Database
 from .dependencies import get_settings
 from .google.auth import GoogleAuth
 from .google.calendar import CalendarService
+from .google.gmail import GmailService
 from .google.http import AuthorizedGoogleHttp
 from .voice.audio import FfmpegAudioNormalizer
 from .voice.faster_whisper import FasterWhisperProvider
@@ -181,6 +182,34 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.approval_engine = engine
     app.state.tool_registry = registry
     app.state.tool_executor = executor
+
+    # -- A06 Gmail ingestion + deterministic Attention rules. The Attention
+    # SINK is B04's AttentionEngine (frozen ingest(source_event) -> AttentionItem):
+    # until B04 wires it, app.state.attention_sink stays None and ingestion
+    # honestly leaves new sources unseen instead of faking classification.
+    # IMPORTANT SENDERS: exact-address set is a B04/ORG configuration handoff;
+    # empty here on purpose - no real addresses are hardcoded in source.
+    from .attention.ingest import GmailIngestionService
+    from .attention.rules import AttentionRules
+    from .db.repositories import AttentionRepository, CursorRepository
+
+    app.state.cursor_repository = CursorRepository(db)
+    app.state.attention_repository = AttentionRepository(db)
+    app.state.attention_rules = AttentionRules(
+        policy=policy,
+        important_senders=getattr(app.state, "important_sender_addresses", ()),
+    )
+    app.state.attention_sink = None  # B04 injects its AttentionEngine here
+    app.state.ingestion_service = GmailIngestionService(
+        gmail_source_factory=lambda: GmailService(_google_http()),
+        cursors=app.state.cursor_repository,
+        attention_repo=app.state.attention_repository,
+        sink=None,  # replaced at B04 wiring alongside app.state.attention_sink
+        query=settings.eva_gmail_query,
+        search_limit=settings.eva_gmail_search_limit,
+        overlap_seconds=settings.eva_gmail_poll_overlap_seconds,
+        clock=utcnow,
+    )
 
     # -- A05 voice pipeline: one normalizer + one STT service per application.
     # Tests replace app.state.audio_normalizer / stt_service (and the inject

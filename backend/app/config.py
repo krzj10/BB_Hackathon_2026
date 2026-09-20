@@ -169,6 +169,15 @@ class Settings(BaseSettings):
     #: written 0600 best-effort and never read into API responses or logs.
     google_credentials_path: str = "secrets/google_credentials.json"
 
+    # --- A06 Gmail ingestion (backend-only) ------------------------------------
+    #: Baseline poll query (read-only Gmail search surface).
+    eva_gmail_query: str = "in:inbox"
+    #: Threads fetched per bounded poll window (A02 hard-caps at 50).
+    eva_gmail_search_limit: int = 25
+    #: Cursor overlap rediscovering late-arriving messages; dedup makes the
+    #: repeat safe. 0 disables overlap.
+    eva_gmail_poll_overlap_seconds: int = 120
+
     @field_validator("eva_llm_base_url", "eva_llm_fallback_base_url")
     @classmethod
     def _validate_endpoints(cls, value: str) -> str:
@@ -207,6 +216,20 @@ class Settings(BaseSettings):
     def _validate_stt_timeout(cls, value: float) -> float:
         if value <= 0:
             raise ValueError("EVA_STT_TIMEOUT_SECONDS must be > 0")
+        return value
+
+    @field_validator("eva_gmail_search_limit")
+    @classmethod
+    def _validate_gmail_search_limit(cls, value: int) -> int:
+        if not 1 <= value <= 50:
+            raise ValueError("EVA_GMAIL_SEARCH_LIMIT must be between 1 and 50")
+        return value
+
+    @field_validator("eva_gmail_poll_overlap_seconds")
+    @classmethod
+    def _validate_gmail_overlap(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("EVA_GMAIL_POLL_OVERLAP_SECONDS must be >= 0")
         return value
 
     # ------------------------------------------------------------------ #
