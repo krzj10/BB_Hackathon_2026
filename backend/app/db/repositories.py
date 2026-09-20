@@ -15,12 +15,15 @@ Design rules enforced here:
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from datetime import datetime
 from typing import NamedTuple
 
 from app.contracts import domain
 from app.db.session import Database, from_db, to_db
+
+logger = logging.getLogger("eva.db.repositories")
 
 # Controlled action-status transition table (frozen lifecycle). Kept as
 # documentation of the canonical lifecycle; each repository operation encodes
@@ -1064,6 +1067,15 @@ class FocusRepository:
         if not rows:
             return None
         # Concurrent overlapping starts are a bug, not a choice: surface it.
+        # "Exactly one active focus session" is an invariant; more than one row
+        # means a start raced past the check-then-insert guard. We log loudly
+        # (observability) and keep serving the most recent, rather than fail a
+        # read - but this line must never be silent in production.
+        if len(rows) > 1:
+            logger.error(
+                "multiple active focus sessions detected at %s; invariant violated",
+                to_db(now),
+            )
         session = domain.FocusSession.model_validate_json(rows[0]["payload_json"])
         return session if session.is_active(now) else None
 

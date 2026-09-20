@@ -377,6 +377,7 @@ def test_high_financial_accept_requires_ui_confirm_and_records_internally(tmp_pa
     proposal = env.client.post(
         f"/api/decisions/{decision_id}/outcome-proposals",
         json={"outcome": "accept", "session_id": "sess-b04", "request_id": "out-1"},
+        headers=SESSION,
     )
     assert proposal.status_code == 200
     decision = proposal.json()["decision"]
@@ -418,6 +419,7 @@ def test_high_financial_accept_requires_ui_confirm_and_records_internally(tmp_pa
     again = env.client.post(
         f"/api/decisions/{decision_id}/outcome-proposals",
         json={"outcome": "reject", "session_id": "sess-b04", "request_id": "out-2"},
+        headers=SESSION,
     )
     assert again.status_code == 409
 
@@ -441,6 +443,7 @@ def test_defer_is_internal_bookkeeping_only(tmp_path) -> None:
     proposal = env.client.post(
         f"/api/decisions/{decision_id}/outcome-proposals",
         json={"outcome": "accept", "session_id": "sess-b04", "request_id": "out-3"},
+        headers=SESSION,
     )
     assert proposal.status_code == 200
 
@@ -560,3 +563,23 @@ def test_ws_stream_requires_session_and_delivers_events(tmp_path) -> None:
         payload = ws.receive_json()
         assert payload["type"] == "attention_item_created"
         assert payload["payload"]["item"]["source_id"] == "m1"
+
+
+def test_final_dismissed_decision_cannot_receive_outcome_proposal(tmp_path) -> None:
+    # P1 regression: EVERY final status (RESOLVED *and* DISMISSED) must reject a
+    # new outcome proposal - not RESOLVED alone. Nothing sets DISMISSED in the
+    # normal flow, so we drive it through the repository to lock the invariant.
+    env = seeded_env(tmp_path, make_event("m1", **FINANCIAL_EVENT))
+    decision_id = env.new_check_now().json()["new_items"][0]["decision_id"]
+
+    stored = env.decision_repo.get(decision_id)
+    assert stored is not None and stored.status is DecisionStatus.NEEDS_REVIEW
+    env.decision_repo.update(stored.model_copy(update={"status": DecisionStatus.DISMISSED}))
+
+    resp = env.client.post(
+        f"/api/decisions/{decision_id}/outcome-proposals",
+        json={"outcome": "accept", "session_id": "sess-b04", "request_id": "out-dismissed"},
+        headers=SESSION,
+    )
+    assert resp.status_code == 409
+    assert "final" in resp.json()["detail"]

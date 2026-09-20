@@ -51,8 +51,14 @@ def propose_outcome(
     request: Request, decision_id: str, body: DecisionOutcomeProposalRequest
 ) -> DecisionResponse:
     """User-initiated accept/reject proposal. The frozen body carries the
-    session/request identity; origin protection still applies."""
+    session/request identity; origin protection applies AND the claimed body
+    session must equal the trusted caller header (same binding as /defer and
+    /assistant/message), so an idempotency slot can never be opened under a
+    session the caller is not presenting."""
     require_origin(request)
+    header_session = require_session_header(request)
+    if header_session != body.session_id:
+        raise HTTPException(status_code=403, detail="session id does not match the caller")
     service = _service(request)
     try:
         action = service.create_outcome_proposal(

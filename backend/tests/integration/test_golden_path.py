@@ -401,6 +401,7 @@ def test_g3_golden_path(tmp_path) -> None:
     out_prop = env.client.post(
         f"/api/decisions/{decision_fin_id}/outcome-proposals",
         json={"outcome": "accept", "session_id": SESSION, "request_id": "out-1"},
+        headers=headers("out-1"),
     )
     assert out_prop.status_code == 200
     action_id = out_prop.json()["decision"]["proposed_action_id"]
@@ -524,6 +525,7 @@ def test_high_financial_proposal_never_allows_voice_approval(tmp_path) -> None:
     prop = env.client.post(
         f"/api/decisions/{decision_id}/outcome-proposals",
         json={"outcome": "accept", "session_id": SESSION, "request_id": "v-1"},
+        headers=headers("v-1"),
     ).json()["decision"]
     action = env.client.get(f"/api/actions/{prop['proposed_action_id']}",
                             headers={"X-EVA-Session-ID": SESSION}).json()["action"]
@@ -567,6 +569,7 @@ def test_decision_replay_does_not_duplicate_local_write(tmp_path) -> None:
     prop = env.client.post(
         f"/api/decisions/{decision_id}/outcome-proposals",
         json={"outcome": "accept", "session_id": SESSION, "request_id": "rep-1"},
+        headers=headers("rep-1"),
     ).json()["decision"]
     action_id = prop["proposed_action_id"]
 
@@ -574,6 +577,7 @@ def test_decision_replay_does_not_duplicate_local_write(tmp_path) -> None:
     again = env.client.post(
         f"/api/decisions/{decision_id}/outcome-proposals",
         json={"outcome": "accept", "session_id": SESSION, "request_id": "rep-1"},
+        headers=headers("rep-1"),
     ).json()["decision"]
     assert again["proposed_action_id"] == action_id
 

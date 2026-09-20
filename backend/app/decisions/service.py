@@ -110,9 +110,10 @@ class DecisionService:
         not this service - decides risk/approval; HIGH decisions therefore
         require explicit UI confirmation through the standard A03 flow."""
         decision = self._require(decision_id)
-        if decision.status is DecisionStatus.RESOLVED:
+        if decision.status in _FINAL_STATUSES:
             raise DecisionConflictError(
-                "decision_resolved", "outcome already recorded for this decision"
+                "decision_final",
+                f"decision is {decision.status.value}; outcome can no longer be proposed",
             )
 
         # One in-flight outcome proposal per decision (replay, never stack).
@@ -182,6 +183,10 @@ class DecisionService:
         """Local-write handler for the guarded executor. Runs ONLY after the
         proposal passed policy + (for HIGH) explicit UI approval."""
         decision = self._require(args.decision_id)
+        if decision.status is DecisionStatus.DISMISSED:
+            # Final state: an outcome can never be recorded on a dismissed
+            # decision (defense-in-depth; proposals are already blocked).
+            raise ValueError("decision is dismissed; outcome cannot be recorded")
         if decision.status is DecisionStatus.RESOLVED:
             if decision.outcome is args.outcome:
                 # Durable idempotent replay of the same recorded outcome.
