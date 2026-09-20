@@ -505,6 +505,38 @@ describe("useVoiceSession acquisition-window races", () => {
     expect(screen.getByTestId("state")).toHaveTextContent("listening");
   });
 
+  it("canStart reflects the internal capture lifecycle (acquiring/listening/stopping)", async () => {
+    const { stream } = makeStream();
+    const pending = deferred<MediaStream>();
+    setupEnvironment(vi.fn(() => pending.promise));
+    vi.stubGlobal("MediaRecorder", DelayedRecorder);
+    const sttPending = deferred<TranscribeResponse>();
+    render(<VoiceHarness client={voiceClient(() => sttPending.promise)} />);
+
+    expect(lastSession?.canStart).toBe(true);
+    fireEvent.click(screen.getByTestId("start"));
+    await flush();
+    // Acquisition window (permission prompt pending): no new press.
+    expect(lastSession?.canStart).toBe(false);
+
+    pending.resolve(stream);
+    await flush();
+    expect(lastSession?.canStart).toBe(false); // listening
+
+    fireEvent.click(screen.getByTestId("stop"));
+    await flush();
+    expect(lastSession?.canStart).toBe(false); // stopping (recorder flushing)
+
+    const recorder = FakeRecorder.instances[0] as DelayedRecorder;
+    act(() => {
+      recorder.release();
+    });
+    await flush();
+    // Transcribing intentionally allows a superseding press.
+    expect(lastSession?.canStart).toBe(true);
+    expect(screen.getByTestId("state")).toHaveTextContent("transcribing");
+  });
+
   it("stops acquired tracks when the MediaRecorder constructor throws", async () => {
     const { track, stream } = makeStream();
     setupEnvironment(vi.fn(() => Promise.resolve(stream)));
@@ -638,7 +670,7 @@ describe("useVoiceSession capture-local recorder ownership", () => {
     recorderA.ondataavailable?.({ data: new Blob(["A-data"], { type: "audio/webm" }) });
     fireEvent.click(screen.getByTestId("stop"));
     await flush();
-    expect(screen.getByTestId("state")).toHaveTextContent("listening");
+    expect(screen.getByTestId("state")).toHaveTextContent("transcribing");
 
     // Cancel while A is still flushing, then let A's late onstop land.
     fireEvent.click(screen.getByTestId("cancel"));
@@ -653,6 +685,48 @@ describe("useVoiceSession capture-local recorder ownership", () => {
     act(() => {
       vi.advanceTimersByTime(1600);
     });
+    expect(screen.getByTestId("state")).toHaveTextContent("idle");
+  });
+
+  it("release presents transcribing immediately, uploads nothing before onstop, then transcribes normally", async () => {
+    const { track, stream } = makeStream();
+    setupEnvironment(vi.fn(() => Promise.resolve(stream)));
+    vi.stubGlobal("MediaRecorder", DelayedRecorder);
+    const sttPending = deferred<TranscribeResponse>();
+    let sentRequestId = "";
+    const transcribe = vi.fn((request: TranscribeAudioRequest) => {
+      sentRequestId = request.requestId;
+      return sttPending.promise;
+    });
+    render(<VoiceHarness client={voiceClient(transcribe)} />);
+
+    fireEvent.click(screen.getByTestId("start"));
+    await flush();
+    const recorder = FakeRecorder.instances[0] as DelayedRecorder;
+    recorder.ondataavailable?.({ data: new Blob(["speech"], { type: "audio/webm" }) });
+
+    fireEvent.click(screen.getByTestId("stop"));
+    // Presentation flips synchronously on release — no lingering
+    // "Listening"/"Release to transcribe" after the press has ended.
+    expect(screen.getByTestId("state")).toHaveTextContent("transcribing");
+    // No premature STT upload: the recorder has not flushed onstop yet.
+    expect(transcribe).not.toHaveBeenCalled();
+
+    act(() => {
+      recorder.release();
+    });
+    await flush();
+    // Valid onstop → exactly one normal transcription begins.
+    expect(transcribe).toHaveBeenCalledTimes(1);
+    expect(track.stop).toHaveBeenCalled();
+
+    sttPending.resolve(
+      transcriptResponse(sentRequestId, "Przygotuj briefing do spotkania z ACME")
+    );
+    await flush();
+    expect(screen.getByTestId("transcript")).toHaveTextContent(
+      "Przygotuj briefing do spotkania z ACME"
+    );
     expect(screen.getByTestId("state")).toHaveTextContent("idle");
   });
 

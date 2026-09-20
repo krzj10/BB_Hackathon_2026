@@ -236,11 +236,19 @@ export function useVoiceSession(options: UseVoiceSessionOptions = {}): VoiceSess
   // Mirror of the canonical state so timeouts can route transitions through
   // applyState without stale-closure reads.
   const stateRef = React.useRef<VoiceState>("idle");
+  // Reactive mirror of the internal capture phase: refs alone do not
+  // re-render, and canStart must reflect the real lifecycle.
+  const [capturePhase, setCapturePhase] = React.useState<VoiceCapturePhase>("idle");
 
   const applyState = React.useCallback((next: VoiceState) => {
     stateRef.current = next;
     setState(next);
     onStateChangeRef.current?.(next);
+  }, []);
+
+  const applyCapturePhase = React.useCallback((next: VoiceCapturePhase) => {
+    phaseRef.current = next;
+    setCapturePhase(next);
   }, []);
 
   const clearTimers = React.useCallback(() => {
@@ -289,14 +297,14 @@ export function useVoiceSession(options: UseVoiceSessionOptions = {}): VoiceSess
       // Nothing is uploaded if the completed Blob exceeds the backend bound.
       if (audio.size > MAX_UPLOAD_BYTES) {
         if (generation !== generationRef.current) return;
-        phaseRef.current = "idle";
+        applyCapturePhase("idle");
         applyState("error");
         setError("Recording is too large. Try a shorter message.");
         return;
       }
       if (audio.size === 0) {
         if (generation !== generationRef.current) return;
-        phaseRef.current = "idle";
+        applyCapturePhase("idle");
         applyState("error");
         setError("No audio was captured. Try again.");
         return;
@@ -306,7 +314,7 @@ export function useVoiceSession(options: UseVoiceSessionOptions = {}): VoiceSess
       activeRequestIdRef.current = requestId;
       const controller = new AbortController();
       abortRef.current = controller;
-      phaseRef.current = "transcribing";
+      applyCapturePhase("transcribing");
       applyState("transcribing");
       setNotice(stoppedAtMax ? `Recording stopped at the maximum duration (${maxSeconds} seconds).` : null);
 
@@ -324,7 +332,7 @@ export function useVoiceSession(options: UseVoiceSessionOptions = {}): VoiceSess
         if (generation !== generationRef.current) return;
         if (response.request_id !== activeRequestIdRef.current) {
           // Mismatched echo: defense in depth — never publish it.
-          phaseRef.current = "idle";
+          applyCapturePhase("idle");
           activeRequestIdRef.current = null;
           applyState("error");
           setError("Speech recognition returned an unexpected response. Try again.");
@@ -341,13 +349,13 @@ export function useVoiceSession(options: UseVoiceSessionOptions = {}): VoiceSess
         setNotice(null);
         // Truthful idle: no assistant reasoning exists in this slice, so
         // `thinking` must NOT be entered merely because STT completed.
-        phaseRef.current = "idle";
+        applyCapturePhase("idle");
         applyState("idle");
       } catch (err) {
         // Aborted/superseded requests are silent: cancel() owns the state.
         if (generation !== generationRef.current) return;
         if (errorName(err) === "AbortError") return;
-        phaseRef.current = "idle";
+        applyCapturePhase("idle");
         activeRequestIdRef.current = null;
         applyState("error");
         setError(mapTranscribeError(err));
@@ -416,14 +424,14 @@ export function useVoiceSession(options: UseVoiceSessionOptions = {}): VoiceSess
     // invalidate the old request, ignore any late response, start cleanly.
     if (phaseRef.current === "transcribing") {
       supersedeInFlight();
-      phaseRef.current = "idle";
+      applyCapturePhase("idle");
     }
     // phase "stopping" falls through deliberately: the previous recorder is
     // only flushing. Its stale finalize detects the generation change below
     // and discards itself without uploading (capture-local chunk ownership).
 
     const generation = ++generationRef.current;
-    phaseRef.current = "acquiring";
+    applyCapturePhase("acquiring");
     setError(null);
     setNotice(null);
 
@@ -474,14 +482,14 @@ export function useVoiceSession(options: UseVoiceSessionOptions = {}): VoiceSess
         recorder.onerror = () => {
           if (capture.generation !== generationRef.current) return;
           if (phaseRef.current !== "listening") return;
-          phaseRef.current = "idle";
+          applyCapturePhase("idle");
           finishCapture(capture, "discard", false);
           applyState("error");
           setError("Recording failed. Try again.");
         };
 
         recorder.start();
-        phaseRef.current = "listening";
+        applyCapturePhase("listening");
         startTsRef.current = Date.now();
         setRecordingMs(0);
         applyState("listening");
@@ -497,7 +505,7 @@ export function useVoiceSession(options: UseVoiceSessionOptions = {}): VoiceSess
         }, maxSeconds * 1000);
       } catch (err) {
         if (generation !== generationRef.current) return;
-        phaseRef.current = "idle";
+        applyCapturePhase("idle");
         // Every error path after getUserMedia resolved still stops the mic.
         stopStreamTracks(stream);
         const capture = captureRef.current;
@@ -521,7 +529,7 @@ export function useVoiceSession(options: UseVoiceSessionOptions = {}): VoiceSess
   const cancel = React.useCallback(() => {
     if (phaseRef.current === "idle") return;
     supersedeInFlight();
-    phaseRef.current = "idle";
+    applyCapturePhase("idle");
     cleanupForCancel();
     applyState("interrupted");
     // Canonical interrupted -> idle transition (short courtesy pause).
@@ -539,16 +547,21 @@ export function useVoiceSession(options: UseVoiceSessionOptions = {}): VoiceSess
       // Released before the permission prompt resolved: invalidate the
       // acquisition so no recording can start after the press has ended.
       supersedeInFlight();
-      phaseRef.current = "idle";
+      applyCapturePhase("idle");
       return;
     }
     if (phaseRef.current !== "listening") return;
     const capture = captureRef.current;
     if (!capture) {
-      phaseRef.current = "idle";
+      applyCapturePhase("idle");
       return;
     }
-    phaseRef.current = "stopping";
+    applyCapturePhase("stopping");
+    // The recording phase is over the moment the user releases: present
+    // `transcribing` immediately while the recorder flushes its final
+    // chunk. Actual upload still waits for the recorder's own onstop, and
+    // delayed/stale finalization protections are unchanged.
+    applyState("transcribing");
     finishCapture(capture, "transcribe", stoppedAtMax);
   };
 
@@ -581,7 +594,10 @@ export function useVoiceSession(options: UseVoiceSessionOptions = {}): VoiceSess
     transcript,
     error,
     notice,
-    canStart: state !== "listening",
+    // Real internal capture lifecycle: a new PTT press may not begin while
+    // acquiring, listening, or stopping. Transcribing intentionally allows
+    // a new press (it supersedes the in-flight request).
+    canStart: capturePhase === "idle" || capturePhase === "transcribing",
     isCapturing: state === "listening",
     recordingMs,
     requestId: activeRequestIdRef.current,
