@@ -62,6 +62,7 @@ class FakeGoogleHttp:
         self.shape_violations: list[str] = []  # REST-shape regressions (PART 27)
         self._etag_seq = 0
         self.post_hook = None  # callable(body, params); may raise after applying
+        self.post_response_id_override = None  # provider returns a DIFFERENT id
         self.patch_hook = None  # callable(event_id, body)
 
     # -- accounting helpers -------------------------------------------------
@@ -129,7 +130,14 @@ class FakeGoogleHttp:
             self.post_hook(copy.deepcopy(body), dict(params or {}), apply)
         else:
             apply()
-        return copy.deepcopy(self.events[event_id])
+        result = (
+            copy.deepcopy(self.events[event_id])
+            if event_id in self.events
+            else {"id": event_id}
+        )
+        if self.post_response_id_override is not None:
+            result["id"] = self.post_response_id_override
+        return result
 
     def patch_json(self, url, params, body, headers=None):
         self.calls.append(("PATCH", url))
@@ -1283,3 +1291,51 @@ def test_recurring_events_remain_readable(env) -> None:
         assert result.status.value == "ok", event_id
     response = env.client.get("/api/calendar/events/evt-master")
     assert response.status_code == 200
+
+
+# =========================================================================== #
+# REMEDIATION - create identity freeze (durable ID is the only anchor)
+# =========================================================================== #
+
+
+def test_create_identity_freeze_follows_durable_id_not_response_id(env) -> None:
+    proposal = propose(env, create_body("Identity freeze"), request_id="req-id1")
+    action = proposal.json()["action"]
+    durable_id = generate_google_event_id(action["id"], action["revision"])
+
+    # POST applies correctly under the DURABLE client id, but the provider
+    # response reports a DIFFERENT id - identity must never switch to it.
+    env.fake.post_response_id_override = "unexpected-provider-id"
+    confirmation = confirm(env, action["id"], action["revision"], action["arguments_digest"], "approve")
+    body = confirmation.json()
+
+    assert durable_id in env.fake.events                      # applied under durable id
+    assert body["action"]["status"] == "succeeded"            # reconciled via durable GET
+    assert body["result"]["data"].get("reconciled") is True
+    assert body["result"]["data"]["event_id"] == durable_id   # never the returned id
+    posts = [c for c in env.fake.calls if c[0] == "POST"]
+    assert len(posts) == 1                                    # exactly one POST, ever
+    # The unexpected id was never followed by any request.
+    assert all("unexpected-provider-id" not in url for _, url in env.fake.calls)
+
+
+def test_create_identity_freeze_unverifiable_mismatch_stays_unknown(env) -> None:
+    proposal = propose(env, create_body("Ghost identity"), request_id="req-id2")
+    action = proposal.json()["action"]
+
+    def hook(body, params, apply):
+        # POST response claims success under a foreign id while NOTHING is
+        # verifiable under the durable id -> ambiguous, must stay UNKNOWN.
+        return None
+
+    env.fake.post_hook = hook
+    env.fake.post_response_id_override = "unexpected-provider-id"
+    confirmation = confirm(env, action["id"], action["revision"], action["arguments_digest"], "approve")
+    body = confirmation.json()
+    assert body["action"]["status"] == "unknown"
+
+    # Replay of the UNKNOWN action performs ZERO new POSTs.
+    posts_before = len([c for c in env.fake.calls if c[0] == "POST"])
+    outcome = env.executor.execute(action["id"])
+    assert outcome.action.status is ProposedActionStatus.UNKNOWN
+    assert len([c for c in env.fake.calls if c[0] == "POST"]) == posts_before

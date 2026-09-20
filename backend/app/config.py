@@ -145,6 +145,21 @@ class Settings(BaseSettings):
     eva_whisper_compute_type: str = "int8"
     eva_wake_word_enabled: bool = False
 
+    # --- A05 STT safety/limits (backend-only) ---------------------------------
+    #: Simultaneous inference calls. Conservative default 1: native STT work
+    #: cannot always be interrupted, so concurrency stays deliberately tight.
+    eva_stt_max_concurrency: int = 1
+    #: Per-attempt transcription timeout in seconds (frees the caller even
+    #: when native inference keeps running; see voice/stt_base.py).
+    eva_stt_timeout_seconds: float = 30.0
+    #: ffmpeg executable (name resolved on PATH or explicit path set by the
+    #: machine owner - never hardcoded developer paths in code).
+    eva_ffmpeg_binary: str = "ffmpeg"
+    #: whisper.cpp fallback: BOTH must be configured or the provider is
+    #: reported unavailable - blank means not configured, never fake success.
+    eva_whisper_cpp_binary: str = ""
+    eva_whisper_cpp_model_path: str = ""
+
     # --- Google ---------------------------------------------------------------
     google_client_id: str = ""
     google_client_secret: str = Field(default="", repr=False)
@@ -170,6 +185,29 @@ class Settings(BaseSettings):
         # Structural validation + normalization; rejects credentials, paths,
         # queries, fragments and non-http(s) with fixed generic messages.
         return [_validated_origin(origin) for origin in value]
+
+    @field_validator("eva_stt_provider")
+    @classmethod
+    def _validate_stt_provider(cls, value: str) -> str:
+        # Unknown providers fail clearly at load; accepted spellings are
+        # normalized to the two supported identities.
+        from app.voice.stt_base import canonicalize_stt_provider_name
+
+        return canonicalize_stt_provider_name(value)
+
+    @field_validator("eva_stt_max_concurrency")
+    @classmethod
+    def _validate_stt_concurrency(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("EVA_STT_MAX_CONCURRENCY must be >= 1")
+        return value
+
+    @field_validator("eva_stt_timeout_seconds")
+    @classmethod
+    def _validate_stt_timeout(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("EVA_STT_TIMEOUT_SECONDS must be > 0")
+        return value
 
     # ------------------------------------------------------------------ #
 
