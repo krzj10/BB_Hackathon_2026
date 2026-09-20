@@ -1,4 +1,5 @@
 import { createMockClient } from "./mock";
+import { getEvaSessionId } from "../lib/session";
 export type {
   AttentionListResponse,
   DecisionListResponse,
@@ -109,13 +110,18 @@ export type EvaClientMode = "rest" | "mock";
 async function requestJson<T>(method: string, path: string, init?: RequestInit): Promise<T> {
   // JSON requests carry an explicit application/json Content-Type; multipart
   // FormData requests MUST NOT (the browser generates the multipart boundary).
+  const supplied = ((init?.headers as Record<string, string> | undefined) ?? {});
   const headers: Record<string, string> = {
     Accept: "application/json",
-    ...((init?.headers as Record<string, string>) ?? {}),
+    ...supplied,
   };
   if (!(init?.body instanceof FormData)) {
     headers["Content-Type"] = "application/json";
   }
+  // Single browser-session authority: every EVA application API request
+  // carries the same non-secret per-tab correlation id. An explicitly
+  // supplied header (the voice path passes its own) is never replaced.
+  headers["X-EVA-Session-ID"] = supplied["X-EVA-Session-ID"] ?? getEvaSessionId();
   const response = await fetch(path, { method, ...init, headers });
   if (!response.ok) {
     const detail = await response.text().catch(() => "");
