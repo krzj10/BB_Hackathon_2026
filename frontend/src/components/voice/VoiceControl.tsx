@@ -7,6 +7,11 @@ import { useVoiceSession } from "../../hooks/useVoiceSession";
 import { Badge } from "../ui/badge";
 import { VoiceOrb } from "./VoiceOrb";
 
+/** Cooldown before the assistant can be asked about a fresh transcript: it
+ * gives the presenter time to read the transcription (and keeps an accidental
+ * double-press from spending an inference round). */
+const ASK_COOLDOWN_SECONDS = 5;
+
 /**
  * Voice control slice (B02B + B03 turn): binds the VoiceOrb to the real PTT/STT
  * lifecycle (A05), then — only on an explicit press — sends that transcript to
@@ -18,7 +23,14 @@ import { VoiceOrb } from "./VoiceOrb";
  * - a proposed action from the assistant is REPORTED only: approval stays in
  *   the guarded UI flow, this component can never confirm it.
  */
-export function VoiceControl({ client = getEvaClient() }: { client?: EvaClient } = {}) {
+export function VoiceControl({
+  client = getEvaClient(),
+  askCooldownSeconds = ASK_COOLDOWN_SECONDS,
+}: {
+  client?: EvaClient;
+  /** Test/preview seam for the countdown; production uses 5 seconds. */
+  askCooldownSeconds?: number;
+} = {}) {
   const voice = useVoiceSession({ client });
   const speech = useSpeechSynthesis();
   const transcript = voice.transcript;
@@ -27,16 +39,31 @@ export function VoiceControl({ client = getEvaClient() }: { client?: EvaClient }
   const [proposedTool, setProposedTool] = React.useState<string | null>(null);
   const [asking, setAsking] = React.useState(false);
   const [askError, setAskError] = React.useState<string | null>(null);
+  const [askCountdown, setAskCountdown] = React.useState(0);
 
-  // A new recording supersedes the previous answer: one truth on screen.
+  // A new recording supersedes the previous answer (one truth on screen) and
+  // restarts the Ask Eva cooldown; the interval is always cleared on change.
   React.useEffect(() => {
     setReply(null);
     setProposedTool(null);
     setAskError(null);
-  }, [transcript?.text]);
+    if (!transcript?.text) {
+      setAskCountdown(0);
+      return;
+    }
+    setAskCountdown(Math.max(0, askCooldownSeconds));
+    if (askCooldownSeconds <= 0) return;
+    const ticker = window.setInterval(() => {
+      // Clamped at zero: later ticks are no-ops for React state.
+      setAskCountdown((current) => (current <= 1 ? 0 : current - 1));
+    }, 1000);
+    return () => window.clearInterval(ticker);
+  }, [transcript?.text, askCooldownSeconds]);
+
+  const canAsk = Boolean(transcript) && !asking && askCountdown === 0;
 
   const askEva = React.useCallback(async () => {
-    if (!transcript || asking) return;
+    if (!canAsk || !transcript) return;
     const language = transcript.language ?? "pl";
     setAsking(true);
     setAskError(null);
@@ -59,7 +86,7 @@ export function VoiceControl({ client = getEvaClient() }: { client?: EvaClient }
     } finally {
       setAsking(false);
     }
-  }, [transcript, asking, client, speech]);
+  }, [canAsk, transcript, client, speech]);
 
   return (
     <>
@@ -74,7 +101,7 @@ export function VoiceControl({ client = getEvaClient() }: { client?: EvaClient }
       {voice.error && (
         <div
           role="alert"
-          className="fixed bottom-40 right-5 z-50 max-w-xs rounded-card border border-danger/40 bg-card px-3 py-2 text-[12.5px] text-danger shadow-panel md:bottom-36 md:right-8"
+          className="fixed bottom-40 right-5 z-50 max-h-[40dvh] max-w-[calc(100vw-2.5rem)] overflow-y-auto overscroll-contain break-words rounded-card border border-danger/40 bg-card px-3 py-2 text-[12.5px] text-danger shadow-panel [overflow-wrap:anywhere] md:bottom-36 md:right-8"
         >
           {voice.error}
         </div>
@@ -83,7 +110,7 @@ export function VoiceControl({ client = getEvaClient() }: { client?: EvaClient }
       {!voice.error && voice.notice && (
         <div
           role="status"
-          className="fixed bottom-40 right-5 z-50 max-w-xs rounded-card border border-border/70 bg-card px-3 py-2 text-[12.5px] text-muted-foreground shadow-panel md:bottom-36 md:right-8"
+          className="fixed bottom-40 right-5 z-50 max-h-[40dvh] max-w-[calc(100vw-2.5rem)] overflow-y-auto overscroll-contain break-words rounded-card border border-border/70 bg-card px-3 py-2 text-[12.5px] text-muted-foreground shadow-panel [overflow-wrap:anywhere] md:bottom-36 md:right-8"
         >
           {voice.notice}
         </div>
@@ -92,7 +119,7 @@ export function VoiceControl({ client = getEvaClient() }: { client?: EvaClient }
       {transcript && !voice.error && (
         <section
           aria-label="Latest voice transcript"
-          className="fixed bottom-40 right-5 z-50 w-80 max-w-[calc(100vw-2.5rem)] rounded-card border border-border/70 bg-card p-3 shadow-panel md:bottom-36 md:right-8"
+          className="fixed bottom-40 right-5 z-50 flex max-h-[calc(100dvh-12rem)] w-80 max-w-[calc(100vw-2.5rem)] flex-col overflow-y-auto overscroll-contain rounded-card border border-border/70 bg-card p-3 shadow-panel md:bottom-36 md:right-8"
         >
           <div className="flex items-center justify-between gap-2">
             <span className="text-[11px] font-medium uppercase tracking-[0.06em] text-subtle-foreground">
@@ -107,7 +134,7 @@ export function VoiceControl({ client = getEvaClient() }: { client?: EvaClient }
               )}
             </div>
           </div>
-          <p className="mt-1.5 text-[13.5px] leading-relaxed text-foreground">
+          <p className="mt-1.5 min-w-0 break-words text-[13.5px] leading-relaxed text-foreground [overflow-wrap:anywhere]">
             {transcript.text}
           </p>
 
@@ -115,10 +142,21 @@ export function VoiceControl({ client = getEvaClient() }: { client?: EvaClient }
             <button
               type="button"
               onClick={askEva}
-              disabled={asking}
-              className="rounded-md border border-border/70 bg-secondary px-2.5 py-1 text-[12px] font-medium text-foreground transition-colors hover:bg-secondary/70 disabled:opacity-60"
+              disabled={!canAsk}
+              aria-label={
+                askCountdown > 0 ? `Ask Eva available in ${askCountdown} seconds` : "Ask Eva"
+              }
+              className="rounded-md border border-border/70 bg-secondary px-2.5 py-1 text-[12px] font-medium text-foreground transition-colors hover:bg-secondary/70 disabled:cursor-not-allowed disabled:opacity-60"
             >
-              {asking ? "Eva is thinking…" : "Ask Eva"}
+              {asking
+                ? "Eva is thinking…"
+                : askCountdown > 0
+                  ? (
+                      <>
+                        Ask Eva in <span className="tabular-nums">{askCountdown}</span>s
+                      </>
+                    )
+                  : "Ask Eva"}
             </button>
             {reply && speech.supported && (
               <button
@@ -142,7 +180,7 @@ export function VoiceControl({ client = getEvaClient() }: { client?: EvaClient }
               <span className="text-[11px] font-medium uppercase tracking-[0.06em] text-subtle-foreground">
                 Eva replied
               </span>
-              <p className="mt-1 whitespace-pre-line text-[13.5px] leading-relaxed text-foreground">
+              <p className="mt-1 min-w-0 whitespace-pre-line break-words text-[13.5px] leading-relaxed text-foreground [overflow-wrap:anywhere]">
                 {reply.text}
               </p>
               {proposedTool && (

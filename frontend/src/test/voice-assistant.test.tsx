@@ -76,8 +76,9 @@ function voiceClient(
   } as unknown as EvaClient;
 }
 
-async function recordUtterance(client: EvaClient) {
-  render(<VoiceControl client={client} />);
+/** `askCooldownSeconds` omitted => the component's own production default. */
+async function recordUtterance(client: EvaClient, askCooldownSeconds?: number) {
+  render(<VoiceControl client={client} askCooldownSeconds={askCooldownSeconds} />);
   const orb = screen.getByRole("button", { name: /EVA voice orb/i });
   fireEvent.pointerDown(orb, { pointerId: 1 });
   await flush();
@@ -107,7 +108,7 @@ describe("VoiceControl assistant turn", () => {
     );
     const client = voiceClient(askAssistant);
 
-    await recordUtterance(client);
+    await recordUtterance(client, 0);
     // Nothing is reasoned about before the explicit press.
     expect(askAssistant).not.toHaveBeenCalled();
     expect(screen.getByText(/has not reasoned about it yet/)).toBeInTheDocument();
@@ -152,7 +153,7 @@ describe("VoiceControl assistant turn", () => {
       tool_results: [],
     }));
 
-    await recordUtterance(client);
+    await recordUtterance(client, 0);
     fireEvent.click(screen.getByRole("button", { name: "Ask Eva" }));
 
     expect(await screen.findByText(/calendar\.update_agenda/)).toBeInTheDocument();
@@ -167,11 +168,49 @@ describe("VoiceControl assistant turn", () => {
       throw new Error("inference unavailable: no configured self-hosted route");
     });
 
-    await recordUtterance(client);
+    await recordUtterance(client, 0);
     fireEvent.click(screen.getByRole("button", { name: "Ask Eva" }));
 
     const alert = await screen.findByText(/inference unavailable/);
     expect(alert.textContent ?? "").toContain("inference unavailable");
     expect(screen.queryByText(/Eva replied/i)).not.toBeInTheDocument();
+  });
+
+  it("holds Ask Eva behind the production five-second countdown", async () => {
+    setupMedia();
+    const askAssistant = vi.fn();
+    await recordUtterance(voiceClient(askAssistant));
+
+    // Component default: the button is locked and counts down from five.
+    const locked = screen.getByRole("button", { name: "Ask Eva available in 5 seconds" });
+    expect(locked).toBeDisabled();
+    expect(screen.getByText(/Ask Eva in/)).toBeInTheDocument();
+    expect(askAssistant).not.toHaveBeenCalled();
+  });
+
+  it("enables Ask Eva when the countdown reaches zero", async () => {
+    setupMedia();
+    const askAssistant = vi.fn(
+      async (): Promise<AssistantMessageResponse> => ({
+        request_id: "req-ask-3",
+        session_id: "sess-test",
+        reply_text: "Czekają cztery decyzje.",
+        language: "pl",
+        tool_results: [],
+      })
+    );
+    // Shortened cooldown keeps the timing assertion quick; same code path as 5s.
+    await recordUtterance(voiceClient(askAssistant), 2);
+    expect(screen.getByRole("button", { name: "Ask Eva available in 2 seconds" })).toBeDisabled();
+
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 2100));
+    });
+
+    const ready = screen.getByRole("button", { name: "Ask Eva" });
+    expect(ready).toBeEnabled();
+    fireEvent.click(ready);
+    expect(await screen.findByText("Czekają cztery decyzje.")).toBeInTheDocument();
+    expect(askAssistant).toHaveBeenCalledTimes(1);
   });
 });
