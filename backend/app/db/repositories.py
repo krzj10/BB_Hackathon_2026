@@ -114,6 +114,72 @@ def _row_to_action(row: sqlite3.Row) -> domain.ProposedAction:
     )
 
 
+def _insert_action(conn: sqlite3.Connection, action: domain.ProposedAction) -> None:
+    """Insert session placeholder + action row on an OPEN transaction (shared by
+    :meth:`ActionRepository.create_action` and the atomic idempotent path)."""
+    # Canonical parent placeholder: the action's session reference is
+    # authoritative; richer session metadata goes to SessionRepository.
+    conn.execute(
+        "INSERT INTO sessions (id, created_at, updated_at) VALUES (?, ?, ?) "
+        "ON CONFLICT(id) DO NOTHING",
+        (action.session_id, to_db(action.created_at), to_db(action.created_at)),
+    )
+    conn.execute(
+        """
+        INSERT INTO proposed_actions (
+            id, session_id, request_id, revision, tool, arguments_json,
+            arguments_digest, summary, reason, impact, before_json, after_json,
+            resource_version, policy_version, risk, requires_approval,
+            voice_approval_allowed, created_at, expires_at, status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            action.id,
+            action.session_id,
+            action.request_id,
+            action.revision,
+            action.tool,
+            _dumps(action.arguments),
+            action.arguments_digest,
+            action.summary,
+            action.reason,
+            action.impact,
+            _dumps(action.before) if action.before is not None else None,
+            _dumps(action.after) if action.after is not None else None,
+            action.resource_version,
+            action.policy_version,
+            action.risk.value,
+            int(action.requires_approval),
+            int(action.voice_approval_allowed),
+            to_db(action.created_at),
+            to_db(action.expires_at),
+            action.status.value,
+        ),
+    )
+
+
+class IdempotentProposalResult:
+    """Outcome of the atomic create-or-replay proposal boundary. Exactly one of
+    the action rows referenced here was durably created by this call when
+    status == 'created'."""
+
+    __slots__ = ("status", "action_id")
+
+    def __init__(self, status: str, action_id: str | None) -> None:
+        self.status = status  # "created" | "existing" | "conflict"
+        self.action_id = action_id
+
+
+class _IdempotencySlotTaken(Exception):
+    """Internal control flow: the (session, request) slot belongs to another
+    concurrent request; the surrounding transaction must roll back so NO
+    orphan ProposedAction row can exist."""
+
+    def __init__(self, row: sqlite3.Row | None) -> None:
+        super().__init__("idempotency slot already claimed")
+        self.row = row
+
+
 class ActionRepository:
     """Durable ProposedAction state plus receipts and execution attempts."""
 
@@ -126,45 +192,7 @@ class ActionRepository:
         """Store a new immutable-by-revision proposal. Raises IntegrityError on
         duplicate id."""
         with self._db.transaction() as conn:
-            # Canonical parent placeholder: the action's session reference is
-            # authoritative; richer session metadata goes to SessionRepository.
-            conn.execute(
-                "INSERT INTO sessions (id, created_at, updated_at) VALUES (?, ?, ?) "
-                "ON CONFLICT(id) DO NOTHING",
-                (action.session_id, to_db(action.created_at), to_db(action.created_at)),
-            )
-            conn.execute(
-                """
-                INSERT INTO proposed_actions (
-                    id, session_id, request_id, revision, tool, arguments_json,
-                    arguments_digest, summary, reason, impact, before_json, after_json,
-                    resource_version, policy_version, risk, requires_approval,
-                    voice_approval_allowed, created_at, expires_at, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    action.id,
-                    action.session_id,
-                    action.request_id,
-                    action.revision,
-                    action.tool,
-                    _dumps(action.arguments),
-                    action.arguments_digest,
-                    action.summary,
-                    action.reason,
-                    action.impact,
-                    _dumps(action.before) if action.before is not None else None,
-                    _dumps(action.after) if action.after is not None else None,
-                    action.resource_version,
-                    action.policy_version,
-                    action.risk.value,
-                    int(action.requires_approval),
-                    int(action.voice_approval_allowed),
-                    to_db(action.created_at),
-                    to_db(action.expires_at),
-                    action.status.value,
-                ),
-            )
+            _insert_action(conn, action)
 
     def get_action(self, action_id: str) -> domain.ProposedAction | None:
         with self._db.connect() as conn:
@@ -764,19 +792,56 @@ class ActionRepository:
             ).fetchone()
         return (row["arguments_digest"], row["action_id"]) if row else None
 
-    def record_idempotent_proposal(
-        self, session_id: str, request_id: str, arguments_digest: str, action_id: str
-    ) -> bool:
-        """Claim the idempotency slot; False when another proposal already
-        holds (session, request) - the caller then compares digests."""
-        with self._db.transaction() as conn:
-            cur = conn.execute(
-                "INSERT INTO proposal_idempotency (session_id, request_id, arguments_digest, action_id)"
-                " VALUES (?, ?, ?, ?)"
-                " ON CONFLICT(session_id, request_id) DO NOTHING",
-                (session_id, request_id, arguments_digest, action_id),
-            )
-            return cur.rowcount == 1
+    def create_idempotent_action(
+        self, action: domain.ProposedAction, *, session_id: str, request_id: str,
+        arguments_digest: str,
+    ) -> IdempotentProposalResult:
+        """ATOMIC create-or-replay for one logical (session, request).
+
+        One BEGIN IMMEDIATE transaction arbitrates the idempotency slot and
+        inserts the ProposedAction together, so concurrent requests can never
+        leave an orphan PENDING action behind:
+
+        - slot free            -> insert action + slot, COMMIT   -> created
+        - slot held, same key  -> rollback (nothing written)     -> existing
+        - slot held, other args-> rollback (nothing written)     -> conflict
+
+        The PK on (session_id, request_id) is the durable authority; process
+        locks are never used. ``action`` must already carry this exact
+        session_id/request_id (validated here)."""
+        if action.session_id != session_id or action.request_id != request_id:
+            raise ValueError("action identity does not match the idempotency key")
+
+        def _lookup(conn: sqlite3.Connection) -> sqlite3.Row | None:
+            return conn.execute(
+                "SELECT arguments_digest, action_id FROM proposal_idempotency"
+                " WHERE session_id = ? AND request_id = ?",
+                (session_id, request_id),
+            ).fetchone()
+
+        try:
+            with self._db.transaction() as conn:
+                row = _lookup(conn)
+                if row is not None:
+                    raise _IdempotencySlotTaken(row)
+                _insert_action(conn, action)
+                cur = conn.execute(
+                    "INSERT INTO proposal_idempotency"
+                    " (session_id, request_id, arguments_digest, action_id)"
+                    " VALUES (?, ?, ?, ?)"
+                    " ON CONFLICT(session_id, request_id) DO NOTHING",
+                    (session_id, request_id, arguments_digest, action.id),
+                )
+                if cur.rowcount != 1:  # defense in depth; rolls the action back
+                    raise _IdempotencySlotTaken(None)
+        except _IdempotencySlotTaken as taken:
+            with self._db.connect() as conn:
+                row = taken.row if taken.row is not None else _lookup(conn)
+            if row is None:  # pathological: slot vanished mid-flight
+                raise
+            status = "existing" if row["arguments_digest"] == arguments_digest else "conflict"
+            return IdempotentProposalResult(status, row["action_id"])
+        return IdempotentProposalResult("created", action.id)
 
 
 class SessionRepository:

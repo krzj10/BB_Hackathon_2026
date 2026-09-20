@@ -167,6 +167,16 @@ class EventPage:
     next_page_token: str | None = None
 
 
+@dataclass(frozen=True)
+class CalendarMutationState:
+    """INTERNAL A04 mutation-safety view (never a public API contract). The
+    canonical Meeting stays provider-shape-free; recurrence facts needed only
+    by the guarded executor are carried alongside it."""
+
+    meeting: Meeting
+    is_recurring: bool
+
+
 class CalendarService:
     """Read-only Calendar API surface (list/get). Writes are A04 territory."""
 
@@ -294,17 +304,37 @@ class CalendarService:
         calendar_id: str = "primary",
     ) -> Meeting:
         """POST a new event with the DURABLE client-generated event id (the
-        reconciliation anchor). sendUpdates is passed exactly as approved."""
+        reconciliation anchor). sendUpdates is passed exactly as approved.
+
+        REST shape per Google events.insert: the client-supplied ID lives in
+        the Event resource body (``id``), NOT in a query parameter; query
+        params carry only supported insert options such as sendUpdates."""
         body = create_event_body(args)
+        body["id"] = google_event_id
         payload = self._http.post_json(
             f"{CALENDAR_BASE}/calendars/{calendar_id}/events",
-            {"eventId": google_event_id, "sendUpdates": google_send_updates(args.send_updates)},
+            {"sendUpdates": google_send_updates(args.send_updates)},
             body,
         )
         # Read-back through the SAME normalization path as reads (LVI/LVIII):
         # trust the GET, not only the POST response.
         event_id = payload.get("id") or google_event_id
         return self.get_event(calendar_id=calendar_id, event_id=event_id)
+
+    def get_event_mutation_state(self, *, calendar_id: str, event_id: str) -> "CalendarMutationState":
+        """INTERNAL A04 mutation-safety read (not a public contract surface).
+
+        Returns the canonical Meeting PLUS raw-payload facts the canonical
+        contract intentionally does not carry: whether the resource belongs to
+        a recurring series. An event is recurring when it has a
+        ``recurringEventId`` (series instance) OR a non-empty ``recurrence``
+        array (series master). Normal A02 reads are unchanged."""
+        payload = self._http.get_json(
+            f"{CALENDAR_BASE}/calendars/{calendar_id}/events/{event_id}", None
+        )
+        meeting = normalize_event(calendar_id, payload, datetime.now(timezone.utc))
+        is_recurring = bool(payload.get("recurringEventId")) or bool(payload.get("recurrence"))
+        return CalendarMutationState(meeting=meeting, is_recurring=is_recurring)
 
     def reschedule_event(
         self,

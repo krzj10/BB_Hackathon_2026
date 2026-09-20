@@ -160,26 +160,32 @@ def create_proposal(request: Request, body: CalendarProposalArguments) -> Propos
     )
     call = ToolCall(id=f"proposal-{request_id}", name=tool, arguments=arguments)
     try:
-        action = engine.propose(call, context)
+        # Policy evaluation WITHOUT persistence (A03 logic unchanged): nothing
+        # is durable yet, so a request that loses the idempotency race can
+        # never leave an orphan PENDING action behind.
+        action = engine.propose(call, context, persist=False)
     except ActionPolicyError as exc:
         raise HTTPException(status_code=422, detail=f"{exc.code}: {exc.detail}") from None
 
-    claimed = repo.record_idempotent_proposal(session_id, request_id, digest, action.id)
-    if not claimed:
-        # Lost a race for this (session, request): the winner's action is the
-        # answer when content matches; different content fails closed. Our
-        # duplicate stays a harmless pending proposal until expiry.
-        existing = repo.get_idempotent_proposal(session_id, request_id)
-        if existing is None or existing[0] != digest:
-            raise HTTPException(
-                status_code=409, detail="this request id already produced a different proposal"
-            )
-        winner = repo.get_action(existing[1])
-        return ProposedActionResponse(action=winner or action)
+    # ONE SQLite transaction arbitrates the (session, request) slot and
+    # inserts the action together; the PK decides the winner across threads,
+    # connections and process restarts - never an in-process lock.
+    outcome = repo.create_idempotent_action(
+        action, session_id=session_id, request_id=request_id, arguments_digest=digest
+    )
+    if outcome.status == "conflict":
+        raise HTTPException(
+            status_code=409, detail="this request id already produced a different proposal"
+        )
+    if outcome.status == "existing":
+        winner = repo.get_action(outcome.action_id)
+        if winner is None:  # slot without an action cannot happen durably
+            raise HTTPException(status_code=500, detail="idempotency record inconsistent")
+        return ProposedActionResponse(action=winner)
 
     if not action.requires_approval:
         # Durable creation -> executor revalidation -> atomic no-approval
         # claim (inside execute()). No synthetic receipt, ever.
-        outcome = executor.execute(action.id)
-        action = outcome.action or action
+        exec_outcome = executor.execute(action.id)
+        action = exec_outcome.action or action
     return ProposedActionResponse(action=action)

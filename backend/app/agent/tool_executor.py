@@ -371,7 +371,9 @@ class ToolExecutor:
         else:
             ref = args.ref  # reschedule / update_agenda
             try:
-                current = service.get_event(calendar_id=ref.calendar_id, event_id=ref.event_id)
+                state = service.get_event_mutation_state(
+                    calendar_id=ref.calendar_id, event_id=ref.event_id
+                )
             except GoogleApiError as exc:
                 code = (
                     "target_not_found"
@@ -388,8 +390,10 @@ class ToolExecutor:
                     action=action,
                     result=self._error_result(action.tool, "target_unreadable", "mutation target cannot be read", action.created_at),
                 )
-            # Recurring-series ambiguity is blocked for demo mutations.
-            if current.recurring_event_id is not None:
+            current = state.meeting
+            # Recurring-series ambiguity is blocked for demo mutations - both
+            # instances (recurringEventId) and series masters (recurrence[]).
+            if state.is_recurring:
                 return self._supersede_unstarted(
                     action, "recurring_series_ambiguous",
                     "recurring events need a specific-instance proposal",
@@ -568,8 +572,11 @@ class ToolExecutor:
         )
 
     def _perform_agenda(self, action, args: CalendarUpdateAgendaArguments, service, started) -> ToolResult:
-        current = service.get_event(calendar_id=args.ref.calendar_id, event_id=args.ref.event_id)
-        if current.recurring_event_id is not None:
+        state = service.get_event_mutation_state(
+            calendar_id=args.ref.calendar_id, event_id=args.ref.event_id
+        )
+        current = state.meeting
+        if state.is_recurring:
             return self._supersede_executing(
                 action, "recurring_series_ambiguous",
                 "recurring events need a specific-instance proposal", started,
@@ -637,6 +644,12 @@ class ToolExecutor:
         except Exception:
             return self._unknown_result(
                 action.tool, "create conflict could not be reconciled", started, action.id
+            )
+        # The lookup key IS the anchor; a payload under another id is not ours.
+        if existing.ref.event_id != google_event_id:
+            return self._error_result(
+                action.tool, "create_conflict_mismatch",
+                "an unrelated event already uses this id; no automatic retry is performed", started,
             )
         if _matches_approved_create(existing, args):
             return self._ok_result(
@@ -805,7 +818,38 @@ def _span_matches(current: TimedSpan | AllDaySpan, approved: TimedSpan | AllDayS
 
 
 def _matches_approved_create(meeting: Meeting, args: CalendarCreateEventArguments) -> bool:
-    return meeting.title == args.title and _span_matches(meeting.span, args.span)
+    """Verify EVERY observable approved create semantic, not just title/time.
+
+    An event sharing only the title and span is NOT proof of our insert:
+    description, location and the canonical attendee email identity set must
+    all agree. sendUpdates is deliberately NOT compared here - it governs
+    notification delivery and is not part of the returned event-resource
+    state; its exactness is enforced on the outgoing request instead (see the
+    mapping tests). Reconciliation can only verify observable state."""
+    if meeting.title != args.title:
+        return False
+    if not _span_matches(meeting.span, args.span):
+        return False
+    if _norm_text(meeting.description) != _norm_text(args.description):
+        return False
+    if _norm_text(meeting.location) != _norm_text(args.location):
+        return False
+    if _attendee_emails(meeting.attendees) != _attendee_emails(args.attendees):
+        return False
+    return True
+
+
+def _norm_text(value: str | None) -> str:
+    """Absence-normalized text: approved None matches provider-absent/empty,
+    non-null values must agree after surrounding-whitespace trim."""
+    return (value or "").strip()
+
+
+def _attendee_emails(attendees) -> list[str]:
+    """Canonical attendee identities: case-normalized email SET. Display
+    names are not compared because providers may normalize them away; a
+    different email set is always a mismatch."""
+    return sorted({a.email.strip().lower() for a in attendees or []})
 
 
 def _matches_reschedule(meeting: Meeting, new_span: TimedSpan | AllDaySpan) -> bool:

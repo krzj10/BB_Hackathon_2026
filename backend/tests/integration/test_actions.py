@@ -59,6 +59,7 @@ class FakeGoogleHttp:
         self.post_params: list[dict] = []
         self.patch_bodies: list[dict] = []
         self.patch_headers: list[dict] = []
+        self.shape_violations: list[str] = []  # REST-shape regressions (PART 27)
         self._etag_seq = 0
         self.post_hook = None  # callable(body, params); may raise after applying
         self.patch_hook = None  # callable(event_id, body)
@@ -92,7 +93,19 @@ class FakeGoogleHttp:
         self.calls.append(("POST", url))
         self.post_bodies.append(copy.deepcopy(body))
         self.post_params.append(dict(params or {}))
-        event_id = (params or {}).get("eventId") or f"srv-{len(self.events)}"
+        # Strict REST-shape enforcement (PART 27): Google events.insert has NO
+        # eventId query parameter - the client id lives in body["id"], and the
+        # only supported option here is sendUpdates. Violations are recorded
+        # so tests fail loudly even if the executor classifies the error.
+        params = params or {}
+        if "eventId" in params:
+            self.shape_violations.append("eventId must never be a query parameter")
+        unsupported = set(params) - {"sendUpdates"}
+        if unsupported:
+            self.shape_violations.append(f"unsupported create query params: {sorted(unsupported)}")
+        # The client-supplied ID comes from the Event resource body, exactly
+        # like the real API. Without one, emulate a provider-generated id.
+        event_id = body.get("id") or f"srv-{len(self.events)}"
         if event_id in self.events and self.post_hook is None:
             raise GoogleApiError(GoogleErrorCategory.CONFLICT, status_code=409, endpoint_kind="events")
 
@@ -1059,3 +1072,214 @@ def test_local_tool_without_handler_fails_closed(tmp_path, env) -> None:
     outcome = executor_without_handlers.execute(action.id)
     assert outcome.action.status is ProposedActionStatus.FAILED
     assert outcome.result.error.code == "handler_unavailable"
+
+
+# =========================================================================== #
+# REMEDIATION - create request shape (body id, no eventId param)
+# =========================================================================== #
+
+
+def test_create_request_shape_body_id_and_no_eventid_param(env) -> None:
+    """Fails on the pre-remediation shape (eventId query param): the client-
+    generated ID must ride in the Event resource body under 'id', while the
+    query string carries only supported options such as sendUpdates."""
+    action, confirmation = propose_and_approve(env, create_body("Shape check"), request_id="req-shape")
+    assert confirmation.json()["action"]["status"] == "succeeded"
+    stored = env.repo.get_google_event_id(action["id"], action["revision"])
+    assert stored == generate_google_event_id(action["id"], action["revision"])
+
+    assert env.fake.shape_violations == []
+    assert "eventId" not in env.fake.post_params[0]
+    assert env.fake.post_bodies[0]["id"] == stored
+    assert env.fake.post_params[0].get("sendUpdates") == "none"
+    # Read-back GET used the SAME durable client id.
+    get_urls = [url for method, url in env.fake.calls if method == "GET"]
+    assert any(url.endswith(f"/events/{stored}") for url in get_urls)
+
+
+# =========================================================================== #
+# REMEDIATION - atomic proposal idempotency (no orphan losers)
+# =========================================================================== #
+
+
+def _count(env: Env, sql: str, params: tuple) -> int:
+    from app.db.session import Database
+
+    with Database(env.db_url).connect() as conn:  # fresh connection = durable truth
+        return conn.execute(sql, params).fetchone()[0]
+
+
+def test_concurrent_same_digest_yields_exactly_one_action(env) -> None:
+    body = create_body("Race sync", span=timed_span_iso(15))
+    barrier = threading.Barrier(2)
+    results: list[tuple[int, str | None]] = []
+    lock = threading.Lock()
+
+    def attempt() -> None:
+        client = TestClient(env.app)  # independent request threads
+        barrier.wait()
+        response = client.post("/api/calendar/proposals", json=body, headers=headers(request_id="req-race1"))
+        action_id = response.json().get("action", {}).get("id") if response.status_code == 200 else None
+        with lock:
+            results.append((response.status_code, action_id))
+
+    threads = [threading.Thread(target=attempt) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+    assert [r[0] for r in results] == [200, 200], results
+    assert results[0][1] is not None and results[0][1] == results[1][1]
+
+    assert _count(env, "SELECT COUNT(*) FROM proposal_idempotency WHERE session_id=? AND request_id=?",
+                  (SESSION, "req-race1")) == 1
+    assert _count(env, "SELECT COUNT(*) FROM proposed_actions WHERE session_id=? AND request_id=?",
+                  (SESSION, "req-race1")) == 1  # no orphan loser action
+    # Only one action exists, hence exactly one challengeable surface.
+    snapshot = env.client.get(f"/api/actions/{results[0][1]}", headers=headers(request_id=None))
+    assert snapshot.status_code == 200
+
+
+def test_concurrent_different_digest_one_wins_one_conflict(env) -> None:
+    barrier = threading.Barrier(2)
+    outcomes: list[int] = []
+    lock = threading.Lock()
+
+    def attempt(title: str) -> None:
+        client = TestClient(env.app)
+        body = create_body(title, span=timed_span_iso(16))
+        barrier.wait()
+        response = client.post("/api/calendar/proposals", json=body, headers=headers(request_id="req-race2"))
+        with lock:
+            outcomes.append(response.status_code)
+
+    threads = [
+        threading.Thread(target=attempt, args=("Alpha plan",)),
+        threading.Thread(target=attempt, args=("Beta plan",)),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+    assert sorted(outcomes) == [200, 409]  # winner independent of scheduling
+
+    assert _count(env, "SELECT COUNT(*) FROM proposal_idempotency WHERE session_id=? AND request_id=?",
+                  (SESSION, "req-race2")) == 1
+    assert _count(env, "SELECT COUNT(*) FROM proposed_actions WHERE session_id=? AND request_id=?",
+                  (SESSION, "req-race2")) == 1  # exactly one action; no orphan PENDING
+
+
+# =========================================================================== #
+# REMEDIATION - hardened reconciliation matching
+# =========================================================================== #
+
+
+def test_conflict_reconciliation_mismatch_on_attendees_fails(env) -> None:
+    proposal = propose(env, create_body("Reconcile target"), request_id="req-mm1")
+    action = proposal.json()["action"]
+
+    def hook(body, params, apply):
+        # An unrelated-but-similar event landed under our client id (same
+        # title AND span - only the attendee set differs). Title/time alone
+        # must NOT be treated as proof of our successful create.
+        env.fake.events[body["id"]] = {
+            "id": body["id"], "summary": "Reconcile target", "etag": "etag-x1",
+            "start": {"dateTime": "2026-09-21T12:00:00+02:00", "timeZone": "Europe/Warsaw"},
+            "end": {"dateTime": "2026-09-21T13:00:00+02:00", "timeZone": "Europe/Warsaw"},
+            "attendees": [{"email": "mallory@example.com"}],
+        }
+        raise GoogleApiError(GoogleErrorCategory.CONFLICT, status_code=409, endpoint_kind="events")
+
+    env.fake.post_hook = hook
+    confirmation = confirm(env, action["id"], action["revision"], action["arguments_digest"], "approve")
+    body = confirmation.json()
+    assert body["action"]["status"] == "failed"
+    assert body["result"]["error"]["code"] == "create_conflict_mismatch"
+
+
+def test_timeout_reconciliation_mismatch_on_location_stays_unknown(env) -> None:
+    proposal = propose(env, create_body("Timeout mismatch"), request_id="req-mm2")
+    action = proposal.json()["action"]
+
+    def hook(body, params, apply):
+        # Something landed under our id with a DIFFERENT location (approved
+        # had none); the response is then lost. Ambiguous + unverified state
+        # must stay UNKNOWN - never verified success.
+        env.fake.events[body["id"]] = {
+            "id": body["id"], "summary": "Timeout mismatch", "etag": "etag-x2",
+            "location": "Room of requirement: 7",
+            "start": {"dateTime": "2026-09-21T12:00:00+02:00", "timeZone": "Europe/Warsaw"},
+            "end": {"dateTime": "2026-09-21T13:00:00+02:00", "timeZone": "Europe/Warsaw"},
+        }
+        raise GoogleApiError(GoogleErrorCategory.TRANSPORT, endpoint_kind="events")
+
+    env.fake.post_hook = hook
+    confirmation = confirm(env, action["id"], action["revision"], action["arguments_digest"], "approve")
+    body = confirmation.json()
+    assert body["action"]["status"] == "unknown"  # never verified success
+    assert body["result"]["status"] == "unknown"
+
+
+def test_conflict_reconciliation_matches_case_insensitive_attendees(env) -> None:
+    proposal = propose(
+        env,
+        create_body("Match me", attendees=[{"email": "Alice@Example.com"}, {"email": "bob@example.com"}]),
+        request_id="req-mm3",
+    )
+    action = proposal.json()["action"]
+    google_id = generate_google_event_id(action["id"], action["revision"])
+
+    def hook(body, params, apply):
+        apply()  # event lands (duplicate delivery), then the response is lost
+        raise GoogleApiError(GoogleErrorCategory.CONFLICT, status_code=409, endpoint_kind="events")
+
+    env.fake.post_hook = hook
+    confirmation = confirm(env, action["id"], action["revision"], action["arguments_digest"], "approve")
+    body = confirmation.json()
+    # The applied event carries the approved attendee emails (provider may
+    # case-normalize); identity comparison is case-insensitive -> reconciled.
+    assert body["action"]["status"] == "succeeded"
+    assert body["result"]["data"].get("reconciled") is True
+
+
+# =========================================================================== #
+# REMEDIATION - recurring MASTER detection (recurrence[] without id)
+# =========================================================================== #
+
+
+def test_recurring_master_recurrence_array_blocks_reschedule(env) -> None:
+    seed_event(
+        env, event_id="evt-1", etag="etag-v1",
+        recurrence=["RRULE:FREQ=WEEKLY"],  # series master: no recurringEventId
+    )
+    action, confirmation = propose_and_approve(env, reschedule_body(), request_id="req-rm1")
+    body = confirmation.json()
+    assert body["action"]["status"] == "superseded"
+    assert body["result"]["error"]["code"] == "recurring_series_ambiguous"
+    assert env.fake.mutations == []  # zero PATCH
+
+
+def test_recurring_master_blocks_agenda_update(env) -> None:
+    seed_event(
+        env, event_id="evt-1", etag="etag-v1", description="series master text",
+        recurrence=["RRULE:FREQ=MONTHLY;BYMONTHDAY=5"],
+    )
+    action, confirmation = propose_and_approve(env, agenda_body(), request_id="req-rm2")
+    body = confirmation.json()
+    assert body["action"]["status"] == "superseded"
+    assert body["result"]["error"]["code"] == "recurring_series_ambiguous"
+    assert env.fake.mutations == []
+
+
+def test_recurring_events_remain_readable(env) -> None:
+    """Mutation eligibility only - A02-style reads of recurring events stay
+    fully allowed (both instances and masters)."""
+    seed_event(env, event_id="evt-master", summary="Weekly sync", recurrence=["RRULE:FREQ=WEEKLY"])
+    seed_event(env, event_id="evt-inst", summary="Weekly sync instance", recurringEventId="series-1")
+    for event_id in ("evt-master", "evt-inst"):
+        result = env.executor.execute_read(
+            ToolCall(id=f"c-{event_id}", name="calendar.get_event", arguments={"event_id": event_id})
+        )
+        assert result.status.value == "ok", event_id
+    response = env.client.get("/api/calendar/events/evt-master")
+    assert response.status_code == 200
