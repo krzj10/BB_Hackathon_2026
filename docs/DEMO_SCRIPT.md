@@ -25,26 +25,32 @@ Kontrola: `GET /api/health` → `components.stt.status = ready`.
 ## 2. Głos Evy (TTS zainstalowany w systemie)
 
 Eva czyta odpowiedzi za pośrednictwem `speechSynthesis` przeglądarki, czyli
-głosów zainstalowanych w Windows. Angielski jest domyślnie (`Zira`), polski
-trzeba dodać — **raz**, z uprawnieniami administratora:
+głosów zainstalowanych w Windows. **Polski głos jest już na tej maszynie**
+(`Microsoft Paulina Desktop`, `pl-PL`), angielski to fabryczna `Zira`. Instalacja
+wygląda tak — jednorazowo, z uprawnieniami administratora:
 
 ```powershell
-# PowerShell JAKO ADMINISTRATOR
 Add-WindowsCapability -Online -Name "Language.TextToSpeech~~~pl-PL~0.0.1.0"
+# weryfikacja (bez uprawnień):
+Add-Type -AssemblyName System.Speech
+(New-Object System.Speech.Synthesis.SpeechSynthesizer).GetInstalledVoices().VoiceInfo | Select-Object Name, Culture
 ```
 
 albo bez wiersza polecenia: *Ustawienia → Czas i język → Wymowa → Dodaj głosy →
 Polski*. Nie trzeba wpisywać żadnej nazwy głosu — kod dopasowuje go po prefiksie
 BCP-47 (`pl`).
 
-Wariant zero-instalacji: Chrome/Edge mają sieciowe głosy neuronowe. Sprawdź w
-DevTools (F12 → Console):
+**Świeżo zainstalowany głos wymaga restartu przeglądarki**: Chrome i Edge
+cache'ują listę głosów systemowych, więc Paulina pojawi się w `getVoices()`
+dopiero w nowym procesie. Kontrola w DevTools (F12 → Console):
 
 ```js
 [...speechSynthesis.getVoices()].filter(v => v.lang.toLowerCase().startsWith("pl")).map(v => `${v.name} (${v.lang})`)
 ```
 
-Jeśli lista jest niepusta, Eva będzie mówić po polsku od razu.
+Lista niepusta → Eva mówi po polsku od razu. Lista pusta po reboocie systemu i
+restartzie przeglądarki → zostaje wariant zero-instalacji: sieciowe głosy
+neuronowe Chrome/Edge (`Microsoft ... Online (Natural)`).
 
 ## 3. Wgranie danych demonstracyjnych
 
@@ -135,5 +141,5 @@ ma.
 |---|---|
 | puste ekrany | ponowny `POST /api/demo/reset` |
 | mikrofon milczy | czy to `localhost`; czy `/api/health` pokazuje `stt: ready`; nagranie ≤ 30 s |
-| Eva nie mówi po polsku | dodaj głos wg sekcji 2 albo użyj Chrome/Edge z głosem sieciowym |
+| Eva nie mówi po polsku | restart przeglądarki (lista głosów jest cache'owana), potem weryfikacja z sekcji 2; awaryjnie głos sieciowy Chrome/Edge |
 | brak odpowiedzi asystenta | sprawdź `POST /api/settings/llm/test`; model self-hosted musi być uruchomiony |
