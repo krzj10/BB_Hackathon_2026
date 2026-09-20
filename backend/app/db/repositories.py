@@ -878,11 +878,24 @@ class AttentionRepository:
     def __init__(self, db: Database) -> None:
         self._db = db
 
-    def add(self, item: domain.AttentionItem) -> bool:
+    def add(
+        self,
+        item: domain.AttentionItem,
+        decision: domain.Decision | None = None,
+    ) -> bool:
         """True when stored; False only on the canonical (source, source_id)
         deduplication conflict. Any other integrity violation (e.g. duplicate
         primary key) surfaces as sqlite3.IntegrityError instead of being
-        misread as a duplicate sighting."""
+        misread as a duplicate sighting.
+
+        B04 extension (semantics for A06's single-argument call are byte-for-
+        byte unchanged): when a linked Decision is supplied, item and decision
+        are inserted in ONE transaction - the FK requires the item row first,
+        and UNIQUE(attention_item_id) keeps exactly one Decision per item. A
+        dedup miss inserts nothing, so a replayed source can never produce a
+        second Decision."""
+        if decision is not None and decision.attention_item_id != item.id:
+            raise ValueError("decision.attention_item_id must equal item.id")
         with self._db.transaction() as conn:
             cur = conn.execute(
                 "INSERT INTO attention_items (id, source, source_id, received_at, payload_json)"
@@ -891,7 +904,24 @@ class AttentionRepository:
                 (item.id, item.source.value, item.source_id, to_db(item.received_at),
                  item.model_dump_json()),
             )
+            if cur.rowcount == 1 and decision is not None:
+                conn.execute(
+                    "INSERT INTO decisions (id, attention_item_id, status,"
+                    " proposed_action_id, payload_json) VALUES (?, ?, ?, ?, ?)",
+                    (decision.id, decision.attention_item_id, decision.status.value,
+                     decision.proposed_action_id, decision.model_dump_json()),
+                )
             return cur.rowcount == 1
+
+    def list_latest(self, *, limit: int = 200) -> list[domain.AttentionItem]:
+        """Most recently received items first (stable tie-break by id)."""
+        with self._db.connect() as conn:
+            rows = conn.execute(
+                "SELECT payload_json FROM attention_items"
+                " ORDER BY received_at DESC, id ASC LIMIT ?",
+                (max(1, int(limit)),),
+            ).fetchall()
+        return [domain.AttentionItem.model_validate_json(row["payload_json"]) for row in rows]
 
     def get(self, item_id: str) -> domain.AttentionItem | None:
         with self._db.connect() as conn:
@@ -945,6 +975,35 @@ class DecisionRepository:
             ).fetchone()
         return domain.Decision.model_validate_json(row["payload_json"]) if row else None
 
+    def get_by_attention_item(self, attention_item_id: str) -> domain.Decision | None:
+        with self._db.connect() as conn:
+            row = conn.execute(
+                "SELECT payload_json FROM decisions WHERE attention_item_id = ?",
+                (attention_item_id,),
+            ).fetchone()
+        return domain.Decision.model_validate_json(row["payload_json"]) if row else None
+
+    def list_all(self) -> list[domain.Decision]:
+        """All decisions in durable creation order (newest first)."""
+        with self._db.connect() as conn:
+            rows = conn.execute(
+                "SELECT payload_json FROM decisions ORDER BY rowid DESC"
+            ).fetchall()
+        return [domain.Decision.model_validate_json(row["payload_json"]) for row in rows]
+
+    def update(self, decision: domain.Decision) -> None:
+        """Canonical whole-row update (status/proposed_action_id/payload move
+        together; the stored status column always agrees with the payload)."""
+        with self._db.transaction() as conn:
+            cur = conn.execute(
+                "UPDATE decisions SET status = ?, proposed_action_id = ?, payload_json = ?"
+                " WHERE id = ?",
+                (decision.status.value, decision.proposed_action_id,
+                 decision.model_dump_json(), decision.id),
+            )
+            if cur.rowcount != 1:
+                raise KeyError(f"unknown decision {decision.id!r}")
+
 
 class FocusRepository:
     """Canonical storage boundary for focus sessions and completion summaries
@@ -988,6 +1047,25 @@ class FocusRepository:
                 "SELECT payload_json FROM focus_sessions WHERE id = ?", (session_id,)
             ).fetchone()
         return domain.FocusSession.model_validate_json(row["payload_json"]) if row else None
+
+    def get_active(self, now: datetime) -> domain.FocusSession | None:
+        """The one session active at ``now`` ('active' stays derived from
+        timestamps + stopped_at; never a stored boolean). Rows are compared on
+        the canonical UTC representation written by to_db()."""
+        if now.tzinfo is None or now.tzinfo.utcoffset(now) is None:
+            raise ValueError("naive datetimes are rejected; contracts require aware values")
+        with self._db.connect() as conn:
+            rows = conn.execute(
+                "SELECT payload_json FROM focus_sessions"
+                " WHERE stopped_at IS NULL AND starts_at <= ? AND ends_at > ?"
+                " ORDER BY starts_at DESC LIMIT 2",
+                (to_db(now), to_db(now)),
+            ).fetchall()
+        if not rows:
+            return None
+        # Concurrent overlapping starts are a bug, not a choice: surface it.
+        session = domain.FocusSession.model_validate_json(rows[0]["payload_json"])
+        return session if session.is_active(now) else None
 
     def put_summary(self, summary: domain.FocusCompletionSummary) -> None:
         with self._db.transaction() as conn:
@@ -1082,3 +1160,32 @@ class OutboxRepository:
                 "SELECT payload_json FROM event_outbox ORDER BY seq ASC LIMIT ?", (limit,)
             ).fetchall()
         return [domain.EventEnvelope.model_validate_json(r["payload_json"]) for r in rows]
+
+    def list_after(
+        self, seq: int, *, session_id: str | None = None, limit: int = 100
+    ) -> list[tuple[int, domain.EventEnvelope]]:
+        """Events appended after ``seq`` as (outbox_seq, envelope) pairs in
+        durable order (monotonic read view; no consumption).
+
+        B04 basic live-event streaming reads through this cursor; durable
+        delivery/replay semantics remain A07."""
+        if session_id is None:
+            query = (
+                "SELECT seq, payload_json FROM event_outbox WHERE seq > ?"
+                " ORDER BY seq ASC LIMIT ?"
+            )
+            params: tuple = (int(seq), max(1, int(limit)))
+        else:
+            query = (
+                "SELECT seq, payload_json FROM event_outbox WHERE seq > ? AND session_id = ?"
+                " ORDER BY seq ASC LIMIT ?"
+            )
+            params = (int(seq), session_id, max(1, int(limit)))
+        with self._db.connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [(int(r["seq"]), domain.EventEnvelope.model_validate_json(r["payload_json"])) for r in rows]
+
+    def max_seq(self) -> int:
+        with self._db.connect() as conn:
+            row = conn.execute("SELECT MAX(seq) AS m FROM event_outbox").fetchone()
+        return int(row["m"]) if row and row["m"] is not None else 0

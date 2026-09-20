@@ -20,10 +20,17 @@ from . import __version__
 from .agent.tool_executor import ToolExecutor
 from .agent.tool_registry import build_default_registry
 from .api.actions import router as actions_router
+from .api.assistant import router as assistant_router
+from .api.attention import router as attention_router
 from .api.auth_google import router as auth_google_router
+from .api.briefing import router as briefing_router
 from .api.calendar import router as calendar_router
+from .api.decisions import router as decisions_router
+from .api.events import router as events_router
+from .api.focus import router as focus_router
 from .api.health import router as health_router
 from .api.ingress import VoiceIngressLimiter
+from .api.settings import router as settings_router
 from .api.voice import router as voice_router
 from .approvals.engine import ActionApprovalEngine
 from .approvals.policy import load_policy
@@ -37,6 +44,7 @@ from .google.auth import GoogleAuth
 from .google.calendar import CalendarService
 from .google.gmail import GmailService
 from .google.http import AuthorizedGoogleHttp
+from .llm.router import LLMRouter
 from .voice.audio import FfmpegAudioNormalizer
 from .voice.faster_whisper import FasterWhisperProvider
 from .voice.stt_base import TranscriptionService, canonicalize_stt_provider_name
@@ -64,13 +72,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         service = getattr(app.state, "stt_service", None)
         if service is not None:
             await service.warmup()
+        # B04 scheduler: one worker for the shared ingestion path (idle-gated).
+        poller = getattr(app.state, "poll_scheduler", None)
+        if poller is not None:
+            poller.start()
         yield
+        if poller is not None:
+            poller.stop()
 
     app = FastAPI(title="EVA Core Platform", version=__version__, lifespan=lifespan)
     app.state.settings = settings
     # A02: the auth boundary owns all Google credentials. Tests replace
     # app.state.google_auth (and optionally google_http_factory) with fakes.
     app.state.google_auth = GoogleAuth(settings)
+    # B01: ONE inference router for the whole app - self-hosted primary plus an
+    # optional explicitly configured self-hosted fallback; unconfigured settings
+    # yield a router with no routes (fail closed, never cloud). Tests replace
+    # app.state.llm_router with a hermetic double.
+    app.state.llm_router = LLMRouter.from_settings(settings)
 
     # A01/A03/A04 core state - exactly one of each, shared by every route.
     db = Database(settings.eva_db_url)
@@ -162,6 +181,70 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         factory = getattr(app.state, "google_http_factory", None)
         return factory(session) if factory is not None else AuthorizedGoogleHttp(session)
 
+    # -- B04 Attention/Focus/Decision services (exactly one of each). The
+    # deterministic rules engine is the ONLY classifier floor; FocusService
+    # influences delivery, never priority; Decisions are projected atomically
+    # with their DECISION_REQUIRED items and executed only as guarded
+    # local_write proposals through the single A04 executor below.
+    from .attention.engine import AttentionEngine
+    from .attention.focus import FocusService
+    from .attention.rules import AttentionRules
+    from .db.repositories import (
+        AttentionRepository,
+        CursorRepository,
+        DecisionRepository,
+        FocusRepository,
+        OutboxRepository,
+    )
+    from .decisions.service import DecisionService
+
+    app.state.cursor_repository = CursorRepository(db)
+    app.state.attention_repository = AttentionRepository(db)
+    app.state.decision_repository = DecisionRepository(db)
+    app.state.event_outbox_repository = OutboxRepository(db)
+    app.state.attention_rules = AttentionRules(
+        policy=policy,
+        important_senders=getattr(app.state, "important_sender_addresses", ()),
+    )
+    focus_service = FocusService(
+        repo=FocusRepository(db),
+        attention_repo=app.state.attention_repository,
+        clock=utcnow,
+        policy_version=policy.version,
+        outbox=app.state.event_outbox_repository,
+    )
+    app.state.focus_service = focus_service
+
+    # The optional LLM ambiguity classifier is a STRENGTHENER ONLY (clamped);
+    # without any configured self-hosted route it answers "no opinion" and the
+    # engine is purely deterministic. It reads the LIVE router, so settings
+    # updates take effect without rebuilding the engine.
+    from .attention.classifier import LLMAmbiguityClassifier
+
+    attention_engine = AttentionEngine(
+        rules=app.state.attention_rules,
+        policy_version=policy.version,
+        focus_service=focus_service,
+        clock=utcnow,
+        classifier=LLMAmbiguityClassifier(lambda: app.state.llm_router),
+    )
+    app.state.attention_engine = attention_engine
+    app.state.attention_sink = attention_engine
+
+    def local_focus_start(args) -> dict:
+        session = focus_service.start(args, now=utcnow())
+        return {"session": session.model_dump(mode="json")}
+
+    def local_focus_stop(args) -> dict:
+        stopped, summary = focus_service.stop(now=utcnow())
+        return {
+            "session": stopped.model_dump(mode="json"),
+            "summary": summary.model_dump(mode="json"),
+        }
+
+    def local_decision_record_outcome(args) -> dict:
+        return decision_service.record_outcome(args)
+
     executor = ToolExecutor(
         registry=registry,
         repo=repo,
@@ -169,12 +252,49 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         clock=utcnow,
         calendar_service_factory=calendar_service_factory,
         granted_scopes_provider=granted_scopes_provider,
+        local_handlers={
+            "focus.start": local_focus_start,
+            "focus.stop": local_focus_stop,
+            "decision.record_outcome": local_decision_record_outcome,
+        },
         read_handlers={
             "calendar.list_events": read_calendar_list,
             "calendar.get_event": read_calendar_get,
             "gmail.search": read_gmail_search,
             "gmail.get_thread": read_gmail_get_thread,
         },
+    )
+    decision_service = DecisionService(
+        repo=app.state.decision_repository,
+        action_repo=repo,
+        engine=engine,
+        executor=executor,
+        clock=utcnow,
+        outbox=app.state.event_outbox_repository,
+    )
+    app.state.decision_service = decision_service
+
+    # -- B03 executive assistant + grounded briefing (one of each). Both read
+    # the LIVE inference router through providers, so a runtime settings PUT
+    # re-routes them without rebuilding.
+    from .agent.executive_agent import ExecutiveAgent
+    from .meetings.briefing import BriefingService
+
+    app.state.calendar_service_factory = calendar_service_factory
+    app.state.assistant_agent = ExecutiveAgent(
+        llm_router_provider=lambda: app.state.llm_router,
+        registry=registry,
+        approval_engine=engine,
+        action_repo=repo,
+        executor=executor,
+        clock=utcnow,
+    )
+    app.state.briefing_service = BriefingService(
+        llm_router_provider=lambda: app.state.llm_router,
+        calendar_service_factory=calendar_service_factory,
+        attention_repo=app.state.attention_repository,
+        clock=utcnow,
+        outbox=app.state.event_outbox_repository,
     )
 
     app.state.db = db
@@ -184,32 +304,44 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.tool_registry = registry
     app.state.tool_executor = executor
 
-    # -- A06 Gmail ingestion + deterministic Attention rules. The Attention
-    # SINK is B04's AttentionEngine (frozen ingest(source_event) -> AttentionItem):
-    # until B04 wires it, app.state.attention_sink stays None and ingestion
-    # honestly leaves new sources unseen instead of faking classification.
-    # IMPORTANT SENDERS: exact-address set is a B04/ORG configuration handoff;
-    # empty here on purpose - no real addresses are hardcoded in source.
+    # -- A06 Gmail ingestion: the ONE real pipeline shared by the scheduler and
+    # POST /api/attention/check-now (never a second path). Its sink is B04's
+    # AttentionEngine; DECISION_REQUIRED items project their single linked
+    # Decision atomically inside AttentionRepository.add via
+    # decision_projection. IMPORTANT SENDERS: exact-address set is an
+    # ORG-configuration handoff - empty here on purpose, never hardcoded.
     from .attention.ingest import GmailIngestionService
-    from .attention.rules import AttentionRules
-    from .db.repositories import AttentionRepository, CursorRepository
 
-    app.state.cursor_repository = CursorRepository(db)
-    app.state.attention_repository = AttentionRepository(db)
-    app.state.attention_rules = AttentionRules(
-        policy=policy,
-        important_senders=getattr(app.state, "important_sender_addresses", ()),
-    )
-    app.state.attention_sink = None  # B04 injects its AttentionEngine here
     app.state.ingestion_service = GmailIngestionService(
         gmail_source_factory=lambda: GmailService(_google_http()),
         cursors=app.state.cursor_repository,
         attention_repo=app.state.attention_repository,
-        sink=None,  # replaced at B04 wiring alongside app.state.attention_sink
+        sink=attention_engine,
         query=settings.eva_gmail_query,
         search_limit=settings.eva_gmail_search_limit,
         overlap_seconds=settings.eva_gmail_poll_overlap_seconds,
         clock=utcnow,
+        decision_projection=attention_engine.decision_projection,
+    )
+
+    # -- B04 scheduler: exactly one in-process poller; it idles with zero
+    # network attempts while Gmail is not authorized and never overlaps a
+    # check-now run (the ingestion service's own lock decides that).
+    from .scheduler.jobs import GmailPollScheduler
+
+    def _gmail_ready() -> bool:
+        try:
+            return bool(app.state.google_auth.status().connected)
+        except Exception:
+            return False
+
+    app.state.poll_scheduler = GmailPollScheduler(
+        ingestion_service=app.state.ingestion_service,
+        outbox_repo=app.state.event_outbox_repository,
+        attention_repo=app.state.attention_repository,
+        decision_repo=app.state.decision_repository,
+        clock=utcnow,
+        enabled_provider=_gmail_ready,
     )
 
     # -- A05 voice pipeline: one normalizer + one STT service per application.
@@ -258,6 +390,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(auth_google_router)
     app.include_router(calendar_router)
     app.include_router(actions_router)
+    app.include_router(attention_router)
+    app.include_router(decisions_router)
+    app.include_router(focus_router)
+    app.include_router(events_router)
+    app.include_router(settings_router)
+    app.include_router(assistant_router)
+    app.include_router(briefing_router)
     app.include_router(voice_router)
 
     # Voice upload ingress cap runs BEFORE multipart parsing (added last, so

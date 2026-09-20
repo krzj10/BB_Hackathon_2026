@@ -50,7 +50,12 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Literal, Protocol, Sequence
 
-from ..contracts.domain import AttentionItem, NormalizedSourceEvent, RetrievalStatus
+from ..contracts.domain import (
+    AttentionItem,
+    Decision,
+    NormalizedSourceEvent,
+    RetrievalStatus,
+)
 from ..db.repositories import AttentionRepository, CursorRepository
 from ..google.gmail import (
     DEFAULT_SEARCH_LIMIT,
@@ -127,6 +132,7 @@ class GmailIngestionService:
         max_poll_threads: int = MAX_WINDOW_THREADS,
         max_poll_pages: int = MAX_WINDOW_PAGES,
         clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+        decision_projection: Callable[[AttentionItem], Decision | None] | None = None,
     ) -> None:
         if overlap_seconds < 0:
             raise ValueError("overlap_seconds must be >= 0")
@@ -142,6 +148,11 @@ class GmailIngestionService:
         self._max_poll_threads = max(1, max_poll_threads)
         self._max_poll_pages = max(1, max_poll_pages)
         self._clock = clock
+        # B04 hook: atomically project a DECISION_REQUIRED item together with
+        # its single linked Decision inside AttentionRepository.add's one
+        # transaction. With None (A06 tests / unwired state) persistence is
+        # exactly the original single-argument call.
+        self._decision_projection = decision_projection
         # Scheduling protection ONLY - durable dedup remains SQLite.
         self._run_lock = threading.Lock()
 
@@ -364,7 +375,12 @@ class GmailIngestionService:
                 break
             try:
                 item = self._sink.ingest(event)
-                stored = self._attention_repo.add(item)
+                if self._decision_projection is not None:
+                    stored = self._attention_repo.add(
+                        item, decision=self._decision_projection(item)
+                    )
+                else:
+                    stored = self._attention_repo.add(item)
             except Exception as exc:  # sanitized id + class, never the body
                 logger.error(
                     "downstream ingestion failed for gmail:%s (%s)",
