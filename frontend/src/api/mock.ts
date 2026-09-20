@@ -1,4 +1,4 @@
-import type { EvaClient } from "./client";
+import { ApiError, type EvaClient, type TranscribeAudioRequest } from "./client";
 import type {
   AttentionItem,
   AttentionListResponse,
@@ -30,6 +30,8 @@ import type {
   LlmSettingsUpdateRequest,
   LlmTestConnectionResponse,
   DetectModelsResponse,
+  Transcript,
+  TranscribeResponse,
 } from "./types.generated";
 import acmeFixture from "../../../contracts/fixtures/meeting_acme_high.json";
 import teamSyncFixture from "../../../contracts/fixtures/meeting_team_sync_medium.json";
@@ -42,6 +44,7 @@ import briefingFixture from "../../../contracts/fixtures/briefing_acme_pl.json";
 import proposedActionFixture from "../../../contracts/fixtures/proposed_action_agenda_high.json";
 import toolResultFixture from "../../../contracts/fixtures/tool_result_agenda_ok.json";
 import llmSettingsFixture from "../../../contracts/fixtures/llm_settings_response.json";
+import transcriptPlFixture from "../../../contracts/fixtures/transcript_pl.json";
 
 export type MockMode =
   | "fixtures"
@@ -78,6 +81,7 @@ const activeFocusSession = canonical<FocusSession>(focusSessionFixture, "focus_s
 const focusCompletionSummary = canonical<FocusCompletionSummary>(focusCompletionFixture, "focus_completion_summary");
 const briefing = canonical<ExecutiveBriefing>(briefingFixture, "briefing_acme_pl");
 const proposedActionAgenda = canonical<ProposedAction>(proposedActionFixture, "proposed_action_agenda_high");
+const transcriptPl = canonical<Transcript>(transcriptPlFixture, "transcript_pl");
 const toolResult = canonical<ToolResult>(toolResultFixture, "tool_result_agenda_ok");
 const llmSettings = canonical<LlmSettingsResponse>(llmSettingsFixture, "llm_settings_response");
 
@@ -627,6 +631,25 @@ export function createMockClient(options: MockClientOptions = {}): EvaClient {
           },
         ],
       });
+    },
+
+    transcribeAudio: (request: TranscribeAudioRequest) => {
+      // Deterministic canonical fixture transcript; the mock echoes the
+      // supplied requestId (A05 contract) and never randomizes transcripts.
+      // No assistant reasoning exists in this slice — STT only.
+      if (mode === "pending") {
+        return new Promise<TranscribeResponse>(() => {});
+      }
+      if (mode === "error") {
+        return Promise.reject(
+          new ApiError("POST", 422, "/api/voice/transcribe", "audio_silent: no speech detected in the recording")
+        );
+      }
+      const response: TranscribeResponse = {
+        request_id: request.requestId,
+        transcript: { ...transcriptPl },
+      };
+      return Promise.resolve(response);
     },
   };
 }

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import React, { useRef, useState } from "react";
 import { cn } from "../../lib/utils";
 import type { VoiceState } from "../../api/types.generated";
 
@@ -44,22 +44,36 @@ const CANONICAL_STATE_ORDER: VoiceState[] = [
 ];
 
 /**
- * Global EVA Voice Orb — presentation only. No microphone/STT/TTS/session
- * behavior lives here. In the B02A preview, activation deterministically
- * cycles canonical states for visual inspection; it does not pretend any
- * voice processing is connected.
+ * Global EVA Voice Orb — presentation plus PTT affordance. No microphone
+ * capture/STT/TTS/session behavior lives here: the canonical VoiceState and
+ * press handlers arrive from the voice controller (useVoiceSession). Without
+ * PTT handlers it keeps the B02A deterministic preview cycling.
  */
 export function VoiceOrb({
   state: controlledState,
   className,
+  instructional,
+  onPressStart,
+  onPressEnd,
+  onPressCancel,
+  disabled,
 }: {
   /** Canonical VoiceState from A00; omitted = deterministic preview cycling. */
   state?: VoiceState;
   className?: string;
+  /** Concise PTT instruction for the idle state, e.g. "Hold to talk". */
+  instructional?: string;
+  /** Press-and-hold handlers (pointer + keyboard). */
+  onPressStart?: () => void;
+  onPressEnd?: () => void;
+  onPressCancel?: () => void;
+  disabled?: boolean;
 }) {
   const [previewState, setPreviewState] = useState<VoiceState>("idle");
   const state = controlledState ?? previewState;
   const treatment = ORB_TREATMENT[state];
+  const isPtt = Boolean(onPressStart);
+  const pressedRef = useRef(false);
 
   const cycle = () => {
     if (controlledState !== undefined) return;
@@ -67,6 +81,63 @@ export function VoiceOrb({
       (current) =>
         CANONICAL_STATE_ORDER[(CANONICAL_STATE_ORDER.indexOf(current) + 1) % CANONICAL_STATE_ORDER.length]
     );
+  };
+
+  const beginPress = () => {
+    if (disabled || pressedRef.current) return;
+    pressedRef.current = true;
+    onPressStart?.();
+  };
+
+  const endPress = () => {
+    if (!pressedRef.current) return;
+    pressedRef.current = false;
+    onPressEnd?.();
+  };
+
+  const cancelPress = () => {
+    if (!pressedRef.current) return;
+    pressedRef.current = false;
+    onPressCancel?.();
+  };
+
+  // Native keyboard PTT: hold Space/Enter to talk, release to transcribe.
+  // Key repeat must never start multiple recordings; click (from Space/Enter
+  // activation) must not re-trigger the cycle in PTT mode.
+  const handleKeyDown = (event: React.KeyboardEvent<HTMLButtonElement>) => {
+    if (!isPtt) return;
+    if (event.key === " " || event.key === "Enter") {
+      event.preventDefault();
+      if (!event.repeat) beginPress();
+    }
+  };
+
+  const handleKeyUp = (event: React.KeyboardEvent<HTMLButtonElement>) => {
+    if (!isPtt) return;
+    if (event.key === " " || event.key === "Enter") {
+      event.preventDefault();
+      endPress();
+    }
+  };
+
+  const handlePointerDown = (event: React.PointerEvent<HTMLButtonElement>) => {
+    if (!isPtt) return;
+    if (event.pointerType === "touch") event.preventDefault();
+    // Capture the pointer so releasing outside the orb still ends cleanly.
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+    beginPress();
+  };
+
+  const handlePointerUp = (event: React.PointerEvent<HTMLButtonElement>) => {
+    if (!isPtt) return;
+    event.currentTarget.releasePointerCapture?.(event.pointerId);
+    endPress();
+  };
+
+  const handlePointerCancel = (event: React.PointerEvent<HTMLButtonElement>) => {
+    if (!isPtt) return;
+    event.currentTarget.releasePointerCapture?.(event.pointerId);
+    cancelPress();
   };
 
   return (
@@ -88,17 +159,36 @@ export function VoiceOrb({
         {STATE_LABELS[state]}
       </span>
 
+      {isPtt && instructional && (
+        <span
+          className={cn(
+            "absolute -top-16 right-0 whitespace-nowrap rounded-full bg-card px-2.5 py-1 text-[11px] font-medium text-muted-foreground shadow-panel ring-1 ring-inset ring-border/70",
+            state === "idle" ? "opacity-100" : "opacity-0"
+          )}
+        >
+          {state === "listening" ? "Release to transcribe" : instructional}
+        </span>
+      )}
+
       <button
         type="button"
-        onClick={cycle}
+        onClick={isPtt ? undefined : cycle}
+        onKeyDown={isPtt ? handleKeyDown : undefined}
+        onKeyUp={isPtt ? handleKeyUp : undefined}
+        onPointerDown={isPtt ? handlePointerDown : undefined}
+        onPointerUp={isPtt ? handlePointerUp : undefined}
+        onPointerCancel={isPtt ? handlePointerCancel : undefined}
+        onBlur={isPtt ? cancelPress : undefined}
+        disabled={disabled}
         aria-label={`EVA voice orb — ${STATE_LABELS[state]}${
           controlledState === undefined ? " Activate to cycle preview states." : ""
         }`}
         className={cn(
-          "relative grid size-16 place-items-center rounded-full bg-orb ring-1 ring-inset ring-white/15",
+          "relative grid size-16 place-items-center rounded-full bg-orb ring-1 ring-inset ring-white/15 touch-none select-none",
           "transition-transform duration-200 ease-smooth motion-safe:hover:scale-105 motion-safe:active:scale-95",
           "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background",
-          treatment === "idle" && state === "idle" && "animate-orb-breathe shadow-orb"
+          treatment === "idle" && state === "idle" && "animate-orb-breathe shadow-orb",
+          disabled && "cursor-not-allowed opacity-60"
         )}
       >
         {/* Spherical highlight */}

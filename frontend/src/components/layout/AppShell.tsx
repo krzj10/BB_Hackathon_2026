@@ -2,7 +2,7 @@ import { Outlet } from "react-router-dom";
 import { Sidebar } from "./Sidebar";
 import { MobileTabBar } from "./MobileTabBar";
 import { Header } from "./Header";
-import { VoiceOrb } from "../voice/VoiceOrb";
+import { VoiceControl } from "../voice/VoiceControl";
 
 export function AppShell() {
   return (
@@ -17,7 +17,7 @@ export function AppShell() {
         </main>
       </div>
       <MobileTabBar />
-      <VoiceOrb />
+      <VoiceControl />
     </div>
   );
 }

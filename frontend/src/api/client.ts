@@ -46,7 +46,22 @@ import type {
   LlmSettingsUpdateRequest,
   LlmTestConnectionResponse,
   DetectModelsResponse,
+  TranscribeResponse,
 } from "./types.generated";
+
+/**
+ * Frontend-only transport input for the A05 multipart endpoint. This is NOT a
+ * domain model — the canonical response is the generated TranscribeResponse.
+ * `language` is the optional PRIOR CONVERSATION-LANGUAGE HINT (it never
+ * forces the provider transcription language).
+ */
+export interface TranscribeAudioRequest {
+  audio: Blob;
+  requestId: string;
+  sessionId: string;
+  language?: string;
+  signal?: AbortSignal;
+}
 
 /**
  * The single typed transport boundary for B02A/B02B screens. Screens depend on
@@ -72,6 +87,7 @@ export interface EvaClient {
   updateLlmSettings(request: LlmSettingsUpdateRequest): Promise<LlmSettingsResponse>;
   testLlmConnection(): Promise<LlmTestConnectionResponse>;
   detectLlmModels(): Promise<DetectModelsResponse>;
+  transcribeAudio(request: TranscribeAudioRequest): Promise<TranscribeResponse>;
 }
 
 export class ApiError extends Error {
@@ -91,11 +107,16 @@ export class ApiError extends Error {
 export type EvaClientMode = "rest" | "mock";
 
 async function requestJson<T>(method: string, path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, {
-    method,
-    headers: { Accept: "application/json", "Content-Type": "application/json", ...(init?.headers ?? {}) },
-    ...init,
-  });
+  // JSON requests carry an explicit application/json Content-Type; multipart
+  // FormData requests MUST NOT (the browser generates the multipart boundary).
+  const headers: Record<string, string> = {
+    Accept: "application/json",
+    ...((init?.headers as Record<string, string>) ?? {}),
+  };
+  if (!(init?.body instanceof FormData)) {
+    headers["Content-Type"] = "application/json";
+  }
+  const response = await fetch(path, { method, ...init, headers });
   if (!response.ok) {
     const detail = await response.text().catch(() => "");
     throw new ApiError(method, response.status, path, detail || undefined);
@@ -108,6 +129,16 @@ async function requestJson<T>(method: string, path: string, init?: RequestInit):
   } catch {
     throw new ApiError(method, response.status, path, "response was not valid JSON");
   }
+}
+
+/** Canonical A05 audio filename stem per accepted container (backend strips MIME parameters anyway). */
+function audioFileNameFor(mime: string): string {
+  const base = mime.split(";")[0].trim().toLowerCase();
+  if (base.includes("webm")) return "recording.webm";
+  if (base.includes("ogg")) return "recording.ogg";
+  if (base.includes("wav")) return "recording.wav";
+  if (base.includes("mp4")) return "recording.mp4";
+  return "recording.audio";
 }
 
 /** REST transport against the frozen A00 endpoints (docs/api-contracts.md §8). */
@@ -132,6 +163,23 @@ export function createRestClient(): EvaClient {
     updateLlmSettings: (request) => requestJson("PUT", "/api/settings/llm", { body: JSON.stringify(request) }) as Promise<LlmSettingsResponse>,
     testLlmConnection: () => requestJson("POST", "/api/settings/llm/test", undefined) as Promise<LlmTestConnectionResponse>,
     detectLlmModels: () => requestJson("POST", "/api/settings/llm/detect", undefined) as Promise<DetectModelsResponse>,
+    transcribeAudio: (request: TranscribeAudioRequest) => {
+      // Exact A05 multipart field names: audio / request_id / language (only
+      // when supplied). The browser generates the multipart Content-Type
+      // boundary; we never set it manually. Origin is supplied automatically
+      // by the browser and is never spoofed.
+      const form = new FormData();
+      form.append("audio", request.audio, audioFileNameFor(request.audio.type));
+      form.append("request_id", request.requestId);
+      if (request.language !== undefined && request.language !== "") {
+        form.append("language", request.language);
+      }
+      return requestJson("POST", "/api/voice/transcribe", {
+        body: form,
+        headers: { "X-EVA-Session-ID": request.sessionId },
+        ...(request.signal ? { signal: request.signal } : {}),
+      }) as Promise<TranscribeResponse>;
+    },
   };
 }
 

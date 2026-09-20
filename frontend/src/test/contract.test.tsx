@@ -35,6 +35,7 @@ import type {
   TodayCalendarResponse,
   VoiceState,
   ExecutiveBriefing,
+  Transcript,
 } from "../api/types.generated";
 
 function stubEvaClient(): Pick<
@@ -54,6 +55,7 @@ function stubEvaClient(): Pick<
   | "updateLlmSettings"
   | "testLlmConnection"
   | "detectLlmModels"
+  | "transcribeAudio"
 > {
   return {
     getBriefing: async () => ({ briefing: { id: "stub" } as unknown as ExecutiveBriefing }),
@@ -71,6 +73,7 @@ function stubEvaClient(): Pick<
     updateLlmSettings: async () => ({ provider: "", configured: false }),
     testLlmConnection: async () => ({ health: { status: "unavailable" } }),
     detectLlmModels: async () => ({ models: [] }),
+    transcribeAudio: async () => ({ request_id: "stub", transcript: {} as unknown as Transcript }),
   };
 }
 
