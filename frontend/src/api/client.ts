@@ -42,6 +42,10 @@ import type {
   DecisionOutcomeProposalRequest,
   DeferDecisionRequest,
   ApprovalRequest,
+  LlmSettingsResponse,
+  LlmSettingsUpdateRequest,
+  LlmTestConnectionResponse,
+  DetectModelsResponse,
 } from "./types.generated";
 
 /**
@@ -64,6 +68,10 @@ export interface EvaClient {
   getAction(actionId: string): Promise<ActionResponse>;
   getApprovalChallenge(actionId: string): Promise<ApprovalChallengeResponse>;
   confirmAction(actionId: string, request: ApprovalRequest): Promise<ActionConfirmResponse>;
+  getLlmSettings(): Promise<LlmSettingsResponse>;
+  updateLlmSettings(request: LlmSettingsUpdateRequest): Promise<LlmSettingsResponse>;
+  testLlmConnection(): Promise<LlmTestConnectionResponse>;
+  detectLlmModels(): Promise<DetectModelsResponse>;
 }
 
 export class ApiError extends Error {
@@ -120,6 +128,10 @@ export function createRestClient(): EvaClient {
     getAction: (actionId) => requestJson("GET", `/api/actions/${encodeURIComponent(actionId)}`, undefined) as Promise<ActionResponse>,
     getApprovalChallenge: (actionId) => requestJson("POST", `/api/actions/${encodeURIComponent(actionId)}/challenge`, undefined) as Promise<ApprovalChallengeResponse>,
     confirmAction: (actionId, request) => requestJson("POST", `/api/actions/${encodeURIComponent(actionId)}/confirm`, { body: JSON.stringify(request) }) as Promise<ActionConfirmResponse>,
+    getLlmSettings: () => requestJson("GET", "/api/settings/llm", undefined) as Promise<LlmSettingsResponse>,
+    updateLlmSettings: (request) => requestJson("PUT", "/api/settings/llm", { body: JSON.stringify(request) }) as Promise<LlmSettingsResponse>,
+    testLlmConnection: () => requestJson("POST", "/api/settings/llm/test", undefined) as Promise<LlmTestConnectionResponse>,
+    detectLlmModels: () => requestJson("POST", "/api/settings/llm/detect", undefined) as Promise<DetectModelsResponse>,
   };
 }
 

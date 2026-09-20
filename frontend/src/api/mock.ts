@@ -26,6 +26,10 @@ import type {
   ApprovalRequest,
   ApprovalChallengeResponse,
   DecisionOutcome,
+  LlmSettingsResponse,
+  LlmSettingsUpdateRequest,
+  LlmTestConnectionResponse,
+  DetectModelsResponse,
 } from "./types.generated";
 import acmeFixture from "../../../contracts/fixtures/meeting_acme_high.json";
 import teamSyncFixture from "../../../contracts/fixtures/meeting_team_sync_medium.json";
@@ -37,6 +41,7 @@ import focusCompletionFixture from "../../../contracts/fixtures/focus_completion
 import briefingFixture from "../../../contracts/fixtures/briefing_acme_pl.json";
 import proposedActionFixture from "../../../contracts/fixtures/proposed_action_agenda_high.json";
 import toolResultFixture from "../../../contracts/fixtures/tool_result_agenda_ok.json";
+import llmSettingsFixture from "../../../contracts/fixtures/llm_settings_response.json";
 
 export type MockMode =
   | "fixtures"
@@ -74,6 +79,7 @@ const focusCompletionSummary = canonical<FocusCompletionSummary>(focusCompletion
 const briefing = canonical<ExecutiveBriefing>(briefingFixture, "briefing_acme_pl");
 const proposedActionAgenda = canonical<ProposedAction>(proposedActionFixture, "proposed_action_agenda_high");
 const toolResult = canonical<ToolResult>(toolResultFixture, "tool_result_agenda_ok");
+const llmSettings = canonical<LlmSettingsResponse>(llmSettingsFixture, "llm_settings_response");
 
 const FIXTURE_DAY = "2026-09-21";
 
@@ -224,6 +230,11 @@ export function createMockClient(options: MockClientOptions = {}): EvaClient {
   let storedProposal: ProposedAction | null = null;
   let issuedChallenge: ApprovalChallengeResponse | null = null;
   let challengeConsumed = false;
+
+  // Settings state (sanitized only — the mock never stores or returns an
+  // actual API-key string; a submitted key updates presence flags and is
+  // dropped immediately after that call is processed).
+  let settingsState: LlmSettingsResponse = llmSettings;
 
   return {
     getTodayCalendar: () => respond(mode, fixtureToday, emptyToday),
@@ -532,6 +543,90 @@ export function createMockClient(options: MockClientOptions = {}): EvaClient {
       };
       storedProposal = succeededAction;
       return Promise.resolve(confirmResponse);
+    },
+
+    getLlmSettings: () => statefulRespond(mode, settingsState),
+
+    updateLlmSettings: (request: LlmSettingsUpdateRequest) => {
+      if (mode === "pending") {
+        return new Promise<LlmSettingsResponse>(() => {});
+      }
+      if (mode === "error") {
+        return Promise.reject(new Error("Simulated transport failure (mock error mode)"));
+      }
+      const next: LlmSettingsResponse = { ...settingsState };
+      if (request.base_url !== undefined) next.base_url = request.base_url;
+      if (request.model !== undefined) next.model = request.model;
+      // api_key is write-only: a provided string flips presence to true; an
+      // explicit null removes the key; an omitted field preserves it. The
+      // secret string itself is never stored, returned, or logged.
+      if (request.api_key !== undefined) next.api_key_present = request.api_key !== null;
+      if (request.fallback_base_url !== undefined) next.fallback_base_url = request.fallback_base_url;
+      if (request.fallback_model !== undefined) next.fallback_model = request.fallback_model;
+      if (request.fallback_api_key !== undefined) next.fallback_api_key_present = request.fallback_api_key !== null;
+      // The backend derives `configured`; the mock mirrors that honestly for
+      // the synthetic demo endpoint (allowlisted server-side).
+      next.configured = Boolean(next.base_url && next.model);
+      settingsState = next;
+      return Promise.resolve(settingsState);
+    },
+
+    testLlmConnection: () => {
+      if (mode === "pending") {
+        return new Promise<LlmTestConnectionResponse>(() => {});
+      }
+      if (mode === "error") {
+        // A genuine failure — never silently replaced by success.
+        return Promise.reject(new Error("connection refused (mock error mode)"));
+      }
+      // Deterministic synthetic success against the currently configured demo
+      // model; no real LLM endpoint is contacted.
+      return Promise.resolve({
+        health: {
+          status: "ready",
+          detail: "Mock transport: no real endpoint contacted",
+          provider: settingsState.provider,
+          model: settingsState.model ?? null,
+        },
+        latency_ms: 42,
+        model: settingsState.model ?? null,
+      });
+    },
+
+    detectLlmModels: () => {
+      if (mode === "pending") {
+        return new Promise<DetectModelsResponse>(() => {});
+      }
+      if (mode === "error") {
+        return Promise.reject(new Error("connection refused (mock error mode)"));
+      }
+      // Deterministic synthetic demo identities — not claims about live
+      // installed models.
+      return Promise.resolve({
+        models: [
+          {
+            id: "demo-served-model-id",
+            display_name: "Demo Served Model",
+            supports_tools: true,
+            supports_structured_output: true,
+            context_window: 128000,
+          },
+          {
+            id: "demo-fast-model-id",
+            display_name: "Demo Fast Model",
+            supports_tools: false,
+            supports_structured_output: true,
+            context_window: 32000,
+          },
+          {
+            id: "demo-capability-unknown-model-id",
+            display_name: "Demo Unknown Capabilities Model",
+            supports_tools: null,
+            supports_structured_output: null,
+            context_window: null,
+          },
+        ],
+      });
     },
   };
 }

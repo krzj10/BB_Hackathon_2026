@@ -361,9 +361,9 @@ function DecisionDetailContainer({ decision, onClose, setReloadKey }: DecisionDe
                 Proposing outcome…
               </CardTitle>
             </CardHeader>
-            <CardContent>
-              <p className="text-[13px] text-muted-foreground">Creating outcome proposal and obtaining approval challenge…</p>
-            </CardContent>
+              <CardContent>
+                <p className="text-[13px] text-muted-foreground">Creating outcome proposal…</p>
+              </CardContent>
           </Card>
         )}
 

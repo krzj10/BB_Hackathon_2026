@@ -1,10 +1,11 @@
 import { Navigate, Route, Routes } from "react-router-dom";
-import { Calendar, Library, Settings } from "lucide-react";
+import { Calendar, Library } from "lucide-react";
 import { AppShell } from "./components/layout/AppShell";
 import Today from "./pages/Today";
 import Briefings from "./pages/Briefings";
 import Attention from "./pages/Attention";
 import Decisions from "./pages/Decisions";
+import Settings from "./pages/Settings";
 import { SectionPlaceholder } from "./pages/SectionPlaceholder";
 
 export default function App() {
@@ -35,16 +36,7 @@ export default function App() {
             />
           }
         />
-        <Route
-          path="settings"
-          element={
-            <SectionPlaceholder
-              title="Settings"
-              description="AI engine, integrations and preferences."
-              icon={Settings}
-            />
-          }
-        />
+        <Route path="settings" element={<Settings />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Route>
     </Routes>

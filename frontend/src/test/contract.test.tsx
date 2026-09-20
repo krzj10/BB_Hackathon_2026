@@ -50,6 +50,10 @@ function stubEvaClient(): Pick<
   | "getAction"
   | "getApprovalChallenge"
   | "confirmAction"
+  | "getLlmSettings"
+  | "updateLlmSettings"
+  | "testLlmConnection"
+  | "detectLlmModels"
 > {
   return {
     getBriefing: async () => ({ briefing: { id: "stub" } as unknown as ExecutiveBriefing }),
@@ -63,6 +67,10 @@ function stubEvaClient(): Pick<
     getAction: async () => ({ action: {} as unknown as ProposedAction }),
     getApprovalChallenge: async () => ({ action_id: "", revision: 0, arguments_digest: "", challenge: "", expires_at: "" }),
     confirmAction: async () => ({ action: {} as unknown as ProposedAction }),
+    getLlmSettings: async () => ({ provider: "", configured: false }),
+    updateLlmSettings: async () => ({ provider: "", configured: false }),
+    testLlmConnection: async () => ({ health: { status: "unavailable" } }),
+    detectLlmModels: async () => ({ models: [] }),
   };
 }
 
